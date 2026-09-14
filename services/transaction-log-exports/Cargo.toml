@@ -1,0 +1,20 @@
+[package]
+name = "transaction-log-exports"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes.workspace = true
+crc32c.workspace = true
+getset.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
+[[bench]]
+name = "record_reader"
+harness = false
+test = false

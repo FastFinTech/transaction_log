@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Transaction Log",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--locked",
+                    "--package",
+                    "transaction-log",
+                    "--bin",
+                    "transaction-log"
+                ],
+                "filter": {
+                    "name": "transaction-log",
+                    "kind": "bin"
+                },
+                "cwd": "${workspaceFolder}"
+            },
+            "cwd": "${workspaceFolder}",
+            "args": [],
+            "env": {
+                "RUST_BACKTRACE": "1"
+            },
+            "sourceLanguages": ["rust"],
+            "terminal": "integrated"
+        }
+    ]
+}

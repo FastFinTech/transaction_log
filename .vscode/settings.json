@@ -1,0 +1,9 @@
+{
+    "debug.allowBreakpointsEverywhere": true,
+    "rust-analyzer.debug.engine": "vadimcn.vscode-lldb",
+    "lldb.launch.preRunCommands": [
+        "settings set target.process.thread.step-avoid-regexp ^<?(std|core|alloc|tokio|anyhow|bytes|crc32c|pin_project_lite)::",
+        "settings set target.process.thread.step-in-avoid-nodebug true",
+        "settings set target.process.thread.step-out-avoid-nodebug true"
+    ]
+}

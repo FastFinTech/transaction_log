@@ -1,0 +1,9 @@
+[package]
+name = "transaction-log"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+transaction-log-exports = { path = "../transaction-log-exports" }
