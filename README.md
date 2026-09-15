@@ -2,7 +2,7 @@
 
 A Rust workspace organized into:
 
-- `lib/`: reserved for shared library crates.
+- `lib/`: shared library crates, including `object-pool`.
 - `services/transaction-log/`: the Transaction Log application.
 - `services/transaction-log-exports/`: the application's public exports crate.
 
@@ -40,6 +40,13 @@ The [record writer module](services/transaction-log-exports/src/record_writer/RE
 provides `RecordWriter::write(id, write_body)` for writing opaque record bodies
 through a callback directly into reusable storage, including header/CRC finalization
 and rollback. Shared output coordination and socket output are planned separately.
+
+The [object pool](lib/object-pool/README.md) provides synchronous ownership
+transfer through an executor's exclusive mutable access, without internal locking.
+It grows without a fixed limit and uses `maintenance_tick()` to reclaim the minimum
+available count tracked throughout each configured group of ticks, keeping collection
+capacity for refilling. The owner supplies the maintenance cadence. Writer integration
+and the periodic timer remain planned.
 
 ## Reader performance
 

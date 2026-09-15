@@ -1,0 +1,8 @@
+[package]
+name = "object-pool"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dev-dependencies]
+bytes.workspace = true

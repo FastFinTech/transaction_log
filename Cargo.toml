@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "lib/object-pool",
     "services/transaction-log",
     "services/transaction-log-exports",
 ]
