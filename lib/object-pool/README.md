@@ -3,26 +3,25 @@
 This crate provides the workspace's generic, synchronous [`ObjectPool<T>`]. A
 single owner reuses whole objects without internal locking, tracks demand on
 checkout, and periodically reclaims surplus through
-[`maintenance_tick()`](ObjectPool::maintenance_tick).
+[`reclaim_unused()`](ObjectPool::reclaim_unused).
 This README covers the thin `src/lib.rs` entry point and the implementation and
 same-file tests in `src/object_pool.rs`. It is included in generated Rustdoc.
 
 ## Purpose and ownership
 
-The immediate use case is an executor's local pool of `BytesMut` allocations for
-a record writer. The pool is independent of bytes, record framing, Tokio, sockets,
+An example use case is an executor's local pool of reusable `BytesMut` allocations.
+The pool is independent of bytes, record framing, Tokio, sockets,
 and acknowledgement policy. It has no runtime dependencies and forbids unsafe
 code. `bytes` is a development dependency for allocation-reuse tests.
 
-[`ObjectPool::new(trim_after_ticks: NonZeroUsize)`](ObjectPool::new) creates an
-empty pool without allocating object or collection storage. `trim_after_ticks`
-configures how many calls to `maintenance_tick()` complete one maintenance group.
-Zero is excluded by the type; there is no default threshold. The owner chooses
-the maintenance cadence.
+[`ObjectPool::new()`](ObjectPool::new) creates an empty pool without allocating
+object or collection storage. `Default` has the same behavior and does not
+require `T: Default`. The owner chooses when to call `reclaim_unused()`, for example
+once every ten minutes. There is no interval configuration inside the pool.
 
 Checkout, return, and maintenance require `&mut self`. Objects live in a plain
-`Vec<T>`, alongside the minimum available count and maintenance counters. There
-are no internal locks, runtime borrow checks, clocks, or history allocations.
+`Vec<T>`, alongside the minimum available count. There are no internal locks,
+runtime borrow checks, clocks, or history allocations.
 The pool imposes no `Send` or `Sync` bound on `T`; it can reuse `Rc<Cell<_>>` locally.
 Rust's normal auto-trait rules determine whether ownership of the pool or its
 checked-out objects may move to another thread.
@@ -45,72 +44,67 @@ follows Rust's normal allocation behavior, not a pool-exhaustion error.
 held by writers, output queues, drivers, and return jobs. The pool cannot reclaim
 checked-out objects.
 
-## Availability tracking and trimming
+## Availability tracking and reclamation
 
-The pool tracks the lowest available count throughout each maintenance group,
-including activity between ticks. Ticks advance the maintenance schedule; they
-do not sample availability. Every `try_take()` updates the minimum after popping;
+The pool tracks the lowest available count throughout each maintenance window,
+from construction or the previous `reclaim_unused()` call. It does not rely on
+periodic availability samples. Every `try_take()` updates the minimum after popping;
 `take_or_else()` uses that same path. Returning an object only increases
 availability, so `put()` leaves the earlier minimum intact. A checkout followed
-by a return before the next tick must still affect the group's minimum.
+by a return before the next maintenance call must still affect the window's minimum.
 
 The minimum is historical state, not a current-availability counter. Incrementing
 it on return would erase an earlier dip. `Vec::len()` already exposes the vector's
 stored count, so no duplicate current-availability field is needed.
 
-`maintenance_tick()` increments the tick count. Before the configured threshold,
-it returns zero and removes nothing. At the threshold it:
+Every `reclaim_unused()` call:
 
-1. Saves the group's minimum as the number of objects to discard.
+1. Saves the window's minimum as the number of objects to discard.
 2. Computes `retain = available.len() - remove`. This subtraction is valid because
    checkout tracks every decrease, while returns can only increase availability.
-3. Resets the tick count to zero and the minimum to `retain`, starting a new group.
+3. Resets the minimum to `retain`, starting a new window.
 4. Truncates the object vector to `retain` and returns `remove`.
 
 The minimum is the number to discard: a minimum of 80 with 120 currently available
-means discarding 80 and retaining 40. Reset occurs after every complete group,
-even when its minimum was zero and no objects were removed. The next group's
+means discarding 80 and retaining 40. Reset occurs after every call,
+even when its minimum was zero and no objects were removed. The next window's
 minimum starts at the retained count, and object activity immediately begins
-contributing; tracking does not wait for the next tick.
+contributing; tracking does not wait for the next maintenance call.
 
 Construction starts with a minimum of zero because the pool is empty. The first
-complete group therefore reclaims nothing. If 20 objects have accumulated by its
-end, the next group begins at 20. This provides an initial accumulation period
-without making the minimum permanently zero. Any later group that reaches zero
+maintenance call therefore reclaims nothing. If 20 objects have accumulated by
+then, the next window begins at 20. This provides an initial accumulation period
+without making the minimum permanently zero. Any later window that reaches zero
 also reclaims nothing, then resets to its ending available count.
 
-Groups are consecutive and do not overlap; this is not a rolling time window.
-The starting count contributes to each group's minimum. After trimming empties
-the pool, a subsequent group also starts at zero and allows returned objects to
-accumulate before they can be reclaimed in a later group. A return value of zero
-means no objects were discarded; it does not distinguish an unfinished group
-from a completed group whose minimum was zero.
+Windows are consecutive and do not overlap; this is not a rolling time window.
+The starting count contributes to each window's minimum. If none of those
+available objects were needed, reclamation can empty the pool. That new window
+starts at zero and allows returned objects to accumulate before reclamation in
+a later window. A return value of zero means the completed window reached zero
+availability and no objects were discarded. Every call starts a fresh window.
 
 ```rust
 use object_pool::ObjectPool;
-use std::num::NonZeroUsize;
 
-let mut pool = ObjectPool::new(NonZeroUsize::new(2).unwrap());
+let mut pool = ObjectPool::new();
 for value in 0..4 {
     pool.put(value);
 }
-assert_eq!(pool.maintenance_tick(), 0);
-assert_eq!(pool.maintenance_tick(), 0); // Initial group started empty; next starts at 4.
+assert_eq!(pool.reclaim_unused(), 0); // Initial window started empty; next starts at 4.
 
 let object = pool.try_take().unwrap(); // Available count falls to 3.
 pool.put(object);                     // Returning it preserves that low point.
-assert_eq!(pool.maintenance_tick(), 0);
-assert_eq!(pool.maintenance_tick(), 3); // Discard 3 of the 4 available objects.
+assert_eq!(pool.reclaim_unused(), 3); // Discard 3 of the 4 available objects.
 assert_eq!(pool.len(), 1);
 
-// The next group starts at the retained count, not at the previous minimum.
-assert_eq!(pool.maintenance_tick(), 0);
-assert_eq!(pool.maintenance_tick(), 1);
+// The next window starts at the retained count, not at the previous minimum.
+assert_eq!(pool.reclaim_unused(), 1);
 assert!(pool.is_empty());
 ```
 
 The policy measures spare object count, not each object's idle duration or its
-separately allocated payload size. Normal checkout pops from the end. Trimming
+separately allocated payload size. Normal checkout pops from the end. Reclamation
 retains the beginning of the vector and destroys the surplus tail in place,
 favoring older returns for retention. Object identity does not affect eligibility.
 
@@ -123,43 +117,38 @@ to the allocator; this does not promise an immediate reduction in process RSS.
 
 Factories and destructors run synchronously under the caller's exclusive access.
 They cannot reenter the same pool through safe mutable access. Panics propagate.
-If the caller catches a factory panic, the empty pool remains usable. If a trimmed
+If the caller catches a factory panic, the empty pool remains usable. If a discarded
 object's destructor panics, the vector already has its retained length, and the
-counters and minimum already describe the new group. This ordering must be
-preserved so catching the unwind does not reuse the previous group's minimum.
+minimum already describes the new window. This ordering must be preserved so
+catching the unwind does not reuse the previous window's minimum.
 
 ## Maintenance ownership and writer integration
 
-The pool starts no timer or task. The owner should call `maintenance_tick()` on a
-regular schedule and manage the timer's lifetime. For example,
-`trim_after_ticks = NonZeroUsize::new(600).unwrap()` with one tick per second gives
-approximately ten minutes between trimming decisions. A threshold of one
-considers trimming at every call, using the minimum since construction or the
-previous call.
+The pool starts no timer or task. The owner calls `reclaim_unused()` when its
+maintenance window ends, for example on a ten-minute timer, and manages that
+timer's lifetime. One call performs reclamation and begins the next window.
+No intermediate calls are needed because checkout tracks demand continuously.
 
-Only calls advance the maintenance schedule. Delayed calls extend a group; rapid
-calls shorten it. Time passing does not clear tracking state or cause trimming.
-All availability changes still contribute during a delay. The caller must not
-assume the pool enforces a wall-clock interval.
+Delayed calls extend a window; rapid calls shorten it. Time passing does not
+clear tracking state or cause reclamation. All availability changes still
+contribute during a delay. The caller must not assume the pool enforces a
+wall-clock interval. After a delayed timer, repeated catch-up calls would create
+short or empty windows and could reclaim the retained objects immediately; the
+owner should call once and schedule the next actual observation window.
 
-Writer integration and the owner timer remain planned. The intended arrangement
-is one writer and one local pool per command-handler executor, with a socket
-driver on another thread. The writer holds an eagerly acquired buffer. Submission
-acquires a replacement before moving the whole completed buffer through an
-unbounded SPSC output queue; no per-record split is needed.
+The current record writer appends records synchronously to one private buffer
+and sends batches through explicit async buffer flushes. It does not use this pool.
+This crate remains a standalone utility for owners needing demand-based reclamation;
+any future background output wrapper can choose its own buffer reuse strategy.
 
-After output finishes using a buffer, the driver can return ownership through the
-executor's existing jobs MPSC. The executor clears the buffer and calls `put`.
-Application job types, return callbacks, queues, error/drop handling, and timing
-belong to the integration layer. A writer's own buffer and any queued buffers are
-checked out and cannot be trimmed. Acknowledgement latency, input backpressure,
-and connection policy remain concerns of the command handler and connection owner.
+Pool users can transfer owned Send values across threads without sharing the
+pool itself. For example, an owner can recycle a returned buffer:
 
 ```rust
 use object_pool::ObjectPool;
-use std::{num::NonZeroUsize, sync::mpsc};
+use std::sync::mpsc;
 
-let mut pool = ObjectPool::new(NonZeroUsize::new(600).unwrap());
+let mut pool = ObjectPool::new();
 let mut buffer = pool.take_or_else(|| Vec::<u8>::with_capacity(4096));
 buffer.extend_from_slice(b"serialized bytes");
 
@@ -174,14 +163,14 @@ buffer.clear();
 pool.put(buffer);
 worker.join().unwrap();
 assert_eq!(pool.len(), 1);
-assert_eq!(pool.maintenance_tick(), 0);
+assert_eq!(pool.reclaim_unused(), 0);
 ```
 
 ## Hot-path rationale and evidence
 
 Checkout performs a vector pop followed by a minimum update using the vector's
 stored length. Return performs a push. Neither operation reads a clock,
-allocates tracking storage, synchronizes, or updates the maintenance tick counter.
+allocates tracking storage, or synchronizes.
 Checkout itself does not allocate; a `take_or_else()` factory may allocate on a
 miss, and `put()` may grow the vector when its existing capacity is insufficient.
 Updating the minimum on checkout is deliberate: intermittent snapshots would
@@ -192,10 +181,10 @@ involves no pool call, wrapper, availability check, or reference-count update by
 the pool. `take_or_else` is generic and inline, requiring no dynamic dispatch.
 Pool operations belong at buffer handoffs, not on every record or serializer field.
 
-Tracking storage is constant regardless of the tick threshold or lifetime. A tick
-before the threshold does constant work. A completed group additionally destroys
-its surplus objects, so destructor cost belongs to executor maintenance. No scan
-of historical samples or temporary allocation is needed.
+Tracking storage is constant regardless of the window duration or lifetime.
+Reclamation does constant bookkeeping and destroys its surplus objects, so
+destructor cost belongs to executor maintenance. No scan of historical samples
+or temporary allocation is needed.
 
 These are implementation properties, not measured throughput claims. No pool or
 integrated writer throughput benchmark has been run. Existing reader benchmarks
@@ -209,15 +198,16 @@ transfer, factory invocation and panic recovery, real `BytesMut` allocation reus
 caller-controlled reset, checked-out lifetimes, and cross-thread returns to the
 local owner. Local non-Send objects are supported too.
 
-Maintenance tests cover the initial empty group, exact tick thresholds, minima
-at different points in a group, temporary zero and nonzero dips between ticks,
-returns preserving minima, recovery after zero and positive trims, thresholds
-of one and `usize::MAX`, prefix retention, exact release counts, vector capacity
-preservation through partial/complete/no-op trims and refilling, and resetting
-the group before destructor panics. No clocks, sleeps, or long workloads are
-needed. Both examples above are compilable documentation tests.
+Maintenance tests cover the initial empty window, minima at different points in
+a window, temporary zero and nonzero dips between calls, returns preserving
+minima, recovery after zero and positive reclamation, prefix retention, exact
+release counts, vector capacity preservation through partial/complete/no-op
+reclamation and refilling, and resetting the window before destructor panics.
+Default construction also supports objects with no `Default` implementation.
+No clocks, sleeps, or long workloads are needed. Both examples above are
+compilable documentation tests.
 
 Run `cargo test -p object-pool --locked` and its `--release` variant, formatting,
 workspace Clippy, and Rustdoc with warnings denied. Keep API docs and this README
-synchronized with the continuous availability tracking, tick-count policy,
+synchronized with the continuous availability tracking, owner-defined windows,
 ownership contracts, and implemented/planned integration boundary.

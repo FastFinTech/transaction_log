@@ -11,29 +11,35 @@ use crate::record::record_protocol::{
     self as protocol, HEADER_LEN, MAX_PAYLOAD_LEN, MAX_RECORD_LEN, MIN_RECORD_LEN,
 };
 
-/// A temporary builder for constructing exactly one record in the writer's buffer.
+/// A temporary write destination for exactly one record body.
 ///
-/// Each instance borrows the buffer for one body-writing callback. The
+/// [`super::RecordWriter::write`] in serialization mode lends this builder to one
+/// body-writing callback. Existing-record mode copies complete records without a
+/// builder. This builder borrows the writer's buffer for that callback. The
 /// callback can make many `std::io::Write` calls, all appending to that record's
 /// payload. Construction reserves space for the complete record; body writes
 /// begin after the uninitialized header space. Earlier records are untouched.
 /// The buffer's readable length advances only when the complete record is ready.
 ///
-/// After the callback succeeds, the enclosing writer calls `finish`, which
-/// consumes this builder, fills the header, and appends the checksum. The writer
-/// constructs a fresh builder for the next record, borrowing the same buffer
-/// again. The writer and buffer are reused across records; a builder has no
-/// reset or reuse cycle. With enough buffer capacity, creating the next builder
-/// requires no heap allocation.
+/// After serialization succeeds, the writer invokes `finish`, which consumes
+/// this builder, fills the header, and appends the checksum. The completed record
+/// joins earlier records in the buffer until the caller invokes `flush_buffer`.
+/// Each record uses a fresh builder; the buffer retains its allocation after
+/// output. A builder has no reset or reuse cycle. With enough spare capacity,
+/// constructing a builder requires no heap allocation.
 ///
 /// The first failed write is retained and prevents further writes or successful
 /// finalization of this record. Dropping an unfinished builder rolls it back,
 /// including during unwinding, without discarding preceding records or buffer
-/// capacity. This concrete type stays internal; callbacks use only `Write`.
-/// The callback is synchronous on the producer thread. Only completed buffers
-/// will enter the output queue; this builder needs no thread-transfer support.
-pub(super) struct RecordBuilder<'a> {
-    // Borrowed for this record only; the enclosing writer retains ownership.
+/// capacity. The type is public so callbacks and serializers can use static
+/// dispatch through its `Write` implementation. Its fields, construction, and
+/// finalization remain private to the writer module. Callers cannot create or
+/// finish a builder, or access the underlying storage. Serialization stays on
+/// the caller's thread and completes before asynchronous output begins. A
+/// serializer calling this builder's `Write::flush` only checks retained errors;
+/// it cannot send a partial record or flush the writer's destination.
+pub struct RecordBuilder<'a> {
+    // Borrowed for this record only; the caller retains ownership.
     // Its readable length stays at start until finish publishes the complete
     // record. No byte view escapes while the cached pointer is used.
     buffer: &'a mut BytesMut,
@@ -48,12 +54,15 @@ pub(super) struct RecordBuilder<'a> {
     // remain outside buffer.len(). Header and trailer are initialized by finish.
     // Only successful appends advance this count; it never exceeds MAX_PAYLOAD_LEN.
     payload_len: usize,
+    // A serializer can swallow a Write error and report success. Retaining it
+    // prevents finish from publishing a silently truncated payload.
     error: Option<RecordBuildError>,
+    // Disarm rollback only after publishing the complete initialized record.
     finished: bool,
 }
 
 impl<'a> RecordBuilder<'a> {
-    /// Borrows the writer's buffer to construct one new record with an empty payload.
+    /// Borrows a buffer to construct one new record with an empty payload.
     ///
     /// Existing bytes remain untouched and do not count towards the payload
     /// limit. Reserves `MAX_RECORD_LEN` additional bytes without initializing any
@@ -63,10 +72,13 @@ impl<'a> RecordBuilder<'a> {
     /// Call this constructor again for each subsequent record after the previous
     /// builder has been consumed by `finish` or dropped.
     // Expose the initial zero payload length and empty error state when the
-    // public writer is monomorphized in a downstream crate.
+    // generic writer is monomorphized in a downstream crate.
     #[inline]
     pub(super) fn new(buffer: &'a mut BytesMut) -> Self {
         let start = buffer.len();
+        // Reserving the worst case once avoids growth checks per serialized field.
+        // reserve may move earlier buffered records, so derive the cached pointer
+        // afterwards; never retain it into the next builder or asynchronous output.
         buffer.reserve(MAX_RECORD_LEN);
         let record_start = NonNull::from(buffer.spare_capacity_mut()).cast::<u8>();
         Self {
@@ -139,6 +151,8 @@ impl<'a> RecordBuilder<'a> {
             protocol::write::crc(record_start, length);
             self.buffer.set_len(self.start + length);
         }
+        // The record is now part of the batch. Dropping this consumed builder
+        // must preserve it; actual destination output is a separate writer step.
         self.finished = true;
         Ok(())
     }
@@ -200,11 +214,15 @@ impl io::Write for RecordBuilder<'_> {
 
     #[inline]
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Our write is all-or-error, so a retry loop adds no value. Delegating
+        // also checks sticky errors for empty input, unlike a length-only loop.
         self.write(bytes).map(|_| ())
     }
 
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
+        // Serializer-level flush cannot publish framing: only finish has the ID
+        // and final payload size needed to initialize the header and checksum.
         self.check_error().map_err(io::Error::from)
     }
 }

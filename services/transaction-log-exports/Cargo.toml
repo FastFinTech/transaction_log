@@ -8,13 +8,25 @@ bytes.workspace = true
 crc32c.workspace = true
 getset.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
 anyhow.workspace = true
-tokio = { workspace = true, features = ["net"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { workspace = true, features = ["net", "time"] }
 
 [[bench]]
 name = "record_reader"
+harness = false
+test = false
+
+[[bench]]
+name = "record_writer"
+harness = false
+test = false
+
+[[bench]]
+name = "record_io"
 harness = false
 test = false

@@ -1,5 +1,7 @@
 //! Opt-in TCP throughput measurement. See README.md for timing and workload rules.
 
+mod environment;
+
 use std::{
     collections::VecDeque,
     hint::black_box,
@@ -149,6 +151,8 @@ fn main() -> Result<()> {
     );
     let batch = make_batch(&config)?;
 
+    environment::print();
+
     println!(
         "RecordReader TCP loopback | {}-{} | logical CPUs={}",
         std::env::consts::ARCH,
@@ -224,8 +228,8 @@ fn make_batch(config: &Config) -> Result<Arc<[u8]>> {
     let length = u16::try_from(config.record_len())?;
     for index in 0..config.batch_records {
         let start = batch.len();
-        // Benchmark-local encoding until a writer exists. Use the public wire
-        // contract, never private access or a native RecordHeader memory cast.
+        // Keep the prebuilt producer independent of RecordWriter changes. Use
+        // the public wire contract, never private access or a native header cast.
         batch.extend_from_slice(&length.to_le_bytes());
         batch.extend_from_slice(&((index % StreamId::COUNT) as u16).to_le_bytes());
         batch.extend_from_slice(&((index / StreamId::COUNT) as u64).to_le_bytes());

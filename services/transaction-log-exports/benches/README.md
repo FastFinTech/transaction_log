@@ -1,14 +1,111 @@
-# Record reader benchmarks
+# Record I/O benchmarks
 
 This directory contains explicitly invoked performance executables for people
-and agents. It is separate from the correctness test suite. The current
-`record_reader` target measures the public `RecordReader` over a real TCP
-connection, or multiple concurrent connections, on IPv4 localhost. It does not
-start the Transaction Log service.
+and agents. It is separate from the correctness test suite. Three targets use
+real TCP connections on IPv4 localhost; none starts the Transaction Log service.
+
+| Target | Timed producer | Timed receiver | Use |
+| --- | --- | --- | --- |
+| `record_reader` | Replays prebuilt encoded bytes; no `RecordWriter` | Real `RecordReader`, including CRC validation | Compare reader changes independently of writer changes. |
+| `record_writer` | Real `RecordWriter` | Raw byte drain; no `RecordReader` or CRC validation | Compare writer changes independently of reader changes. |
+| `record_io` | Real `RecordWriter` | Real `RecordReader`, including CRC validation | Check the combined path after either side changes. |
+
+Each target still includes TCP, memory and scheduling costs. An individual target
+isolates it from the other production component, not from the entire system.
+Compare a target against its own before/after baseline; do not subtract durations
+or rates between targets to infer isolated CPU cost, since their work overlaps.
 Read the [record specification](../src/record/README.md) before changing the
 workload or interpreting a result.
 
-## Running
+## Run, archive and compare the suite
+
+From the workspace root, `python scripts/benchmarks.py run` builds the three
+targets once and runs them serially, using eight connections and three measured
+100-million-record samples per target. `--include-copy` adds existing-record
+copying; use smaller record counts first when changing the harness. Standalone
+Cargo commands below continue to default to one connection and one sample.
+
+Each target emits an `ENVIRONMENT` JSON line before warmup, with CPU model,
+physical/logical cores, available parallelism, RAM, OS and power plan/governor
+where available. The shared [environment collector](environment/README.md)
+has no timed or production role. Ordinary test/help invocations skip it.
+
+The runner preserves raw logs, machine/build/source identity, per-sample and
+per-connection results in a versioned JSON bundle, plus CSV and generated Markdown.
+It can regenerate tables and compare median throughput against an approved
+baseline without rerunning it. See [automation documentation](../../../scripts/README.md)
+for commands, validation, exit codes and artifact retention. No regression budget
+is silently chosen, and matching machine/workload settings are required by default.
+The [root README](../../../README.md) presents the selected results for repository
+readers; this document owns workload contracts and historical measurements.
+
+## Writer and combined runs
+
+The default workload for every target is **100 million records with 2,048-byte
+payloads**, after a separate one-million-record warmup. These new commands divide
+that total across eight writer/receiver pairs:
+
+```powershell
+cargo bench -p transaction-log-exports --bench record_writer --locked -- --connections 8
+cargo bench -p transaction-log-exports --bench record_io --locked -- --connections 8
+```
+
+Use one connection by omitting `--connections`, or specify it explicitly. The new
+targets share their producer and coordination code in [support](support/README.md),
+whose README documents timing, ownership, failure behavior and verification.
+The reader-only implementation stays independent so writer changes do not change
+its timed workload.
+
+Both writer targets select a workload before timing:
+
+- `--workload serialize` (default): invoke the public synchronous callback for
+  every record, write its payload in eight-byte chunks, and compute its header/CRC.
+  Payload input is reused; there is no input `Vec` allocation per record. This is
+  a synthetic field-writing workload, not a benchmark of a specific serializer.
+- `--workload copy`: synchronously call `write_record` on prevalidated records.
+  Fixture generation/validation is outside timing; copying into the writer's
+  batch and sending it are timed. Fixture IDs repeat between batches/connections.
+
+Both call async `flush_buffer()` after each batch, reuse its allocation, and
+explicitly flush/shut down the socket at the end. They do not use a worker queue,
+buffer pool, timer, or file synchronization. Each writer owns its destination.
+
+```powershell
+# Small checks before a full measurement:
+cargo bench -p transaction-log-exports --bench record_writer --locked -- --records 100000 --warmup-records 0
+cargo bench -p transaction-log-exports --bench record_io --locked -- --connections 8 --records 100003 --warmup-records 0
+
+# Existing-record copying, or different batching/serialization granularity:
+cargo bench -p transaction-log-exports --bench record_writer --locked -- --connections 8 --workload copy
+cargo bench -p transaction-log-exports --bench record_io --locked -- --connections 8 --batch-records 256
+cargo bench -p transaction-log-exports --bench record_writer --locked -- --write-chunk-bytes 2048
+```
+
+The options below in the reader section also apply to the new targets, with these
+differences: `--batch-records` counts records per `flush_buffer`, `--retain-records`
+is available only on targets with a real reader, and the writer targets additionally
+accept `--workload serialize|copy` and `--write-chunk-bytes N` (positive, default 8).
+An explicit chunk option with the copy workload is rejected. Each run prints its
+configuration and per-connection/aggregate `RESULT` data. The new targets time a
+common worker start through the last sender **or** receiver completion, print both
+durations, and verify encoded byte counts and clean EOF. The combined target also
+validates and counts every record. The raw-drain target derives its record count
+from completed writer calls and does not claim to validate record contents.
+
+At the defaults, 100 million records are **206.4 GB of encoded traffic**. Input is
+generated progressively, not materialized in full. Memory scales with per-writer
+batch capacity, copy fixtures and receiver retention. Sixteen workers run for eight
+connections, competing for the same machine's CPU and memory resources. Fresh
+writers may grow their batches during timing; the warmup uses separate writers.
+
+These are opt-in executables, with the same early skip guard as `record_reader`.
+Ordinary tests and all-target test runs must never launch a long transfer.
+Build without measuring using `cargo bench -p transaction-log-exports --no-run --locked`.
+Run comparisons serially under comparable conditions and retain raw results;
+see the maintenance guidance below. The executables enforce no fixed performance
+threshold; the suite comparison command accepts an explicit regression budget.
+
+## Running the reader benchmark
 
 Run from the workspace root. The default is **100 million records with 2,048-byte
 payloads**, one measured transfer following a one-million-record warmup:
@@ -117,8 +214,8 @@ other readers still transferring. Eviction of older records during a transfer
 is measured. The two consumption modes are selected before the read loop so
 immediate-drop mode has no retention branch or queue operations per record.
 
-The encoder lives only in this benchmark executable until a production writer
-exists. It follows the public little-endian wire contract and uses CRC-32C over
+The encoder stays local to this benchmark to keep its prebuilt-byte producer
+independent of `RecordWriter`. It follows the public little-endian wire contract and uses CRC-32C over
 the finalized header and payload. It never calls private constructors or casts
 native header memory. Each batch cycles through valid stream IDs; sequence
 numbers advance within each stream in that batch. **The exact batch is replayed,
@@ -306,3 +403,68 @@ The production reader and per-record read loop were unchanged. For closer
 comparisons, repeat both `--connections 1` and `--connections 8` with this same
 executable and the same workload and environment. No specific resource bottleneck
 was established by this benchmark.
+
+## Three-target measurement: 2026-09-16
+
+After adding the independent writer and combined targets, all three commands ran
+serially on an Intel Core i9-12900HK (14 cores / 20 logical processors), Windows
+11 Pro 10.0.26200, Rust 1.98.0 (`88d9e12ae`, LLVM 22.1.8), targeting
+`x86_64-pc-windows-msvc`. Cargo used its optimized bench profile, with no additional
+Rust flags supplied. CPU affinity and socket buffers were unchanged. No other
+benchmark or compilation was launched concurrently; desktop background activity
+and scheduling remained uncontrolled.
+
+```powershell
+cargo bench -p transaction-log-exports --bench record_reader --locked -- --connections 8
+cargo bench -p transaction-log-exports --bench record_writer --locked -- --connections 8
+cargo bench -p transaction-log-exports --bench record_io --locked -- --connections 8
+```
+
+Each command transferred **100,000,000 records / 206,400,000,000 encoded bytes**
+across eight connections after a separate one-million-record warmup. Payloads
+were 2,048 bytes, batches were 8,192 records, retention was disabled, and there
+was one measured run per target. Both writer targets used `serialize` with
+eight-byte body writes. The reader target replayed its prebuilt fixture.
+
+| Target | Aggregate seconds | Million records/minute | Encoded MiB/second |
+| --- | ---: | ---: | ---: |
+| Reader with prebuilt sender | 23.168342 | 258.974 | 8,496.006 |
+| Writer with raw byte drain | 29.289744 | 204.850 | 6,720.386 |
+| Combined writer and reader | 30.649856 | 195.759 | 6,422.163 |
+
+Every connection received exactly 12,500,000 records' worth of bytes
+(25,800,000,000). The two real-reader targets also validated and counted each
+record. The raw byte drain checked byte count and clean EOF, not record contents.
+Both writer targets made 1,526 buffer sends per connection (12,208 total),
+including the final partial batch. Independent checks of the printed results
+confirmed per-connection counts, aggregate totals and timing maxima.
+
+These establish initial observations for each workload, not statistical regression
+thresholds. The combined run includes writer CRC generation and reader CRC
+validation. The difference between the writer and combined times does not isolate
+reader CPU cost: their receivers use different buffering/I/O patterns and compete
+with senders for the same hardware. Compare repeated runs of the same target to
+assess a future change. These are throughput measurements, not command latency,
+network capacity between machines, or durable-file throughput.
+
+Raw outputs and environment details are in ignored local artifacts:
+`target/record-reader-100m-20260916.txt`,
+`target/record-writer-100m-20260916.txt`,
+`target/record-io-100m-20260916.txt`, and
+`target/record-io-benchmark-environment.txt`. The table and conditions above remain
+the durable record if `target/` is cleaned.
+
+Before these full transfers, short runs exercised both new targets and workloads
+with empty/maximum payloads, uneven totals, one record per connection, repeated
+runs, uneven warmup, partial batches, seven-byte body chunks and retained records.
+Twenty-seven invalid configurations were rejected; help and explicit skip guards
+were checked. One-million-record eight-connection runs also passed for both
+serialization and copying on each target. The initial full measurement above did
+not include copying. Workspace unit tests, documentation tests, all-target test
+skipping, formatting, Clippy and Rustdoc checks passed.
+
+Later completed suites and their machine/source metadata are preserved in the
+[published observations](../../../benchmarks/README.md). Those same-source,
+single-sample compiler comparisons varied substantially on this shared desktop
+and did not establish a compiler regression. The root README presents those saved
+results; the earlier single-run figures above remain historical observations.

@@ -29,8 +29,9 @@ benchmark result or a guarantee made by this crate.
 | `SequenceNumber` | Implemented: a typed integer with no raw-value validation. |
 | `record_protocol` | Implemented: encoded sizes, offsets, raw header/CRC initialization, field decoding, and CRC calculation shared by consumers. |
 | `RecordReader` in the sibling `record_reader.rs` | Implemented: asynchronous input, complete wire validation, and batch preparation. |
-| Internal `RecordBuilder` in the sibling `record_writer` module | Implemented: bounded body serialization, retained errors, header/CRC finalization, and rollback. |
-| `RecordWriter` | Implemented: own reusable storage, invoke a synchronous body-writing callback, finalize successful records, and roll back failures. Shared output remains planned. |
+| `RecordBuilder` in the sibling `record_writer` module | Implemented: concrete callback destination with bounded body serialization; construction and finalization remain module-private. |
+| `RecordWriter` | Implemented: constructor-selected modes for synchronous serialization or existing-record copies, one reusable buffer and owned async destination, explicit buffer output, separate destination flushing and optional data synchronization, and terminal handling of failed/cancelled I/O. Scheduling and durability policy belong to higher layers. |
+| `AsyncSyncData` in the sibling `record_writer` module | Implemented: optional destination capability that makes data synchronization available on a suitably bounded `RecordWriter`. Tokio files have an implementation; arbitrary `AsyncWrite` destinations do not. |
 | Stream ingestion and file replay | Planned: enforce sequence continuity using previously known stream state. |
 
 Keep `mod.rs` thin and keep each record type in its own file. The reader is a
@@ -378,38 +379,76 @@ writes are bounded to 65,519 bytes, proving that adding the fixed 16-byte overhe
 fits the encoded length without overflow or a repeated range check.
 No provisional header or payload may be sent before finalization.
 
-The sibling [record writer module](../record_writer/README.md) implements
-`RecordWriter` and its internal `RecordBuilder` for bounded `std::io::Write`
-body writing. `RecordWriter::write(id, write_body)` takes an unboxed `FnOnce`
-callback with a scoped `&mut dyn std::io::Write` view of the private builder.
-The body is opaque; application types and serialization choices belong to the
-callback's code. The writer README documents callback code-generation evidence.
-Each builder constructs exactly one record, allowing many writes into that
-record's body. Each subsequent record gets a fresh builder borrowing the writer's
-buffer; the writer and buffer are reused across records.
-Construction reserves room for a maximum-sized record, captures a pointer covering
-the whole spare record region, and leaves its bytes uninitialized.
-A cached payload-byte count enforces the size limit; accepted writes use the
-pointer into reserved storage and advance only that count. The buffer's readable
-length stays unchanged until `finish` exposes the complete initialized record.
-Serialization and finalization cannot grow the buffer.
-The writer module documents the append safety proof and performance evidence.
-`finish(self, id: RecordId)` checks retained write errors, derives total length,
-calls the protocol's `write::header` and `write::crc`, then publishes the total
-buffer length once. It consumes the builder and leaves the
-complete record in the same buffer, without splitting or moving its payload.
-No bytes are prefilled. Header and trailer receive their final values during finish.
+The sibling [record writer module](../record_writer/README.md) provides synchronous
+`RecordWriter::write(id, callback)` with a concrete `&mut RecordBuilder` for static
+dispatch into its `std::io::Write` implementation. The builder type is public, but
+its constructor, fields, and finalization are module-private. Each builder makes
+one record in the writer's `BytesMut`, appending after earlier buffered records.
+The caller explicitly sends the accumulated batch with `flush_buffer().await`.
+Only successful buffer output clears that allocation for reuse.
+Buffering lets the writer compute the final length before emitting the first
+header field and reject an unfinished record before any of it reaches a destination.
+A serializer's `Write::flush` does not finish or send a record.
 
-`RecordWriter::write` checks the callback's own result before calling
-`finish`. Dropping an unfinished builder, including after a rejected finish or during
-unwinding, discards the current construction while preserving earlier records
-and buffer capacity. `RecordWriteError<E>` distinguishes a retained build error
-from a body-writing callback error and preserves the latter's concrete type.
-The public writer exposes complete buffered bytes and permits clearing them for
-storage reuse or transferring the whole immutable buffer. Output coordination,
-bounded batching, and buffer recycling remain planned; the writer module's README
-defines the staged design and ownership contracts. Finalization does not construct
-a public `Record` or establish sequence acceptance, remote receipt, or durability.
+Construction reserves a complete maximum-sized record and captures a pointer
+covering the spare region. A cached payload count enforces the size limit; body
+writes initialize only their final payload positions. The buffer's readable length
+stays unchanged until `finish(self, id)` initializes the header and CRC trailer
+through the protocol's `write` helpers and publishes the completed length once.
+No bytes are prefilled, and serialization/finalization cannot grow the buffer.
+The writer module documents the full safety proof and retained performance evidence.
+
+Retained write errors prevent finalization. The caller must independently reject
+serializer errors before calling `finish`. Dropping an unfinished builder,
+including after rejected finalization or during unwind, preserves earlier records
+and buffer capacity. Finalization does not create a public `Record`, check sequence
+continuity, send bytes, or establish remote acceptance or durability.
+
+`RecordWriter::for_serialization(destination)` and `RecordWriter::for_records(destination)`
+take ownership of an already-open destination and select its append API at compile
+time. They infer `RecordWriter<W, SerializeRecords>` and `RecordWriter<W, ExistingRecords>`
+respectively. Neither mode can call the other's append method, and there is no mode
+conversion. Zero-sized markers require no runtime mode checks. Both modes share
+buffer output, destination flushing, optional synchronization and failure handling.
+Output requires `AsyncWrite + Unpin`. The caller completes socket handshakes or
+chooses file opening mode and position. No Send bound, thread, task, queue, pool
+or timer is imposed by this middle layer. The caller drives each async operation.
+
+Serialization mode's `write` immediately runs its callback and completes the builder
+without I/O. Existing-record mode's `write_record(&record)` copies an encoding into
+its batch without construction, byte-handle cloning, repeated validation or CRC
+recalculation. This copy keeps the append synchronous and preserves record order;
+the original record can be dropped as soon as the append returns. Each mode's buffer
+grows as needed, with limits applied per record rather than per batch. Callers
+control batch latency and retained capacity by choosing when to send; the writer
+does not impose an automatic send threshold, pool or timer.
+
+`flush_buffer().await` sends all buffered bytes, handling partial writes and
+retaining capacity for reuse. `flush().await` flushes only the destination's own
+buffering; it does not send the writer's pending records. For durable file output,
+perform both operations before `writer.sync_data().await`, available when the
+destination implements `AsyncSyncData`. Tokio files implement this capability;
+other storage wrappers can opt in. Synchronization does not implicitly send or
+flush buffered records and is not a replication acknowledgement. This trait uses
+static dispatch without requiring a boxed or Send future. Storage wrappers must
+explicitly implement it; the capability is not forwarded automatically.
+Applications needing `sync_all` use the file through `get_ref`; those direct
+operations bypass the writer's failure tracking and need caller error handling.
+`into_inner` returns destination ownership and discards unsent
+records without implicit output, flush or shutdown. Applications own batching,
+durable-sync cadence, worker sharing and any background handoffs. A single-buffer
+writer cannot construct another record while a buffer flush is in progress.
+
+Construction errors and callback unwinding roll back only the current record.
+Output errors, panics and cancellation leave the writer unusable, so later writes
+cannot replay a partially accepted record prefix. Failed or incomplete data
+synchronization also makes the writer unusable because durability is uncertain.
+The first I/O error is returned directly; subsequent writes, flushes and syncs
+return `Unusable`. A pending send keeps its cursor only inside that future;
+although the full batch remains buffered on failure, replaying it is unsafe.
+An unpolled future has no effect. Connection setup, stream ordering, acknowledgements, reconnection,
+file recovery and command admission remain application responsibilities. See the
+writer README for ownership, cancellation and output completion contracts.
 
 The broader planned service is a cluster of transaction logs with prompt
 replication to read replicas, roughly one-second durable flushes, and no
@@ -440,7 +479,8 @@ Review changes against the relevant coverage:
 | Public API rejects field mutation and direct header construction; generated accessors remain callable | Rustdoc examples in `record_id.rs`, `record_header.rs`, and `stream_id_error.rs`; existing record and stream tests |
 | Partial input, cancellation, batching, fixed size limits, malformed records, error state, retained records across refills | Sibling `record_reader.rs` |
 | Bounded serialization, complete framing/CRC, prefix isolation, rollback, preallocated storage, and reader compatibility | Sibling `record_writer/record_builder.rs` |
-| Public callback invocation, error precedence and preservation, retry/unwind rollback, buffer reuse/transfer, thread movement, and reader integration | Sibling `record_writer/record_writer.rs` and `record_writer/record_write_error.rs` |
+| Synchronous appends without I/O, batching, callback errors, owned destinations, allocation reuse, existing record copies, partial writes, cancellation, separate send/flush/sync operations, terminal failures, lifecycle, file and handshake-complete socket integration | Sibling `record_writer/record_writer.rs` |
+| Constructor-selected append APIs cannot be mixed; synchronization unavailable without its optional trait; public file usage example and builder privacy | Rustdoc examples in sibling `record_writer/README.md` |
 
 The shared test encoder and bitwise CRC reference live in the protocol's
 test-only support module. They deliberately do not call production decoding or
