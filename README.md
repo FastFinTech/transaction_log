@@ -6,8 +6,9 @@ streams, persists them, and serves stream-specific reads. Throughput, predictabl
 latency, buffer ownership and the cost of each record operation drive the design.
 
 **Status:** the record format, reader, writer and TCP benchmark suite are
-implemented. The service executable and log-file provider are scaffolds; storage,
-indexing, replication and client protocol handling remain in development.
+implemented, alongside log-file identities, path layout and stream-directory
+initialization. The service executable is a scaffold; file persistence, indexing,
+replication and client protocol handling remain in development.
 
 ## Design priorities
 
@@ -209,7 +210,9 @@ failure handling, comparison rules and integration commands.
 - [x] Synchronous record builder and compile-time writer modes.
 - [x] Explicit async buffer output, destination flushing and optional file data synchronization.
 - [x] Single-threaded object-pool utility with unused-object reclamation.
-- [x] Log-file provider scaffold accepting a root directory.
+- [x] Storage provider with owned startup configuration, deterministic log/index paths and stream-directory initialization.
+- [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
+- [x] Stream checkpoint model and validated JSON serialization for storage identities/checkpoints; persistence and recovery integration remain pending.
 - [x] Independent reader/writer and combined loopback benchmarks.
 - [x] Benchmark artifacts with machine specifications, report generation and regression comparison.
 - [ ] Service connection setup, handshake and client lifecycle.
@@ -229,7 +232,7 @@ service's persistence policy and recovery behavior are still to be implemented.
 
 | Path | Responsibility |
 | --- | --- |
-| [`services/transaction-log`](services/transaction-log) | Service executable and application modules; currently scaffolded. |
+| [`services/transaction-log`](services/transaction-log) | Service executable scaffold, log-file identities, path layout and directory initialization. |
 | [`services/transaction-log-exports`](services/transaction-log-exports) | Public record types, reader, writer and benchmarks. |
 | [`lib/object-pool`](lib/object-pool) | Reusable single-threaded object pool. |
 | [`scripts`](scripts/README.md) | Benchmark execution, reporting and comparison tooling. |
@@ -264,7 +267,7 @@ design decisions, safety invariants and optimization evidence.
 | [Exports crate overview](services/transaction-log-exports/src/lib.rs) | Public types and API entry points. |
 | [Record specification](services/transaction-log-exports/src/record/README.md) | Wire format, ownership, validation and reader integration. |
 | [Writer specification](services/transaction-log-exports/src/record_writer/README.md) | Constructor modes, buffering, completion, cancellation and hot-path rationale. |
-| [Log-file provider](services/transaction-log/src/log_file_provider/README.md) | Implemented scaffold and storage boundaries. |
+| [Storage](services/transaction-log/src/storage/README.md) | File identities, startup configuration, path layout, directory initialization and storage boundaries. |
 | [Object pool](lib/object-pool/README.md) | Ownership, reclamation policy and usage. |
 | [Benchmark specification](services/transaction-log-exports/benches/README.md) | Workloads, timing contracts and measurement history. |
 

@@ -1,4 +1,5 @@
 use getset::CopyGetters;
+use serde::{Deserialize, Serialize};
 
 use super::{SequenceNumber, StreamId};
 
@@ -14,6 +15,9 @@ use super::{SequenceNumber, StreamId};
 ///
 /// This is an owned Rust value whose memory layout is compiler-selected.
 /// Its wire representation is defined separately by [`super::record_protocol`].
+/// Serde metadata uses named `stream_id` and `sequence_number` fields, with integer
+/// values. Deserialization validates the stream ID and rejects missing, duplicate
+/// or unknown fields; it does not check sequence continuity against storage.
 ///
 /// ```compile_fail,E0616
 /// use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
@@ -21,8 +25,11 @@ use super::{SequenceNumber, StreamId};
 /// let mut id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
 /// id.sequence_number = SequenceNumber::MAX;
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, CopyGetters)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, CopyGetters, Serialize, Deserialize,
+)]
 #[getset(get_copy = "pub")]
+#[serde(deny_unknown_fields)]
 pub struct RecordId {
     /// Logical stream containing the record, shared by its replicas.
     stream_id: StreamId,
@@ -76,6 +83,28 @@ impl RecordId {
 #[cfg(test)]
 mod tests {
     use super::{RecordId, SequenceNumber, StreamId};
+
+    #[test]
+    fn json_uses_named_fields_and_validated_identifiers() {
+        let json = r#"{"stream_id":4095,"sequence_number":18446744073709551615}"#;
+        let id = RecordId::new(StreamId::MAX, SequenceNumber::MAX);
+        assert_eq!(serde_json::to_string(&id).unwrap(), json);
+        assert_eq!(serde_json::from_str::<RecordId>(json).unwrap(), id);
+
+        for invalid in [
+            r#"{"stream_id":4096,"sequence_number":0}"#,
+            r#"{"stream_id":0}"#,
+            r#"{"sequence_number":0}"#,
+            r#"{"stream_id":0,"stream_id":1,"sequence_number":0}"#,
+            r#"{"stream_id":0,"sequence_number":0,"sequence_number":1}"#,
+            r#"{"stream_id":0,"sequence_number":0,"extra":0}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<RecordId>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     #[test]
     fn successor_preserves_stream_and_advances_across_numeric_boundaries() {

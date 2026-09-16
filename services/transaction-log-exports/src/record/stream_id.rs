@@ -2,19 +2,24 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use super::StreamIdError;
 
 /// A logical stream ID in `0..=4095`, stored as a `u16`.
 ///
-/// Replicas of a stream share the same ID. The private field ensures callers
-/// validate new IDs through [`new`](Self::new) or [`TryFrom<u16>`]. Records
-/// already validated by [`RecordReader`](crate::RecordReader) expose this type
-/// directly, without repeating the range check.
+/// Replicas of a stream share the same ID. Raw IDs are validated through
+/// [`new`](Self::new) or [`TryFrom<u16>`]; [`Self::all`] enumerates the supported
+/// domain as already valid IDs. Records already validated by
+/// [`RecordReader`](crate::RecordReader) expose this type directly, without
+/// repeating the range check.
 ///
 /// The ID names a logical virtual shard, not its current host or execution
 /// context. Zero is valid. The supported stream count is a domain constraint,
 /// distinct from the larger representable `u16` range. Conversion to `u16`
 /// preserves the value, and display uses decimal notation.
+/// Serde represents the ID as an integer and validates deserialized values through
+/// [`TryFrom<u16>`], preserving the supported range when loading metadata.
 ///
 /// ```
 /// use transaction_log_exports::StreamId;
@@ -25,7 +30,10 @@ use super::StreamIdError;
 /// # Ok::<(), transaction_log_exports::StreamIdError>(())
 /// ```
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+// A transparent Deserialize derive would bypass the domain check. Keep external
+// metadata on the same validated construction path as other raw IDs.
+#[serde(try_from = "u16", into = "u16")]
 pub struct StreamId(u16);
 
 impl StreamId {
@@ -47,6 +55,26 @@ impl StreamId {
             return Err(StreamIdError::new(value));
         }
         Ok(Self(value))
+    }
+
+    /// Enumerates every supported stream ID from [`Self::MIN`] to [`Self::MAX`], inclusive.
+    ///
+    /// The iterator is lazy, allocates nothing, and yields each ID once in ascending
+    /// order without repeated validation. Each call starts a fresh iteration over
+    /// the domain; it does not discover existing streams or filter by host ownership.
+    ///
+    /// ```
+    /// use transaction_log_exports::StreamId;
+    ///
+    /// let mut ids = StreamId::all();
+    /// assert_eq!(ids.next(), Some(StreamId::MIN));
+    /// assert_eq!(ids.last(), Some(StreamId::MAX));
+    /// assert_eq!(StreamId::all().count(), StreamId::COUNT);
+    /// ```
+    pub fn all() -> impl Iterator<Item = Self> {
+        // The bounded range already establishes validity. Construct the private
+        // wrapper directly instead of validating each value or using unsafe code.
+        (Self::MIN.0..=Self::MAX.0).map(Self)
     }
 
     /// Returns the validated integer without checking its range again.
@@ -109,6 +137,34 @@ mod tests {
                 assert_eq!(error.value(), value);
                 assert_eq!(StreamId::try_from(value), Err(error));
             }
+        }
+    }
+
+    #[test]
+    fn enumerates_every_supported_id_once_in_ascending_order() {
+        let mut ids = StreamId::all();
+        for expected in 0..4096 {
+            assert_eq!(ids.next().unwrap().get(), expected);
+        }
+        assert_eq!(ids.next(), None);
+        assert_eq!(StreamId::all().next(), Some(StreamId::MIN));
+    }
+
+    #[test]
+    fn json_uses_integers_and_preserves_stream_validation() {
+        for (json, expected) in [("0", StreamId::MIN), ("4095", StreamId::MAX)] {
+            assert_eq!(serde_json::from_str::<StreamId>(json).unwrap(), expected);
+            assert_eq!(serde_json::to_string(&expected).unwrap(), json);
+        }
+
+        let error = serde_json::from_str::<StreamId>("4096").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&StreamId::new(4096).unwrap_err().to_string())
+        );
+        for json in ["65535", "65536", "-1", "1.5", "null", "\"42\""] {
+            assert!(serde_json::from_str::<StreamId>(json).is_err(), "{json}");
         }
     }
 

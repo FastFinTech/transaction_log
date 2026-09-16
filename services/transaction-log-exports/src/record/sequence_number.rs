@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// A stream-local sequence number. Every `u64` value is representable.
 ///
 /// This type distinguishes sequence numbers from lengths and other integers;
@@ -12,8 +14,11 @@ use std::fmt;
 ///
 /// [`From<u64>`] and [`Self::new`] provide equivalent infallible construction.
 /// Conversion back to `u64` preserves the value, and display uses decimal notation.
+/// Serde represents it as an unsigned integer with the full `u64` range; loading
+/// metadata does not establish sequence continuity.
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SequenceNumber(u64);
 
 impl SequenceNumber {
@@ -59,6 +64,28 @@ impl fmt::Display for SequenceNumber {
 mod tests {
     use super::SequenceNumber;
     use std::mem::{align_of, size_of};
+
+    #[test]
+    fn json_preserves_full_u64_precision_and_rejects_non_u64_values() {
+        for (json, raw) in [
+            ("0", 0),
+            ("9007199254740993", 9_007_199_254_740_993),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            let sequence = SequenceNumber::new(raw);
+            assert_eq!(
+                serde_json::from_str::<SequenceNumber>(json).unwrap(),
+                sequence
+            );
+            assert_eq!(serde_json::to_string(&sequence).unwrap(), json);
+        }
+        for json in ["18446744073709551616", "-1", "1.5", "null", "\"42\""] {
+            assert!(
+                serde_json::from_str::<SequenceNumber>(json).is_err(),
+                "{json}"
+            );
+        }
+    }
 
     #[test]
     fn preserves_u64_values_and_layout() {

@@ -5,5 +5,12 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-tokio.workspace = true
+getset.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 transaction-log-exports = { path = "../transaction-log-exports" }
+
+[dev-dependencies]
+tempfile = "3"

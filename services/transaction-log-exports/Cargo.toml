@@ -7,12 +7,13 @@ edition.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
 getset.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
 anyhow.workspace = true
-serde_json = "1"
+serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["net", "time"] }
 

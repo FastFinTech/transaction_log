@@ -25,7 +25,7 @@ benchmark result or a guarantee made by this crate.
 | `Record` | Implemented: immutable ownership of exactly one validated encoded record and inexpensive accessors. |
 | `RecordHeader` | Implemented: an independently owned, read-only snapshot of length and identity. |
 | `RecordId` | Implemented: a read-only `StreamId` and `SequenceNumber` pair with a checked successor operation. |
-| `StreamId` / `StreamIdError` | Implemented: a validated logical stream identifier and its construction error. |
+| `StreamId` / `StreamIdError` | Implemented: a validated logical stream identifier, enumeration of its supported domain, and its construction error. |
 | `SequenceNumber` | Implemented: a typed integer with no raw-value validation. |
 | `record_protocol` | Implemented: encoded sizes, offsets, raw header/CRC initialization, field decoding, and CRC calculation shared by consumers. |
 | `RecordReader` in the sibling `record_reader.rs` | Implemented: asynchronous input, complete wire validation, and batch preparation. |
@@ -104,6 +104,13 @@ and trailer-borrow helpers are unnecessary.
 a valid stream ID. `StreamId::new` and `TryFrom<u16>` validate external values and
 return `StreamIdError` containing the rejected integer. Replicas use the same ID.
 
+`StreamId::all()` returns a fresh, lazy iterator over every supported ID, from
+`MIN` through `MAX` inclusive and in ascending order. It allocates no collection
+and constructs valid wrappers directly from the bounded range without repeated
+validation or unsafe code. Consumers such as storage initialization can remain
+typed throughout instead of rebuilding raw integer ranges. This enumerates the
+supported domain, not streams discovered on disk or assigned to a particular host.
+
 Streams represent virtual shards, rather than individual users or accounts.
 A user or another chosen domain boundary stays on its original logical shard;
 the machine hosting a shard can change. A stream ID therefore does not identify
@@ -134,6 +141,27 @@ method, keeping ordinary calls direct while preventing silent wraparound.
 It leaves the original ID unchanged and performs no allocation or repeated
 stream ID validation. It does not reserve an ID, synchronize producers, or prove
 sequence continuity.
+
+### Identifier metadata serialization
+
+`StreamId`, `SequenceNumber` and `RecordId` implement Serde's format-independent
+`Serialize` and `Deserialize` traits for metadata such as storage checkpoints.
+In JSON the wrappers are integers; a record ID is an object such as
+`{"stream_id":42,"sequence_number":123}`. Its two fields are required, with
+duplicate and unknown object fields rejected.
+
+`StreamId` uses `#[serde(try_from = "u16", into = "u16")]`, routing loading through
+its existing checked conversion. Do not replace this with transparent derived
+deserialization: that would allow external metadata to construct an invalid ID.
+`SequenceNumber` is transparent to Serde because every `u64` value is valid.
+Integer decoding preserves the full range without conversion through floats.
+Serde reports invalid numeric types/ranges and stream-domain errors through the
+chosen format's error type. It does not establish sequence continuity or record
+existence, which still require application state.
+
+These traits describe metadata, not encoded records. They add no stored fields
+or validation to getters and are not called by the record reader/writer codecs.
+The explicit little-endian protocol remains authoritative for record I/O.
 
 ## Ownership, native layout, and accessors
 
@@ -473,9 +501,9 @@ Review changes against the relevant coverage:
 | --- | --- |
 | Accessors, exact payload slices, empty/maximum payloads, typed boundaries, all eight address residues, shared ownership and header lifetime | `record.rs` |
 | Encoded sizes, offsets, uninitialized header/CRC writes at byte alignments with guard bytes, endianness, raw numeric limits, known CRC vectors, every covered bit, excluded trailer, oversized test encoding | `record_protocol.rs` |
-| Entire raw `u16` range, conversions, representation, limits, rejected value accessor and formatting | `stream_id.rs` |
-| Raw sequence boundaries, conversions, representation, formatting | `sequence_number.rs` |
-| Successor arithmetic across numeric boundaries, preserved stream ID, panic on exhaustion in debug and release builds | `record_id.rs` |
+| Entire raw `u16` range, conversions, representation, limits, rejected value accessor, formatting and validated JSON loading | `stream_id.rs` |
+| Raw sequence boundaries, conversions, representation, formatting and exact full-range JSON integers | `sequence_number.rs` |
+| Successor arithmetic across numeric boundaries, preserved stream ID, panic on exhaustion in debug and release builds, named-field JSON shape and invalid metadata | `record_id.rs` |
 | Public API rejects field mutation and direct header construction; generated accessors remain callable | Rustdoc examples in `record_id.rs`, `record_header.rs`, and `stream_id_error.rs`; existing record and stream tests |
 | Partial input, cancellation, batching, fixed size limits, malformed records, error state, retained records across refills | Sibling `record_reader.rs` |
 | Bounded serialization, complete framing/CRC, prefix isolation, rollback, preallocated storage, and reader compatibility | Sibling `record_writer/record_builder.rs` |
