@@ -1,4 +1,5 @@
 {
+    "explorer.excludeGitIgnore": true,
     "debug.allowBreakpointsEverywhere": true,
     "rust-analyzer.debug.engine": "vadimcn.vscode-lldb",
     "lldb.launch.preRunCommands": [
