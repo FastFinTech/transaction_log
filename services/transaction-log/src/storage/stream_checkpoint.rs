@@ -24,6 +24,8 @@ use super::LogFileId;
 /// Deserialization checks the stream ID's domain and numeric types, and rejects
 /// missing, duplicate or unknown fields. These metadata checks do not establish
 /// that the checkpoint agrees with storage or is safe to use for recovery.
+/// [`super::StorageProvider::checkpoint_file_path`] supplies its per-stream path;
+/// the model itself does not choose a location or perform file I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CopyGetters, Serialize, Deserialize)]
 #[getset(get_copy = "pub")]
 #[serde(deny_unknown_fields)]

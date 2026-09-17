@@ -9,8 +9,8 @@ use super::{LogFileId, StorageConfig, StorageProviderError};
 /// Paths follow the fixed decimal layout documented in this module's README.
 /// Path construction is synchronous and performs no filesystem access. Call
 /// [`Self::initialize`] during startup to ensure all stream base directories exist.
-/// Opening log/index files and creating their deeper range directories belong to
-/// future file operations; this provider does not yet manage open handles.
+/// Opening files and creating deeper log/index range directories belong to future
+/// file operations; this provider does not yet manage open handles.
 ///
 /// The provider is immutable and can be shared through `Arc<StorageProvider>`.
 /// It has no path cache, locks, background tasks or initialization flag.
@@ -37,7 +37,7 @@ impl StorageProvider {
     ///
     /// Creates missing parents and `streams/0000` through `streams/4095` using
     /// Tokio filesystem operations. Existing directories and their contents are
-    /// left intact. No range directories, log files or index files are created.
+    /// left intact. No range directories, log, index or checkpoint files are created.
     ///
     /// Call during startup before starting file operations. Repeated calls are
     /// allowed. Failure or cancellation can leave some directories created; a
@@ -77,7 +77,17 @@ impl StorageProvider {
         self.file_path(id, "idx")
     }
 
-    /// Shared base layout for initialization and both file-path methods.
+    /// Constructs the absolute `checkpoint.json` path for one stream's checkpoint.
+    ///
+    /// The checkpoint belongs to the stream, so its path stays in the stream base
+    /// directory as the last checkpointed record advances across log files. Returns
+    /// an owned path without creating directories or loading, writing or validating
+    /// checkpoint data. The path is available before initialization.
+    pub fn checkpoint_file_path(&self, stream_id: StreamId) -> PathBuf {
+        self.stream_directory(stream_id).join("checkpoint.json")
+    }
+
+    /// Shared base layout for initialization and all file-path methods.
     fn stream_directory(&self, stream_id: StreamId) -> PathBuf {
         self.root_directory()
             .join("streams")
@@ -147,6 +157,26 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_paths_use_stream_bases_without_filesystem_access() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("log data 東京").join("replica");
+        let provider = StorageProvider::new(StorageConfig::new(root.clone()).unwrap());
+
+        for (stream, relative) in [
+            (0, "streams/0000/checkpoint.json"),
+            (42, "streams/0042/checkpoint.json"),
+            (4095, "streams/4095/checkpoint.json"),
+        ] {
+            assert_eq!(
+                provider.checkpoint_file_path(StreamId::new(stream).unwrap()),
+                root.join(relative),
+            );
+        }
+        assert!(!root.exists());
+        assert_eq!(temporary.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[test]
     fn relative_configuration_produces_absolute_paths() {
         let current = std::env::current_dir().unwrap();
         let provider = StorageProvider::new(StorageConfig::new("log data".into()).unwrap());
@@ -156,6 +186,10 @@ mod tests {
         assert_eq!(
             provider.log_file_path(id),
             current.join("log data/streams/0000/000/000/000/000/000000000000000.log")
+        );
+        assert_eq!(
+            provider.checkpoint_file_path(StreamId::MIN),
+            current.join("log data/streams/0000/checkpoint.json"),
         );
     }
 
@@ -175,6 +209,10 @@ mod tests {
         assert_eq!(
             provider.log_file_path(id),
             root.join("streams/0000/000/000/000/000/000000000000000.log")
+        );
+        assert_eq!(
+            provider.checkpoint_file_path(StreamId::MIN),
+            root.join("streams/0000/checkpoint.json"),
         );
         assert!(!root.exists());
     }
@@ -204,10 +242,12 @@ mod tests {
         );
         let log = provider.log_file_path(id);
         let index = provider.index_file_path(id);
+        let checkpoint = provider.checkpoint_file_path(id.stream_id());
         assert!(!log.parent().unwrap().exists());
         fs::create_dir_all(log.parent().unwrap()).unwrap();
         fs::write(&log, b"existing log contents").unwrap();
         fs::write(&index, b"existing index contents").unwrap();
+        fs::write(&checkpoint, b"existing checkpoint contents").unwrap();
         let unrelated = root.join("existing-metadata");
         fs::write(&unrelated, b"keep me").unwrap();
 
@@ -215,6 +255,10 @@ mod tests {
 
         assert_eq!(fs::read(log).unwrap(), b"existing log contents");
         assert_eq!(fs::read(index).unwrap(), b"existing index contents");
+        assert_eq!(
+            fs::read(checkpoint).unwrap(),
+            b"existing checkpoint contents"
+        );
         assert_eq!(fs::read(unrelated).unwrap(), b"keep me");
         assert_eq!(streams.read_dir().unwrap().count(), 4096);
     }

@@ -2,9 +2,9 @@
 
 This application module groups storage types for log, index and other file types.
 It currently implements log-file identities, a JSON-serializable stream-checkpoint
-model, immutable startup configuration, deterministic log/index paths and stream-directory
-initialization. File persistence, index encoding, recovery and management of open
-files remain future work.
+model, immutable startup configuration, deterministic log/index/checkpoint paths
+and stream-directory initialization. File persistence, index encoding, recovery
+and management of open files remain future work.
 
 Each type has its own source file. The thin `mod.rs` re-exports the public types
 and `RECORDS_PER_FILE` and includes this specification in Rustdoc:
@@ -36,7 +36,6 @@ A file belongs to exactly one `StreamId`. Its zero-based `file_number` assigns
 file_number = sequence_number / RECORDS_PER_FILE
 first_sequence = file_number * RECORDS_PER_FILE
 last_sequence = min(first_sequence + RECORDS_PER_FILE - 1, u64::MAX)
-record_index = sequence_number - first_sequence  (for a record in this file)
 ```
 
 | File number | First sequence | Last sequence |
@@ -95,8 +94,7 @@ an exception to the completion rule or claim that this terminal file is sealed.
 - `LogFileId::stream_id()` and `file_number()` are copy getters returning the typed
   components. Neither type has setters or unchecked public constructors.
 - `LogFileId::first_record_id()` and `last_record_id()` return inclusive assigned
-  endpoints. `record_index(record_id)` returns `Some(ordinal)` only for a record
-  in this stream and range; otherwise it returns `None`.
+  endpoints.
 - `LogFileId::next()` preserves the stream and delegates to the file number's
   checked successor. It does not duplicate the range check.
 
@@ -157,6 +155,13 @@ those facts. Checkpoint file loading, persistence, advancement, index recovery
 and startup integration remain future work; this step implements the model and
 its JSON representation.
 
+`StorageProvider::checkpoint_file_path(stream_id)` names this stream's checkpoint
+at `{root}/streams/{stream_id:04}/checkpoint.json`. The path depends only on the
+stream, so advancing across log-file ranges does not change the checkpoint's
+location. Initialization creates its parent directory but no checkpoint file.
+The future loader must check that the decoded checkpoint's stream ID matches the
+requested stream, as well as establishing its agreement with storage.
+
 ### JSON representation
 
 Checkpoint metadata uses human-readable JSON. It is small and updated outside
@@ -205,27 +210,17 @@ Direct arithmetic makes record-to-file lookup independent of directory scans or
 record byte lengths. It performs no allocation, I/O, locking or shared-state
 access. Raw file-number validation happens in `LogFileNumber` at construction or
 deserialization; sequence conversion proves the bound arithmetically. `LogFileId`
-construction and typed getters reuse those invariants. After matching the stream,
-`record_index` explicitly rejects a sequence below the file's first sequence,
-subtracts that first sequence, then rejects an index at or above `RECORDS_PER_FILE`.
-The first check prevents underflow; the second enforces the upper bound. This
-avoids another division or computing a saturating last-sequence bound, while
-keeping both checks visible in ordinary control flow.
+construction and typed getters reuse those invariants. These are implementation
+choices, not measured throughput claims. Storage benchmarks will follow actual
+file operations.
 
-On 2026-09-16, standalone wrappers using the production types were compared with
-Rust 1.98.1, LLVM 22.1.8, `x86_64-pc-windows-msvc`, and `-C opt-level=3`. These
-explicit checks compiled identically to checked subtraction followed by
-`then_some`; the compiler merged the wrappers into one function. This is evidence
-for that compiler and target, not a portable code-generation guarantee or a timed
-throughput result. No benchmark has been added for this primitive; storage
-benchmarks will follow actual file operations.
-
-The ordinal can locate an index entry, but it cannot locate a variable-length
-record's byte offset without index/file information. A full file contains 100,000
-records irrespective of their byte sizes. The provider owns the file-path layout;
-index encoding and offset width, open handles and read/write ownership remain
-responsibilities of the future storage implementation. Range endpoints must not
-be substituted for a durability or validation checkpoint.
+`LogFileId` describes file identity and assigned record-range boundaries.
+Locating records within a file and mapping them to index entries or byte offsets
+belong to the future file/index APIs, where the actual storage format is known.
+A full file contains 100,000 records irrespective of their byte sizes. The provider
+owns the file-path layout; index encoding and offset width, open handles and
+read/write ownership remain responsibilities of the future storage implementation.
+Range endpoints must not be substituted for a durability or validation checkpoint.
 
 ## Configuration and ownership
 
@@ -264,6 +259,7 @@ For stream 42 and file 1,234:
 ```text
 {root}/streams/0042/000/000/000/001/000000000001234.log
 {root}/streams/0042/000/000/000/001/000000000001234.idx
+{root}/streams/0042/checkpoint.json
 
 File number:  000 000 000 001 234
 Directories:  000/000/000/001/
@@ -274,6 +270,7 @@ At the maximum stream ID and file number:
 ```text
 {root}/streams/4095/184/467/440/737/184467440737095.log
 {root}/streams/4095/184/467/440/737/184467440737095.idx
+{root}/streams/4095/checkpoint.json
 ```
 
 The slashes above describe path components. Production construction uses native
@@ -284,7 +281,7 @@ the fifteen-digit representation.
 | Directory | Maximum assigned contents |
 | --- | ---: |
 | `streams/` | 4,096 stream directories, `0000` through `4095`. |
-| A stream base | 185 top-level range directories, `000` through `184`. |
+| A stream base | 185 top-level range directories, `000` through `184`, plus `checkpoint.json`. |
 | An intermediate range directory | 1,000 child directories, `000` through `999`. |
 | A leaf range directory | 1,000 log/index pairs, or 2,000 files. |
 
@@ -300,27 +297,30 @@ start, so growing sequences never require moving earlier files to add levels.
 Early paths intentionally include leading `000` directories.
 
 This is a fixed storage-layout contract, not a runtime directory-size setting.
-Changing digit widths, grouping, extensions or the `streams` component changes
-where files are found. Keep naming logic in the provider rather than duplicating
-it in future readers, writers, index maintenance or recovery code.
+Changing digit widths, grouping, extensions, the checkpoint filename or the
+`streams` component changes where files are found. Keep naming logic in the
+provider rather than duplicating it in future readers, writers, index maintenance
+or recovery code.
 
 ## Path construction and performance
 
 - `log_file_path(id: LogFileId) -> PathBuf` returns the complete absolute log path.
 - `index_file_path(id: LogFileId) -> PathBuf` returns the paired index path with
   the same directory and numeric basename.
+- `checkpoint_file_path(stream_id: StreamId) -> PathBuf` returns the stream's
+  `checkpoint.json` path directly inside its base directory.
 
-Both methods are synchronous and deterministic. They allocate a new path without
-scanning directories, testing existence, creating parents, opening handles or
-checking file contents. The caller retains ownership of the result independently
+All three methods are synchronous and deterministic. They allocate a new path
+without scanning directories, testing existence, creating parents, opening handles
+or checking file contents. The caller retains ownership of the result independently
 of the provider's lifetime.
 
 Path construction is not expected to occur frequently enough to justify caching
 filenames or directory names. Ordinary string/path allocation is an explicit
 design choice. Do not add caches, shared scratch buffers, fixed-size formatting
 machinery or caller-supplied output-buffer APIs without a demonstrated need.
-The two public methods share one private formatter so log/index paths cannot
-silently diverge. Initialization and formatting share the stream-base helper.
+The log and index methods share one private formatter so their paths cannot
+silently diverge. Initialization and all path methods share the stream-base helper.
 That helper accepts a validated `StreamId`, preserving the type's domain contract
 through path construction rather than accepting arbitrary raw integers.
 
@@ -339,8 +339,8 @@ check-then-create race.
 
 Initialization is safe to repeat. Existing files and directory contents are left
 intact; initialization does not scan, validate, truncate, overwrite or clean them
-up. The four deeper range directories and actual log/index files are not created.
-Future file creation will ensure those parents only as needed.
+up. The four deeper range directories and actual log/index/checkpoint files are
+not created. Future file creation will ensure those parents only as needed.
 
 The first creation failure stops initialization. `StorageProviderError::path()`
 identifies the full stream-directory path requested; the actual obstacle may be
@@ -375,11 +375,10 @@ the reader's validation responsibilities.
 Same-file tests in `log_file_number.rs` cover raw construction/conversions, domain
 limits, rejected values, sequence grouping, numeric display/zero padding, native
 layout, integer JSON and checked successor exhaustion. Tests in `log_file_id.rs`
-cover independent expected ranges, exact file boundaries, zero and maximum
-sequences, all ordinals in an ordinary and the terminal range, mismatched
-streams/ranges, and successor delegation. Expected boundary values are literal
-fixtures so a mistaken production constant or calculation cannot redefine the
-expected results.
+cover independent expected ranges, record-to-file mapping at exact file and
+integer boundaries, preserved stream IDs, zero and maximum sequences, and
+successor delegation. Expected boundary values are literal fixtures so a mistaken
+production constant or calculation cannot redefine the expected results.
 JSON tests cover the exact named-field representation, domain endpoints, invalid
 stream/file numbers, propagated constructor errors and malformed object fields.
 
@@ -395,12 +394,14 @@ Tests remain in the corresponding source files. Configuration tests cover relati
 root resolution, nonexistent roots and empty input. Provider tests use independent
 path fixtures at every three-digit carry boundary and the numeric maximum, along
 with stream limits, Unicode/space-containing roots, and no filesystem side effects
-from path construction. A Unix-only test checks a non-UTF-8 root component.
+from path construction. Checkpoint fixtures cover stream limits, the stable base
+directory and filename, and paths before initialization. Relative-root and
+Unix-only non-UTF-8-root checks cover checkpoint paths as well.
 
 Filesystem tests use isolated temporary directories and verify all 4,096 stream
 bases, absence of eagerly created range directories, repeated initialization,
-preservation of existing log/index contents, collisions at the root/parent/stream
-levels, retained error causes, and retry after partial initialization. They do not
+preservation of existing log/index/checkpoint contents, collisions at the
+root/parent/stream levels, retained error causes, and retry after partial initialization. They do not
 change the process-wide working directory. Temporary test data is cleaned up by
 the test directory owner.
 

@@ -91,34 +91,6 @@ impl LogFileId {
     pub const fn next(self) -> Self {
         Self::new(self.stream_id, self.file_number.next())
     }
-
-    /// Returns a record's zero-based ordinal within this file, if it belongs here.
-    ///
-    /// Returns `None` for another stream or a sequence outside the assigned range.
-    /// The ordinal is an index-entry position, not a byte offset into variable-size
-    /// records, and does not establish that the record is already present on disk.
-    #[inline]
-    pub fn record_index(self, record_id: RecordId) -> Option<usize> {
-        if record_id.stream_id() != self.stream_id {
-            return None;
-        }
-
-        let sequence = record_id.sequence_number().get();
-        let first = self.file_number.get() * RECORDS_PER_FILE;
-        if sequence < first {
-            return None;
-        }
-
-        // The lower-bound check makes subtraction safe. Checking the resulting
-        // index avoids another division or calculating the file's last sequence.
-        let index = sequence - first;
-        if index >= RECORDS_PER_FILE {
-            return None;
-        }
-
-        // Any accepted ordinal fits usize on the supported 32/64-bit targets.
-        Some(index as usize)
-    }
 }
 
 #[cfg(test)]
@@ -179,23 +151,22 @@ mod tests {
     #[test]
     fn maps_record_ids_across_file_and_integer_boundaries() {
         for stream in [StreamId::MIN, StreamId::MAX] {
-            for (sequence, file_number, index) in [
-                (0, 0, 0),
-                (99_999, 0, 99_999),
-                (100_000, 1, 0),
-                (199_999, 1, 99_999),
-                (200_000, 2, 0),
-                (4_294_967_295, 42_949, 67_295),
-                (4_294_967_296, 42_949, 67_296),
-                (18_446_744_073_709_499_999, 184_467_440_737_094, 99_999),
-                (18_446_744_073_709_500_000, 184_467_440_737_095, 0),
-                (u64::MAX, 184_467_440_737_095, 51_615),
+            for (sequence, file_number) in [
+                (0, 0),
+                (99_999, 0),
+                (100_000, 1),
+                (199_999, 1),
+                (200_000, 2),
+                (4_294_967_295, 42_949),
+                (4_294_967_296, 42_949),
+                (18_446_744_073_709_499_999, 184_467_440_737_094),
+                (18_446_744_073_709_500_000, 184_467_440_737_095),
+                (u64::MAX, 184_467_440_737_095),
             ] {
                 let record = RecordId::new(stream, SequenceNumber::new(sequence));
                 let file = LogFileId::from_record_id(record);
                 assert_eq!(file.stream_id(), stream);
                 assert_eq!(file.file_number().get(), file_number);
-                assert_eq!(file.record_index(record), Some(index));
             }
         }
     }
@@ -222,52 +193,6 @@ mod tests {
                     file.last_record_id(),
                     RecordId::new(stream, SequenceNumber::new(last))
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn every_ordinal_in_an_ordinary_range_maps_to_its_file() {
-        let stream = StreamId::new(42).unwrap();
-        let file = LogFileId::new(stream, LogFileNumber::new(123).unwrap());
-
-        for index in 0..100_000 {
-            let record = RecordId::new(stream, SequenceNumber::new(12_300_000 + index));
-            assert_eq!(LogFileId::from_record_id(record), file);
-            assert_eq!(file.record_index(record), Some(index as usize));
-        }
-    }
-
-    #[test]
-    fn final_range_contains_all_remaining_sequences_without_wrapping() {
-        let file = LogFileId::new(StreamId::MAX, LogFileNumber::MAX);
-
-        for index in 0..51_616 {
-            let record = RecordId::new(
-                StreamId::MAX,
-                SequenceNumber::new(18_446_744_073_709_500_000 + index),
-            );
-            assert_eq!(LogFileId::from_record_id(record), file);
-            assert_eq!(file.record_index(record), Some(index as usize));
-        }
-    }
-
-    #[test]
-    fn rejects_records_from_other_files_or_streams() {
-        for (number, outside) in [
-            (0, vec![100_000, u64::MAX]),
-            (1, vec![0, 99_999, 200_000, u64::MAX]),
-            (184_467_440_737_095, vec![0, 18_446_744_073_709_499_999]),
-        ] {
-            let file = LogFileId::new(StreamId::MIN, LogFileNumber::new(number).unwrap());
-            for sequence in outside {
-                let record = RecordId::new(StreamId::MIN, SequenceNumber::new(sequence));
-                assert_eq!(file.record_index(record), None);
-            }
-
-            for record in [file.first_record_id(), file.last_record_id()] {
-                let other_stream = RecordId::new(StreamId::MAX, record.sequence_number());
-                assert_eq!(file.record_index(other_stream), None);
             }
         }
     }

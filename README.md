@@ -210,7 +210,7 @@ failure handling, comparison rules and integration commands.
 - [x] Synchronous record builder and compile-time writer modes.
 - [x] Explicit async buffer output, destination flushing and optional file data synchronization.
 - [x] Single-threaded object-pool utility with unused-object reclamation.
-- [x] Storage provider with owned startup configuration, deterministic log/index paths and stream-directory initialization.
+- [x] Storage provider with owned startup configuration, deterministic log/index/checkpoint paths and stream-directory initialization.
 - [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
 - [x] Stream checkpoint model and validated JSON serialization for storage identities/checkpoints; persistence and recovery integration remain pending.
 - [x] Independent reader/writer and combined loopback benchmarks.
