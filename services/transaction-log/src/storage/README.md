@@ -1,10 +1,11 @@
 # Storage
 
 This application module groups storage types for log, index and other file types.
-It currently implements log-file identities, a JSON-serializable stream-checkpoint
-model, immutable startup configuration, deterministic log/index/checkpoint paths
-and stream-directory initialization. File persistence, index encoding, recovery
-and management of open files remain future work.
+It currently implements log-file identities, record-range location models, a
+JSON-serializable stream-checkpoint model, immutable startup configuration,
+deterministic log/index/checkpoint paths and stream-directory initialization.
+File persistence, index encoding, recovery and management of open files remain
+future work.
 
 Each type has its own source file. The thin `mod.rs` re-exports the public types
 and `RECORDS_PER_FILE` and includes this specification in Rustdoc:
@@ -14,6 +15,11 @@ and `RECORDS_PER_FILE` and includes this specification in Rustdoc:
 | `log_file_id.rs` | A stream/file-number pair, its assigned record range and derived Serde representation. |
 | `log_file_number.rs` | Validated file numbers, sequence-to-file grouping, checked successors, Serde integer representation and the records-per-file constant. |
 | `log_file_number_error.rs` | Raw file-number validation failures. |
+| `log_file_range.rs` | The portion of an individual log file needed for a range: bounded span, postfix, whole file or prefix. |
+| `record_start_location.rs` | A record ID with its inclusive byte start and derived file identity. |
+| `record_end_location.rs` | A record ID with its exclusive byte end and derived file identity. |
+| `record_range_location.rs` | A typed start/end pair, checks on their relationship and lazy iteration over the required files and their portions. |
+| `record_range_location_error.rs` | Inconsistent stream, sequence or known byte-boundary metadata. |
 | `storage_config.rs` | Immutable startup configuration and absolute root resolution. |
 | `storage_provider.rs` | Configuration ownership, path construction and asynchronous directory initialization. |
 | `storage_provider_error.rs` | A failed directory-creation request and its underlying I/O error. |
@@ -162,6 +168,33 @@ location. Initialization creates its parent directory but no checkpoint file.
 The future loader must check that the decoded checkpoint's stream ID matches the
 requested stream, as well as establishing its agreement with storage.
 
+### Planned historical-read availability
+
+Historical requests use the stream's published checkpoint as their inclusive
+upper sequence limit. A request may succeed only when its last requested record
+is covered by that checkpoint and the stream's files are validated and fully
+indexed through that point. The stream owner must establish those conditions
+before exposing an advanced checkpoint to readers. On startup, loading checkpoint
+metadata alone does not make a stream ready; required indexes must also be
+available and consistent, with rebuilding where necessary.
+
+Provide a per-stream endpoint reporting the **last queryable sequence number**
+so historical clients can discover this limit before requesting data. Its value
+comes from the ready, published checkpoint's last record ID. It may lag the last
+received or appended record; those newer records are not the advertised historical
+limit. Represent absence explicitly when no queryable checkpoint exists, rather
+than using sequence zero as a sentinel. A stream still recovering must not advertise
+an unready checkpoint as available history.
+
+The reported limit is a snapshot of the serving replica's availability. Each
+historical request still checks its range against that replica's ready checkpoint;
+an earlier status response does not establish readiness on another replica or
+guarantee that older files remain retained. Requests beyond the limit must not
+be reported as successful shortened ranges. Whether they return unavailable or
+explicitly wait, along with the endpoint's name and wire response format, remains
+future protocol design. These are development notes; no endpoint or historical
+request handling is implemented yet.
+
 ### JSON representation
 
 Checkpoint metadata uses human-readable JSON. It is small and updated outside
@@ -204,6 +237,159 @@ JSON is the selected metadata encoding; no binary checkpoint codec or persisted
 file envelope has been introduced. Metadata serialization does not change the
 binary record protocol, identifier layouts, getters or hot-path validation.
 
+## Dense index layout
+
+The agreed index is a dense list of exclusive record end positions: one `u64`
+for every record in a contiguous prefix of its log file. No separate index-entry
+or collection model type is needed at this stage. A loaded list can be owned as
+`Vec<u64>` and borrowed as `&[u64]`; file-layer behavior and ownership will be
+implemented when index I/O is added.
+
+The `.idx` file will contain consecutive eight-byte little-endian integers, with
+no per-entry record ID, padding, header or collection-length prefix. Its paired
+`LogFileId` comes from the requested storage path. The entry's ordinal supplies
+its sequence number, so storing that identity again would be redundant. This is
+a binary format, distinct from the human-readable checkpoint JSON. A Rust vector's
+native memory representation must not be treated as its portable file encoding.
+
+For a record belonging to the requested file:
+
+```text
+n = record.sequence_number - log_file_id.first_record_id().sequence_number
+index_entry_byte_position = n * 8
+record_start = 0 if n == 0, otherwise end_positions[n - 1]
+record_end = end_positions[n]
+record_byte_range = record_start..record_end
+```
+
+Positions count bytes from the beginning of the log file. Each end includes the
+complete record's CRC trailer; the next record starts immediately there. Log
+records begin at byte zero with no file header or inter-record padding. Looking
+up an end position needs one entry; finding both start and end needs two adjacent
+entries, except for the first record. No index scan or binary search is needed.
+These formulas describe layout and lookup work, not measured disk latency.
+
+A full 100,000-record file has 800,000 bytes of index entries (about 781.25 KiB).
+A partial index contains only its actual prefix's entries; unused slots must not
+be interpreted as records. An empty index has no entries, and sequence zero
+remains a real record. The terminal file range permits only 51,616 entries because
+sequences end at `u64::MAX`. End positions need `u64`: 100,000 maximum-size records
+occupy 6,553,500,000 log bytes, exceeding a `u32` offset.
+
+**Entry-count requirement to reconcile before index implementation:** a completed
+log file's index must contain **100,001 `u64` entries** (800,008 bytes), with the
+last record's exclusive end available from the index without querying log-file
+metadata. The end-offset layout described above already stores that end in its
+100,000th entry. A boundary table containing an initial zero followed by every
+record's end would provide 100,001 entries; adopting it requires updating the
+lookup formulas and partial/empty-index rules together. The extra entry is a byte
+boundary, not an additional record. This note records the requirement; no index
+codec or lookup implementation has been added.
+
+Index data is derived from the log and is rebuildable. The future loading and
+validation layer must check whole eight-byte entries, the file's entry-count
+bound, and plausible increasing positions, and establish agreement with actual
+record boundaries and IDs before trusting those positions. Structural checks
+alone cannot detect every stale or corrupt offset. The log remains authoritative;
+an index endpoint is not evidence of CRC validity, sequence continuity or durable
+storage, and cannot replace a trusted recovery checkpoint. An index may lag the
+log, so a missing entry alone does not establish that the record is absent.
+
+This section records the selected layout. Encoding/decoding, file loading,
+incremental index writes, index recovery and provider APIs returning open files
+with indexing data remain future work. No index model, codec or persistence API
+has been introduced yet.
+
+## Record range locations
+
+Two distinct endpoint types describe a record's byte boundaries:
+
+- `RecordStartLocation` stores a `record_id: RecordId` and its inclusive byte
+  `position: u64` within that record's file.
+- `RecordEndLocation` stores a `record_id: RecordId` and its exclusive byte
+  `position: u64`, immediately after that record's CRC trailer in its file.
+
+Both expose read-only `record_id()` and `position()` copy getters, plus
+`log_file_id()` derived through `LogFileId::from_record_id`. Their
+`new(record_id, position)` constructors are infallible metadata constructors:
+they store the resolver's supplied values without inspecting files or adding
+partial numeric validation. A location alone does not prove that a record exists
+at that offset, is valid or is durable. Endpoint getters perform no validation.
+
+A start lookup uses the preceding record's dense-index entry, or zero for the
+first record in a file. Its stored ID still identifies the **requested record**,
+not the preceding one. An end lookup uses the requested record's own index entry.
+The end remains in that record's file even when it completes the file, and its
+helper never increments the sequence number, including at `u64::MAX`.
+
+`RecordRangeLocation` stores only `start: RecordStartLocation` and
+`end: RecordEndLocation`, exposed through read-only copy getters. Distinct types
+make swapped constructor arguments a compile-time error. There is no implicit
+conversion between the endpoint roles. Use `range.start().record_id()`,
+`range.start().position()` and `range.end().log_file_id()` to inspect them;
+endpoint behavior belongs to those types rather than duplicate range accessors.
+
+The two record IDs are **inclusive**. Equal IDs describe one complete record,
+so a separate complete-record `RecordLocation` type is unnecessary. An empty
+result is represented outside the range type, rather than reserving sequence
+zero or constructing an empty byte span. Single-file ranges can contain several
+records and exceed 65,535 bytes; positions and byte differences use `u64`, even
+though an individual encoded length fits `u16`.
+
+Positions are relative to their respective log files. The final position can be
+smaller than the initial position when the range spans files; subtracting those
+two values does not give the total transfer size. Each endpoint derives its own
+file identity; there are no redundant stored file IDs, paths or per-record entries.
+
+`RecordRangeLocation::new(start, end)` checks the metadata relationships needed
+for enumeration and returns `RecordRangeLocationError`
+for different streams, decreasing sequences, zero byte ends, or an end at/before
+the start in a single file. The final prefix of a multi-file range is checked
+against zero, never against the start offset in another file. Constructors do
+not read indexes or validate that offsets agree with actual record boundaries,
+encoded sizes or readable file extents. These structural checks are not record
+validation; the future file/index resolver must establish agreement with storage.
+The value is location metadata, not proof of CRC validity or durable persistence.
+
+### Iterating over files
+
+`iter()` owns a copy of the endpoints and lazily returns `(LogFileId, LogFileRange)`
+items in ascending file-number order:
+
+| Case | Enum value | Bytes requested from that file |
+| --- | --- | --- |
+| Both endpoints in one file | `FileRange { start_position, end_position }` | The explicit `start..end` span. |
+| First of multiple files | `FilePostfix { start_position }` | From the explicit start through the file's validated record end. |
+| Intermediate file | `EntireFile` | From zero through the file's validated record end. |
+| Last of multiple files | `FilePrefix { end_position }` | From zero up to the explicit exclusive end. |
+
+For example, a request from sequence 99,998 to 300,001 yields file zero's postfix,
+files one and two in their entirety, then file three's prefix. Two adjacent files
+produce no `EntireFile` item. A single record produces exactly one `FileRange`.
+Explicit outer bounds are preserved even when they coincide with whole-file
+boundaries; there is no need to infer EOF in place of a known end position.
+
+The enum leaves intermediate byte ends unresolved because 100,000 variable-length
+records do not determine a file's byte length. The future reader resolves those
+ends while opening each file. It must establish the complete, validated extent
+of that file's assigned records, not guess a maximum size or copy an unvalidated
+physical tail. The last file is always bounded by the supplied end, even if
+newer records have since been appended. The iterator itself does not open, seek,
+copy, validate or synchronize any file, and creates no asynchronous tasks.
+
+The endpoint and range models are `Copy` and have no heap storage. Construction
+does constant work; iteration uses constant memory and advances one file per item,
+without allocating a list or resolving all file ends upfront. It stops before asking for a successor
+to the final file, including `LogFileNumber::MAX`, and remains exhausted thereafter.
+The full sequence domain can therefore be represented and traversed progressively.
+These are algorithmic properties, not benchmark results. No `repr(C)`, serialized
+model format, cache, lock or shared ownership is needed for these value types.
+
+Owning a location does not keep files open, prevent retention or stabilize file
+contents. Future request handling must acquire suitable read handles and preserve
+the readable boundaries while copying. Historical sealed-file reads and current-file
+publication remain file-layer work; a location is not a recovery checkpoint.
+
 ## Storage and performance boundaries
 
 Direct arithmetic makes record-to-file lookup independent of directory scans or
@@ -215,10 +401,10 @@ choices, not measured throughput claims. Storage benchmarks will follow actual
 file operations.
 
 `LogFileId` describes file identity and assigned record-range boundaries.
-Locating records within a file and mapping them to index entries or byte offsets
-belong to the future file/index APIs, where the actual storage format is known.
-A full file contains 100,000 records irrespective of their byte sizes. The provider
-owns the file-path layout; index encoding and offset width, open handles and
+Resolving record positions belongs to future file/index APIs using the dense
+layout above; `RecordRangeLocation` carries their outer endpoints and enumerates
+the required file portions. A full file contains 100,000 records irrespective of
+their byte sizes. The provider owns the file-path layout; index I/O, open handles and
 read/write ownership remain responsibilities of the future storage implementation.
 Range endpoints must not be substituted for a durability or validation checkpoint.
 
@@ -389,6 +575,27 @@ JSON fixtures check pretty output and I/O round trips, exact maximum sequence
 values, large offsets, missing/duplicate/unknown fields, invalid numeric values,
 truncation and trailing garbage. Expected JSON is literal, so serialization and
 deserialization cannot silently agree on an unintended field shape.
+
+`record_start_location.rs` and `record_end_location.rs` test independent endpoint
+identity and position preservation, both stream limits, positions above 4 GiB,
+file rotation and the maximum sequence. Literal fixtures distinguish a start in
+the new file from the preceding record's end in the completed file.
+
+`record_range_location.rs` tests the typed endpoint pair and `LogFileRange` enum contract:
+single records, partial single-file requests, every multi-file role, adjacent and
+exact file boundaries, independent offsets across files, positions above 4 GiB,
+stream limits, the terminal sequence/file and repeated iterator exhaustion.
+Invalid stream/order/known byte-span metadata exercises each typed error.
+A full-domain test consumes only a few iterator items, protecting lazy enumeration
+without allocating or visiting the entire file range. Literal expected file numbers
+and enum values keep these tests independent of the iterator's implementation.
+
+The range constructor's Rustdoc includes a working typed-endpoint example and a
+compile-fail example for swapped roles. The application is currently a binary
+target, so ordinary `cargo test` does not discover these documentation tests.
+They can be checked with `rustdoc --test` against a temporary library build of
+the application source using Cargo's compiled dependencies. Keep that library
+and other compiler-check artifacts under the ignored `target/` directory.
 
 Tests remain in the corresponding source files. Configuration tests cover relative
 root resolution, nonexistent roots and empty input. Provider tests use independent
