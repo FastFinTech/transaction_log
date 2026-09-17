@@ -214,7 +214,7 @@ failure handling, comparison rules and integration commands.
 - [x] Storage provider with owned startup configuration, deterministic log/index/checkpoint paths and stream-directory initialization.
 - [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
 - [x] Typed record start/end locations and a range model with lazy enumeration of bounded, postfix, whole-file and prefix reads.
-- [x] Stream checkpoint model and validated JSON serialization for storage identities/checkpoints; persistence and recovery integration remain pending.
+- [x] Stream checkpoint model and JSON serialization for storage identities, record endpoints and checkpoints, with identifier validation; persistence and recovery integration remain pending.
 - [x] Independent reader/writer and combined loopback benchmarks.
 - [x] Benchmark artifacts with machine specifications, report generation and regression comparison.
 - [ ] Service connection setup, handshake and client lifecycle.

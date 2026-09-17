@@ -16,14 +16,14 @@ and `RECORDS_PER_FILE` and includes this specification in Rustdoc:
 | `log_file_number.rs` | Validated file numbers, sequence-to-file grouping, checked successors, Serde integer representation and the records-per-file constant. |
 | `log_file_number_error.rs` | Raw file-number validation failures. |
 | `log_file_range.rs` | The portion of an individual log file needed for a range: bounded span, postfix, whole file or prefix. |
-| `record_start_location.rs` | A record ID with its inclusive byte start and derived file identity. |
-| `record_end_location.rs` | A record ID with its exclusive byte end and derived file identity. |
+| `record_start_location.rs` | A record ID with its inclusive byte start, derived file identity and Serde metadata representation. |
+| `record_end_location.rs` | A record ID with its exclusive byte end, derived file identity and Serde metadata representation. |
 | `record_range_location.rs` | A typed start/end pair, checks on their relationship and lazy iteration over the required files and their portions. |
 | `record_range_location_error.rs` | Inconsistent stream, sequence or known byte-boundary metadata. |
 | `storage_config.rs` | Immutable startup configuration and absolute root resolution. |
 | `storage_provider.rs` | Configuration ownership, path construction and asynchronous directory initialization. |
 | `storage_provider_error.rs` | A failed directory-creation request and its underlying I/O error. |
-| `stream_checkpoint.rs` | Immutable last-record identity and its exclusive end position in a log file, with JSON serialization. |
+| `stream_checkpoint.rs` | A checkpoint boundary held as a typed record end location, with JSON serialization. |
 
 Storage policy belongs to the application, not the public record I/O exports
 crate. `LogFileId` describes where a record belongs in a stream's sequence;
@@ -123,18 +123,23 @@ existence, record validity or durability.
 
 ## Stream checkpoint model
 
-`StreamCheckpoint` stores two read-only fields with `getset` copy getters:
+`StreamCheckpoint` stores one read-only `end: RecordEndLocation`, exposed through
+a `getset` copy getter. The endpoint keeps the last included record and its byte
+position together:
 
-- `last_record_id: RecordId`: the last complete record included in the checkpoint.
-  Its identity already includes the stream ID.
-- `end_position: u64`: the byte offset from the beginning of that record's log
-  file to immediately after the complete encoded record, including its CRC.
+- `checkpoint.end().record_id()` identifies the last complete record included in
+  the checkpoint. Its identity already includes the stream ID.
+- `checkpoint.end().position()` is the byte offset from the beginning of that
+  record's log file to immediately after the complete encoded record, including its CRC.
   The boundary is exclusive: following bytes have not been checkpointed by this
   snapshot. It is not the position of the last byte, an index-file position, or
   a cumulative byte count across multiple files.
 
-`log_file_id()` derives the file identity through `LogFileId::from_record_id`, so
-the model does not store redundant stream/file identifiers that could disagree.
+`checkpoint.end().log_file_id()` derives the file identity through the endpoint,
+so the model does not store redundant stream/file identifiers that could disagree.
+Endpoint access and file lookup belong to `RecordEndLocation`; the checkpoint
+does not duplicate those methods. The separate checkpoint type expresses the
+recovery boundary's meaning, which a general record end location does not carry.
 At sequence 99,999 the endpoint still belongs to file zero; sequence 100,000
 belongs to file one and has a position within that new file. The helper never
 increments the sequence and remains usable at `u64::MAX`. An endpoint may precede
@@ -146,7 +151,7 @@ can exceed 4 GiB. The model is a small owned `Copy` value without allocation,
 mutable accessors or filesystem access. Its native layout does not define its
 serialized representation.
 
-`new(last_record_id, end_position)` is an infallible data constructor. It does not
+`StreamCheckpoint::new(end)` is an infallible data constructor. It does not
 claim to validate the relationship between the record and its supplied position,
 and it does not add a partial numeric check in place of inspecting actual storage.
 The future checkpoint owner must establish the complete contract when producing
@@ -160,6 +165,22 @@ durably publishing that checkpoint. Constructing this value establishes none of
 those facts. Checkpoint file loading, persistence, advancement, index recovery
 and startup integration remain future work; this step implements the model and
 its JSON representation.
+
+```rust
+use transaction_log::storage::{RecordEndLocation, StreamCheckpoint};
+use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
+
+let id = RecordId::new(StreamId::new(42)?, SequenceNumber::new(99_999));
+let end = RecordEndLocation::new(id, 6_553_500_000);
+let checkpoint = StreamCheckpoint::new(end);
+assert_eq!(checkpoint.end().record_id(), id);
+assert_eq!(checkpoint.end().position(), 6_553_500_000);
+assert_eq!(checkpoint.end().log_file_id().file_number().get(), 0);
+
+let bytes = serde_json::to_vec_pretty(&checkpoint)?;
+assert_eq!(serde_json::from_slice::<StreamCheckpoint>(&bytes)?, checkpoint);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 `StorageProvider::checkpoint_file_path(stream_id)` names this stream's checkpoint
 at `{root}/streams/{stream_id:04}/checkpoint.json`. The path depends only on the
@@ -203,11 +224,13 @@ derives describe the fields, and `serde_json` provides the JSON codec:
 
 ```json
 {
-  "last_record_id": {
-    "stream_id": 42,
-    "sequence_number": 99999
-  },
-  "end_position": 6553500000
+  "end": {
+    "record_id": {
+      "stream_id": 42,
+      "sequence_number": 99999
+    },
+    "position": 6553500000
+  }
 }
 ```
 
@@ -219,7 +242,8 @@ atomically publish a checkpoint file. Those operations belong to the future
 persistence owner, which must publish only after covered log data is durable.
 
 Fields are required; missing, duplicate or unknown object fields are errors,
-including inside the nested record ID. There are no default-zero substitutions.
+including inside the endpoint and its nested record ID. There are no default-zero
+substitutions.
 `StreamId` deserialization uses its existing checked conversion, so JSON cannot
 introduce an ID outside `0..=4095`. Sequence numbers and positions decode as `u64`:
 negative, fractional and overflowing values are rejected. JSON integer text
@@ -269,22 +293,17 @@ up an end position needs one entry; finding both start and end needs two adjacen
 entries, except for the first record. No index scan or binary search is needed.
 These formulas describe layout and lookup work, not measured disk latency.
 
+The initial zero boundary is implicit and is not stored. A completed file's
+last record end is in entry 99,999 (the 100,000th entry), at byte offset 799,992
+in the index. Reading that entry supplies the log file's complete record end
+without querying log-file metadata; no extra terminal entry is required.
+
 A full 100,000-record file has 800,000 bytes of index entries (about 781.25 KiB).
 A partial index contains only its actual prefix's entries; unused slots must not
 be interpreted as records. An empty index has no entries, and sequence zero
 remains a real record. The terminal file range permits only 51,616 entries because
 sequences end at `u64::MAX`. End positions need `u64`: 100,000 maximum-size records
 occupy 6,553,500,000 log bytes, exceeding a `u32` offset.
-
-**Entry-count requirement to reconcile before index implementation:** a completed
-log file's index must contain **100,001 `u64` entries** (800,008 bytes), with the
-last record's exclusive end available from the index without querying log-file
-metadata. The end-offset layout described above already stores that end in its
-100,000th entry. A boundary table containing an initial zero followed by every
-record's end would provide 100,001 entries; adopting it requires updating the
-lookup formulas and partial/empty-index rules together. The extra entry is a byte
-boundary, not an additional record. This note records the requirement; no index
-codec or lookup implementation has been added.
 
 Index data is derived from the log and is rebuildable. The future loading and
 validation layer must check whole eight-byte entries, the file's entry-count
@@ -315,6 +334,29 @@ Both expose read-only `record_id()` and `position()` copy getters, plus
 they store the resolver's supplied values without inspecting files or adding
 partial numeric validation. A location alone does not prove that a record exists
 at that offset, is valid or is durable. Endpoint getters perform no validation.
+
+Both endpoint types derive Serde with named `record_id` and `position` fields.
+For example, an end location has this JSON representation:
+
+```json
+{"record_id":{"stream_id":42,"sequence_number":99999},"position":6553500000}
+```
+
+A start location uses the same field names, with its inclusive start position.
+The enclosing field or chosen Rust type establishes the endpoint's role; the
+JSON has no start/end type tag. Distinct Rust types prevent swapped constructor
+arguments, but do not make arbitrary serialized bytes trustworthy.
+Deserialization delegates to `RecordId` and its validated identifier types,
+requires a `u64` position, and rejects missing, duplicate or unknown object fields
+at either level. All `u64` positions are representable metadata, including zero
+and `u64::MAX`; storage validation must still establish real record boundaries.
+In particular, decoding a zero end does not make it a valid record end.
+
+The Serde traits are format-independent. This metadata representation does not
+change the dense index's eight-byte end entries or the binary record protocol.
+It adds no validation to typed getters or constructors. `RecordRangeLocation`
+has no Serde implementation; its checked constructor remains the boundary for
+establishing the relationship between endpoints.
 
 A start lookup uses the preceding record's dense-index entry, or zero for the
 first record in a file. Its stored ID still identifies the **requested record**,
@@ -382,8 +424,9 @@ does constant work; iteration uses constant memory and advances one file per ite
 without allocating a list or resolving all file ends upfront. It stops before asking for a successor
 to the final file, including `LogFileNumber::MAX`, and remains exhausted thereafter.
 The full sequence domain can therefore be represented and traversed progressively.
-These are algorithmic properties, not benchmark results. No `repr(C)`, serialized
-model format, cache, lock or shared ownership is needed for these value types.
+These are algorithmic properties, not benchmark results. No `repr(C)`, cache,
+lock or shared ownership is needed for these value types. Serde metadata is
+separate from their compiler-selected memory layout.
 
 Owning a location does not keep files open, prevent retention or stabilize file
 contents. Future request handling must acquire suitable read handles and preserve
@@ -568,18 +611,22 @@ production constant or calculation cannot redefine the expected results.
 JSON tests cover the exact named-field representation, domain endpoints, invalid
 stream/file numbers, propagated constructor errors and malformed object fields.
 
-`stream_checkpoint.rs` tests the exclusive endpoint's associated file at sequence
+`stream_checkpoint.rs` tests preservation of the supplied typed endpoint at sequence
 zero, file rotation, a position above 4 GiB and sequence exhaustion. These tests
 exercise the metadata model, not validation or durability of real stored records.
 JSON fixtures check pretty output and I/O round trips, exact maximum sequence
-values, large offsets, missing/duplicate/unknown fields, invalid numeric values,
-truncation and trailing garbage. Expected JSON is literal, so serialization and
+values, large offsets, missing/duplicate/unknown fields at all three object levels,
+invalid numeric values, truncation and trailing garbage. Expected JSON is literal, so serialization and
 deserialization cannot silently agree on an unintended field shape.
 
 `record_start_location.rs` and `record_end_location.rs` test independent endpoint
 identity and position preservation, both stream limits, positions above 4 GiB,
 file rotation and the maximum sequence. Literal fixtures distinguish a start in
 the new file from the preceding record's end in the completed file.
+Their JSON tests cover literal field shapes and I/O round trips, zero and maximum
+numeric metadata, invalid stream IDs and numeric types, missing/duplicate/unknown
+fields, truncation and trailing garbage. Acceptance of raw offset limits protects
+the distinction between metadata decoding and actual storage validation.
 
 `record_range_location.rs` tests the typed endpoint pair and `LogFileRange` enum contract:
 single records, partial single-file requests, every multi-file role, adjacent and
@@ -590,9 +637,10 @@ A full-domain test consumes only a few iterator items, protecting lazy enumerati
 without allocating or visiting the entire file range. Literal expected file numbers
 and enum values keep these tests independent of the iterator's implementation.
 
-The range constructor's Rustdoc includes a working typed-endpoint example and a
-compile-fail example for swapped roles. The application is currently a binary
-target, so ordinary `cargo test` does not discover these documentation tests.
+The checkpoint example exercises typed construction, endpoint access and JSON
+round trips. The range constructor's Rustdoc includes a working typed-endpoint
+example and a compile-fail example for swapped roles. The application is currently
+a binary target, so ordinary `cargo test` does not discover these documentation tests.
 They can be checked with `rustdoc --test` against a temporary library build of
 the application source using Cargo's compiled dependencies. Keep that library
 and other compiler-check artifacts under the ignored `target/` directory.

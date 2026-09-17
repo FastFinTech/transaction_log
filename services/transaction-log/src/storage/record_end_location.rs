@@ -1,4 +1,5 @@
 use getset::CopyGetters;
+use serde::{Deserialize, Serialize};
 use transaction_log_exports::RecordId;
 
 use super::LogFileId;
@@ -15,8 +16,15 @@ use super::LogFileId;
 /// is not a stream checkpoint. Pair it with [`super::RecordStartLocation`] to
 /// construct a [`super::RecordRangeLocation`]. The distinct endpoint types prevent
 /// accidentally swapping their roles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, CopyGetters)]
+///
+/// Serde uses named `record_id` and `position` fields. Deserialization validates
+/// the nested identifiers and the `u64` position, and rejects missing, duplicate
+/// or unknown object fields. It does not verify the position against storage.
+/// The endpoint's role comes from its Rust type or enclosing field, not a type
+/// tag in the serialized data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CopyGetters, Serialize, Deserialize)]
 #[getset(get_copy = "pub")]
+#[serde(deny_unknown_fields)]
 pub struct RecordEndLocation {
     /// Record whose complete encoding ends at this exclusive position.
     record_id: RecordId,
@@ -71,6 +79,78 @@ mod tests {
                 assert_eq!(location.log_file_id().stream_id(), stream_id);
                 assert_eq!(location.log_file_id().file_number().get(), file_number);
             }
+        }
+    }
+
+    #[test]
+    fn json_uses_named_fields_and_round_trips_through_io() {
+        let json =
+            r#"{"record_id":{"stream_id":42,"sequence_number":99999},"position":6553500000}"#;
+        let location = RecordEndLocation::new(
+            RecordId::new(StreamId::new(42).unwrap(), SequenceNumber::new(99_999)),
+            6_553_500_000,
+        );
+        let mut bytes = Vec::new();
+        serde_json::to_writer(&mut bytes, &location).unwrap();
+        assert_eq!(bytes, json.as_bytes());
+        assert_eq!(
+            serde_json::from_reader::<_, RecordEndLocation>(bytes.as_slice()).unwrap(),
+            location
+        );
+    }
+
+    #[test]
+    fn json_preserves_numeric_limits_without_claiming_storage_validity() {
+        // Zero cannot be a real record end; accepting it here leaves storage
+        // validation to the resolver, just as the metadata constructor does.
+        for (json, record_id, position) in [
+            (
+                r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":0}"#,
+                RecordId::new(StreamId::MIN, SequenceNumber::MIN),
+                0,
+            ),
+            (
+                r#"{"record_id":{"stream_id":4095,"sequence_number":18446744073709551615},"position":18446744073709551615}"#,
+                RecordId::new(StreamId::MAX, SequenceNumber::MAX),
+                u64::MAX,
+            ),
+        ] {
+            let location = RecordEndLocation::new(record_id, position);
+            assert_eq!(serde_json::to_string(&location).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<RecordEndLocation>(json).unwrap(),
+                location
+            );
+        }
+    }
+
+    #[test]
+    fn json_rejects_incomplete_ambiguous_and_invalid_metadata() {
+        for json in [
+            r#"{}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0}}"#,
+            r#"{"position":16}"#,
+            r#"{"record_id":null,"position":16}"#,
+            r#"{"record_id":{"stream_id":4096,"sequence_number":0},"position":16}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":-1},"position":16}"#,
+            r#"{"record_id":{"stream_id":0},"position":16}"#,
+            r#"{"record_id":{"stream_id":0,"stream_id":1,"sequence_number":0},"position":16}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":-1}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":1.5}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":18446744073709551616}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":null}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":"16"}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":16,"position":32}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"record_id":{"stream_id":1,"sequence_number":0},"position":16}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0,"extra":0},"position":16}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":16,"extra":0}"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":16"#,
+            r#"{"record_id":{"stream_id":0,"sequence_number":0},"position":16} trailing"#,
+        ] {
+            assert!(
+                serde_json::from_str::<RecordEndLocation>(json).is_err(),
+                "{json}"
+            );
         }
     }
 }
