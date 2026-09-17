@@ -7,9 +7,12 @@ latency, buffer ownership and the cost of each record operation drive the design
 
 **Status:** the record format, reader, writer and TCP benchmark suite are
 implemented, alongside log-file identities, record-range location models, path
-layout and stream-directory initialization. The service executable is a scaffold;
-file persistence, indexing, replication and client protocol handling remain in
-development.
+layout and stream-directory initialization. An indexed log writer now appends
+ordered records and dense offsets to an owned file pair, with explicit flush,
+sync and finalization. File recovery validates from a supplied trusted boundary,
+repairs indexes and hands over partial or full files. The service executable is a
+scaffold; startup recovery orchestration, queries, replication and client protocol
+handling remain in development.
 
 ## Design priorities
 
@@ -215,26 +218,30 @@ failure handling, comparison rules and integration commands.
 - [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
 - [x] Typed record start/end locations and a range model with lazy enumeration of bounded, postfix, whole-file and prefix reads.
 - [x] Stream checkpoint model and JSON serialization for storage identities, record endpoints and checkpoints, with identifier validation; persistence and recovery integration remain pending.
+- [x] Indexed log writer with stream/sequence checks, log-before-index flushing, separate flushed/durable progress and full-file finalization.
+- [x] File-only index writer with reusable buffering and separate buffer output, file flushing and data synchronization.
+- [x] Provider-based recovery file acquisition, supplied-boundary validation, index repair, explicit invalid-log-tail truncation and synchronized partial/full handover.
 - [x] Independent reader/writer and combined loopback benchmarks.
 - [x] Benchmark artifacts with machine specifications, report generation and regression comparison.
 - [ ] Service connection setup, handshake and client lifecycle.
 - [ ] Stream routing, ingestion queues, admission control and periodic progress/status messages.
-- [ ] Sequence continuity enforcement during ingestion and file replay.
-- [ ] Stream log files, index files and stream-specific queries.
-- [ ] Durable flush scheduling, recovery and invalid-tail handling.
+- [ ] Client ingestion rejection/disconnection.
+- [ ] Multi-file lifecycle coordination and stream-specific index queries.
+- [ ] Durable flush scheduling, checkpoint persistence and startup-wide recovery orchestration.
 - [ ] Replication and cluster coordination.
 - [ ] Storage, indexing, replication, recovery and latency benchmarks.
 - [ ] Dedicated performance CI workers and durable benchmark-history publication.
 
-The checklist distinguishes reusable record I/O from service behavior. File
-synchronization is available through the writer's optional capability; the
-service's persistence policy and recovery behavior are still to be implemented.
+The checklist distinguishes implemented I/O components from service behavior.
+The indexed log writer coordinates an individual pair; the service's persistence
+schedule, checkpoint publication, file rotation and startup recovery orchestration
+remain to be implemented.
 
 ## Workspace and development
 
 | Path | Responsibility |
 | --- | --- |
-| [`services/transaction-log`](services/transaction-log) | Service executable scaffold, storage identity/location models, path layout and directory initialization. |
+| [`services/transaction-log`](services/transaction-log) | Service scaffold, storage models/paths, file acquisition, indexed appends and pair validation/repair. |
 | [`services/transaction-log-exports`](services/transaction-log-exports) | Public record types, reader, writer and benchmarks. |
 | [`lib/object-pool`](lib/object-pool) | Reusable single-threaded object pool. |
 | [`scripts`](scripts/README.md) | Benchmark execution, reporting and comparison tooling. |
@@ -270,6 +277,7 @@ design decisions, safety invariants and optimization evidence.
 | [Record specification](services/transaction-log-exports/src/record/README.md) | Wire format, ownership, validation and reader integration. |
 | [Writer specification](services/transaction-log-exports/src/record_writer/README.md) | Constructor modes, buffering, completion, cancellation and hot-path rationale. |
 | [Storage](services/transaction-log/src/storage/README.md) | File identities, startup configuration, path layout, directory initialization and storage boundaries. |
+| [Stream operations](services/transaction-log/src/streams/README.md) | Indexed appends, validation, repair, partial/full handover and failure handling. |
 | [Object pool](lib/object-pool/README.md) | Ownership, reclamation policy and usage. |
 | [Benchmark specification](services/transaction-log-exports/benches/README.md) | Workloads, timing contracts and measurement history. |
 

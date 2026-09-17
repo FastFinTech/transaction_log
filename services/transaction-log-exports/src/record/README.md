@@ -32,7 +32,7 @@ benchmark result or a guarantee made by this crate.
 | `RecordBuilder` in the sibling `record_writer` module | Implemented: concrete callback destination with bounded body serialization; construction and finalization remain module-private. |
 | `RecordWriter` | Implemented: constructor-selected modes for synchronous serialization or existing-record copies, one reusable buffer and owned async destination, explicit buffer output, separate destination flushing and optional data synchronization, and terminal handling of failed/cancelled I/O. Scheduling and durability policy belong to higher layers. |
 | `AsyncSyncData` in the sibling `record_writer` module | Implemented: optional destination capability that makes data synchronization available on a suitably bounded `RecordWriter`. Tokio files have an implementation; arbitrary `AsyncWrite` destinations do not. |
-| Stream ingestion and file replay | Planned: enforce sequence continuity using previously known stream state. |
+| Application indexed log writer/validator | Enforce each file's stream and sequence on append/recovery; the validator repairs indexes and supports explicit invalid-tail removal. Client ingestion/disconnection remains future integration work. |
 
 Keep `mod.rs` thin and keep each record type in its own file. The reader is a
 separate module. Tests belong in the same source file as the behavior they test.
@@ -264,8 +264,8 @@ exercise invalid field values while still honoring byte-extent preconditions.
 asynchronous methods require Tokio `AsyncRead + Unpin`.
 
 `wait_to_read()` waits until at least one complete record is available, validates
-all complete buffered records, then splits and freezes the complete prefix once.
-It leaves the incomplete tail in `BytesMut` for the next read. It does not wait
+the complete prefix up to the first incomplete or invalid record, then splits and
+freezes that valid prefix once. The remaining bytes stay in `BytesMut`. It does not wait
 to fill a batch after complete records are available. Repeated waits with unread
 records return immediately. Validated pending header state survives fragmented
 input and cancellation so header checks are not repeated for the same frame.
@@ -276,12 +276,29 @@ the receive buffer per record. Returned records share slices of the frozen
 batch. The final record takes over the batch handle instead of cloning it.
 `None` means the batch is exhausted; the caller waits again.
 
-If any record in a candidate batch fails validation, the wait returns an error
-before exposing any of that batch, including its otherwise valid prefix.
-Previously returned records remain valid. Validation and I/O failures are
-terminal; subsequent operations report `ReaderFailed`. EOF within a header,
-payload, or trailer is an error. Clean EOF between records returns `false` and
-is terminal too; this reader does not tail files that grow after EOF.
+If a record fails validation after a valid prefix, the wait returns `true` and
+exposes that prefix first. Repeated waits while the batch has unread records still
+return immediately. Once it is drained, `try_read_next()` returns `None`; the next
+wait validates the offending bytes at the beginning of the receive buffer and
+reports the error without reading more source bytes. Invalid input at the start
+of a batch fails immediately. The reader never skips an invalid record to expose
+later ones. This preserves the valid prefix independently of source chunking.
+
+Keep the offending bytes rather than storing a pending error or adding reader
+state. Invalid length/stream checks or a failing CRC calculation may run twice;
+only this failure path repeats work. Successfully validated records leave the
+receive buffer and are not checked again. A CRC-invalid frame can keep its cached
+length because its length and stream ID already passed validation. The single
+split and existing record ownership rules apply equally to a prefix before error.
+
+An error returned to the caller is terminal; subsequent operations report
+`ReaderFailed`. Retained records remain valid after an error or reader drop.
+Source I/O failures are reported immediately when encountered, without retrying
+them as content errors (`Interrupted` reads retain their existing retry behavior).
+An incomplete tail is retained for further input; EOF within a header, payload,
+or trailer is an error after any preceding complete records have been exposed.
+Clean EOF between records returns `false` and is terminal too; this reader does
+not tail files that grow after EOF.
 
 Refilling can move unfinished data when the mutable buffer grows or reclaims
 space. Sharing completed records does not imply that the entire receive path
@@ -315,6 +332,7 @@ async fn read_first<R: AsyncRead + Unpin>(source: R) -> Result<Option<Record>, R
 | Expose native value fields through `getset::CopyGetters` | Private fields preserve read-only APIs; inline field copies avoid allocation, reference counting, and repeated validation. |
 | Keep CRC in a trailer | Validation computes CRC over one contiguous header-and-payload slice. |
 | Split once per prepared batch | Avoid a mutable-buffer split for every consumed record. |
+| Publish a valid prefix before reporting corrupt input | Preserve every preceding valid record without storing an error; rediscover the failure from retained bytes only after the batch drains. |
 | Share completed bytes and move the final handle | Avoid per-record payload copies and an unnecessary final reference-count increment. Shared slices can still incur reference-count costs. |
 
 Getters must not allocate, clone storage, recompute checksums, or add integrity
@@ -505,7 +523,7 @@ Review changes against the relevant coverage:
 | Raw sequence boundaries, conversions, representation, formatting and exact full-range JSON integers | `sequence_number.rs` |
 | Successor arithmetic across numeric boundaries, preserved stream ID, panic on exhaustion in debug and release builds, named-field JSON shape and invalid metadata | `record_id.rs` |
 | Public API rejects field mutation and direct header construction; generated accessors remain callable | Rustdoc examples in `record_id.rs`, `record_header.rs`, and `stream_id_error.rs`; existing record and stream tests |
-| Partial input, cancellation, batching, fixed size limits, malformed records, error state, retained records across refills | Sibling `record_reader.rs` |
+| Partial input, cancellation, batching, fixed size limits, valid prefixes before malformed/truncated records, error rediscovery without source I/O, terminal failures, retained records across refills and errors | Sibling `record_reader.rs` |
 | Bounded serialization, complete framing/CRC, prefix isolation, rollback, preallocated storage, and reader compatibility | Sibling `record_writer/record_builder.rs` |
 | Synchronous appends without I/O, batching, callback errors, owned destinations, allocation reuse, existing record copies, partial writes, cancellation, separate send/flush/sync operations, terminal failures, lifecycle, file and handshake-complete socket integration | Sibling `record_writer/record_writer.rs` |
 | Constructor-selected append APIs cannot be mixed; synchronization unavailable without its optional trait; public file usage example and builder privacy | Rustdoc examples in sibling `record_writer/README.md` |

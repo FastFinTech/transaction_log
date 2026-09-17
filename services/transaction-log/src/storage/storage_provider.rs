@@ -2,15 +2,16 @@ use std::path::{Path, PathBuf};
 
 use transaction_log_exports::StreamId;
 
-use super::{LogFileId, StorageConfig, StorageProviderError};
+use super::{LogFileId, StorageConfig, StorageFileOpenError, StorageProviderError};
 
 /// Owns storage configuration, constructs paths, and initializes stream directories.
 ///
 /// Paths follow the fixed decimal layout documented in this module's README.
 /// Path construction is synchronous and performs no filesystem access. Call
 /// [`Self::initialize`] during startup to ensure all stream base directories exist.
-/// Opening files and creating deeper log/index range directories belong to future
-/// file operations; this provider does not yet manage open handles.
+/// Validation opens existing logs and opens or creates their repairable indexes.
+/// The caller owns returned handles; deeper directory creation and file rotation
+/// remain owner responsibilities. The provider does not cache open handles.
 ///
 /// The provider is immutable and can be shared through `Arc<StorageProvider>`.
 /// It has no path cache, locks, background tasks or initialization flag.
@@ -75,6 +76,47 @@ impl StorageProvider {
     /// allocates a path but neither creates nor inspects an index file.
     pub fn index_file_path(&self, id: LogFileId) -> PathBuf {
         self.file_path(id, "idx")
+    }
+
+    /// Opens an existing log for validation and explicitly requested tail repair.
+    ///
+    /// Uses read/write access without creating, truncating or append mode. The
+    /// validator must seek to verified boundaries before handing over for writes.
+    /// No directories are created. The caller must exclude other writers during
+    /// validation, repair and handover; this operation does not acquire a lock.
+    pub async fn open_log_for_validation(
+        &self,
+        id: LogFileId,
+    ) -> Result<tokio::fs::File, StorageFileOpenError> {
+        let path = self.log_file_path(id);
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|source| StorageFileOpenError::new(path, source))
+    }
+
+    /// Opens the paired index for inspection and repair, creating it if missing.
+    ///
+    /// Existing bytes are preserved. Uses read/write access without append mode
+    /// so repair can replace an incorrect suffix. Parent directories must already
+    /// exist. Creating a missing empty index establishes no validated entries or
+    /// durable directory publication. Open the authoritative log successfully
+    /// first, so a missing log does not leave a newly created orphan index.
+    pub async fn open_index_for_repair(
+        &self,
+        id: LogFileId,
+    ) -> Result<tokio::fs::File, StorageFileOpenError> {
+        let path = self.index_file_path(id);
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .await
+            .map_err(|source| StorageFileOpenError::new(path, source))
     }
 
     /// Constructs the absolute `checkpoint.json` path for one stream's checkpoint.
@@ -154,6 +196,59 @@ mod tests {
         // Constructors and path queries have no filesystem side effects.
         assert!(!root.exists());
         assert_eq!(temporary.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn validation_opens_preserve_existing_bytes_and_index_creation_is_explicit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let provider =
+            StorageProvider::new(StorageConfig::new(temporary.path().to_owned()).unwrap());
+        let id = LogFileId::new(StreamId::MIN, LogFileNumber::MIN);
+        let log = provider.log_file_path(id);
+        let index = provider.index_file_path(id);
+        let error = provider.open_log_for_validation(id).await.unwrap_err();
+        assert_eq!(error.path(), log);
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!log.parent().unwrap().exists());
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, b"unchanged log").unwrap();
+        drop(provider.open_log_for_validation(id).await.unwrap());
+        assert!(!index.exists());
+        drop(provider.open_index_for_repair(id).await.unwrap());
+        assert_eq!(fs::read(&index).unwrap(), b"");
+        fs::write(&index, b"unchanged index").unwrap();
+        drop(provider.open_index_for_repair(id).await.unwrap());
+        assert_eq!(fs::read(&log).unwrap(), b"unchanged log");
+        assert_eq!(fs::read(&index).unwrap(), b"unchanged index");
+    }
+
+    #[tokio::test]
+    async fn index_open_errors_identify_the_path_and_preserve_colliding_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let provider =
+            StorageProvider::new(StorageConfig::new(temporary.path().to_owned()).unwrap());
+        let id = LogFileId::new(StreamId::MIN, LogFileNumber::MIN);
+        let index = provider.index_file_path(id);
+        fs::create_dir_all(&index).unwrap();
+        fs::write(index.join("keep"), b"existing content").unwrap();
+        let error = provider.open_index_for_repair(id).await.unwrap_err();
+        assert_eq!(error.path(), index);
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .is_some()
+        );
+        assert_eq!(fs::read(index.join("keep")).unwrap(), b"existing content");
     }
 
     #[test]

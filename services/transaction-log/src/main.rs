@@ -1,4 +1,5 @@
 pub mod storage;
+pub mod streams;
 
 use anyhow::Result;
 

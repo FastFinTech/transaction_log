@@ -4,7 +4,10 @@ This application module groups storage types for log, index and other file types
 It currently implements log-file identities, record-range location models, a
 JSON-serializable stream-checkpoint model, immutable startup configuration,
 deterministic log/index/checkpoint paths and stream-directory initialization.
-File persistence, index encoding, recovery and management of open files remain
+The provider also opens existing logs and their repairable indexes. The sibling
+[streams module](../streams/README.md) implements indexed appends, validation from
+a supplied trusted boundary, index repair and explicit invalid-tail recovery.
+Checkpoint persistence, startup orchestration and management of live files remain
 future work.
 
 Each type has its own source file. The thin `mod.rs` re-exports the public types
@@ -21,8 +24,9 @@ and `RECORDS_PER_FILE` and includes this specification in Rustdoc:
 | `record_range_location.rs` | A typed start/end pair, checks on their relationship and lazy iteration over the required files and their portions. |
 | `record_range_location_error.rs` | Inconsistent stream, sequence or known byte-boundary metadata. |
 | `storage_config.rs` | Immutable startup configuration and absolute root resolution. |
-| `storage_provider.rs` | Configuration ownership, path construction and asynchronous directory initialization. |
+| `storage_provider.rs` | Configuration ownership, paths, directory initialization and owned file acquisition for validation/repair. |
 | `storage_provider_error.rs` | A failed directory-creation request and its underlying I/O error. |
+| `storage_file_open_error.rs` | The requested log/index path and original file-opening error. |
 | `stream_checkpoint.rs` | A checkpoint boundary held as a typed record end location, with JSON serialization. |
 
 Storage policy belongs to the application, not the public record I/O exports
@@ -59,9 +63,10 @@ production definition. The exports crate's `SequenceNumber` continues to accept
 every `u64`; storage grouping is application policy, not a wire-format change.
 
 A completed file must hold exactly 100,000 records in its assigned consecutive
-range. Counting 100,000 arbitrary records is insufficient: the future writer and
-recovery code must enforce the stream and sequence values. These identity helpers
-do not validate file contents or sequence continuity. A partial file's
+range. Counting 100,000 arbitrary records is insufficient: `IndexedLogWriter`
+enforces the stream and sequence on append; `IndexedLogValidator` checks them
+during recovery scanning. These identity helpers do not validate file contents or
+sequence continuity. A partial file's
 `last_record_id()` is its assigned endpoint, not its last written, validated,
 received or durable record.
 
@@ -162,9 +167,11 @@ durable records on the local replica. It may lag durable data, but must never le
 it. Validity includes record framing, CRC, stream identity and sequence continuity.
 The owner must capture a complete boundary and make the covered data durable before
 durably publishing that checkpoint. Constructing this value establishes none of
-those facts. Checkpoint file loading, persistence, advancement, index recovery
-and startup integration remain future work; this step implements the model and
-its JSON representation.
+those facts. Checkpoint loading, persistence, advancement and startup integration
+remain future work. `IndexedLogValidator` accepts an explicitly supplied trusted
+endpoint, including trust in its index prefix; it does not load or choose the
+checkpoint itself. It repairs newly validated index suffixes, while an unusable
+trusted index prefix requires the caller to supply an earlier boundary.
 
 ```rust
 use transaction_log::storage::{RecordEndLocation, StreamCheckpoint};
@@ -191,24 +198,26 @@ requested stream, as well as establishing its agreement with storage.
 
 ### Planned historical-read availability
 
-Historical requests use the stream's published checkpoint as their inclusive
-upper sequence limit. A request may succeed only when its last requested record
-is covered by that checkpoint and the stream's files are validated and fully
-indexed through that point. The stream owner must establish those conditions
-before exposing an advanced checkpoint to readers. On startup, loading checkpoint
-metadata alone does not make a stream ready; required indexes must also be
-available and consistent, with rebuilding where necessary.
+Historical requests require a published contiguous prefix of validated, fully
+indexed records. A ready recovery checkpoint can establish a durable serving
+boundary. For the active file, `IndexedLogWriter` also reports a flushed boundary:
+independent read-only handles can read completed writes through the OS cache
+before durable synchronization. Whether to expose that newer prefix or require
+durability remains the serving owner's policy; the writer reports both boundaries.
+On startup, loading checkpoint metadata alone does not make a stream ready;
+required indexes must also be available and consistent, with rebuilding where
+necessary. Raw index length is not a substitute for this readiness contract.
 
 Provide a per-stream endpoint reporting the **last queryable sequence number**
 so historical clients can discover this limit before requesting data. Its value
-comes from the ready, published checkpoint's last record ID. It may lag the last
+comes from the serving owner's ready, published endpoint. It may lag the last
 received or appended record; those newer records are not the advertised historical
-limit. Represent absence explicitly when no queryable checkpoint exists, rather
+limit. Represent absence explicitly when no queryable prefix exists, rather
 than using sequence zero as a sentinel. A stream still recovering must not advertise
 an unready checkpoint as available history.
 
 The reported limit is a snapshot of the serving replica's availability. Each
-historical request still checks its range against that replica's ready checkpoint;
+historical request still checks its range against that replica's ready prefix;
 an earlier status response does not establish readiness on another replica or
 guarantee that older files remain retained. Requests beyond the limit must not
 be reported as successful shortened ranges. Whether they return unavailable or
@@ -265,11 +274,12 @@ binary record protocol, identifier layouts, getters or hot-path validation.
 
 The agreed index is a dense list of exclusive record end positions: one `u64`
 for every record in a contiguous prefix of its log file. No separate index-entry
-or collection model type is needed at this stage. A loaded list can be owned as
-`Vec<u64>` and borrowed as `&[u64]`; file-layer behavior and ownership will be
-implemented when index I/O is added.
+or collection model type is needed. `IndexWriter`, composed by `IndexedLogWriter`,
+encodes entries into a reusable byte buffer containing only its pending batch.
+Future index readers can seek directly to entries or load a list as `Vec<u64>`;
+they need not retain the entire index merely to resolve a range.
 
-The `.idx` file will contain consecutive eight-byte little-endian integers, with
+The `.idx` file contains consecutive eight-byte little-endian integers, with
 no per-entry record ID, padding, header or collection-length prefix. Its paired
 `LogFileId` comes from the requested storage path. The entry's ordinal supplies
 its sequence number, so storing that identity again would be redundant. This is
@@ -305,19 +315,24 @@ remains a real record. The terminal file range permits only 51,616 entries becau
 sequences end at `u64::MAX`. End positions need `u64`: 100,000 maximum-size records
 occupy 6,553,500,000 log bytes, exceeding a `u32` offset.
 
-Index data is derived from the log and is rebuildable. The future loading and
-validation layer must check whole eight-byte entries, the file's entry-count
-bound, and plausible increasing positions, and establish agreement with actual
-record boundaries and IDs before trusting those positions. Structural checks
+Index data is derived from the log and is rebuildable. `IndexedLogValidator`
+checks whole eight-byte entries, prefix plausibility and actual record boundaries
+and IDs for the newly scanned suffix. The supplied starting boundary certifies
+both earlier prefixes; structural checks on that trusted prefix do not establish
+its original validity. Structural checks
 alone cannot detect every stale or corrupt offset. The log remains authoritative;
 an index endpoint is not evidence of CRC validity, sequence continuity or durable
 storage, and cannot replace a trusted recovery checkpoint. An index may lag the
 log, so a missing entry alone does not establish that the record is absent.
 
-This section records the selected layout. Encoding/decoding, file loading,
-incremental index writes, index recovery and provider APIs returning open files
-with indexing data remain future work. No index model, codec or persistence API
-has been introduced yet.
+`IndexWriter` owns encoding and file output; `IndexedLogWriter` supplies the offsets
+of accepted records and coordinates output with the paired log. The pair writer
+completes the log batch and its destination flush before beginning index output,
+then flushes the index. Concurrent index readers must account for a partial last
+entry and respect the owner's published boundary. Ordered flushes establish read
+visibility, not an atomic two-file commit or durability. The validator uses the
+same `IndexWriter` to repair a bad/missing index suffix before handover. Historical
+index lookup and range-serving APIs remain future work.
 
 ## Record range locations
 
@@ -447,8 +462,10 @@ file operations.
 Resolving record positions belongs to future file/index APIs using the dense
 layout above; `RecordRangeLocation` carries their outer endpoints and enumerates
 the required file portions. A full file contains 100,000 records irrespective of
-their byte sizes. The provider owns the file-path layout; index I/O, open handles and
-read/write ownership remain responsibilities of the future storage implementation.
+their byte sizes. The provider owns the file-path layout; the streams module owns
+append and validation/repair operations on a supplied pair. Named provider methods
+acquire recovery handles; historical lookup and coordination of live writer/read
+handles remain future integration work.
 Range endpoints must not be substituted for a durability or validation checkpoint.
 
 ## Configuration and ownership
@@ -525,6 +542,11 @@ respective groups. The hierarchy covers the entire file-number domain from the
 start, so growing sequences never require moving earlier files to add levels.
 Early paths intentionally include leading `000` directories.
 
+Active and finalized pairs use these same permanent paths and file formats.
+They are not relocated, stitched together or converted when full. Finalization
+ends appending after synchronization; the future stream owner publishes that
+state. Path shape alone does not establish a file's completeness or readiness.
+
 This is a fixed storage-layout contract, not a runtime directory-size setting.
 Changing digit widths, grouping, extensions, the checkpoint filename or the
 `streams` component changes where files are found. Keep naming logic in the
@@ -553,8 +575,28 @@ silently diverge. Initialization and all path methods share the stream-base help
 That helper accepts a validated `StreamId`, preserving the type's domain contract
 through path construction rather than accepting arbitrary raw integers.
 
-There is no provider throughput claim or benchmark yet. Record-processing hot
-paths and file-handle ownership will be measured when file operations exist.
+There is no provider or file-recovery throughput measurement yet. Existing record
+benchmarks do not measure these file operations.
+
+## File acquisition for validation and repair
+
+`open_log_for_validation(id)` opens the named existing log with read/write access,
+without create, truncate or append mode. A missing log is an error. The caller
+needs write access for explicit tail repair and eventual writer handover. The
+validator seeks to verified append boundaries before transferring these handles.
+
+`open_index_for_repair(id)` opens the index with read/write access, creating a
+missing empty index and preserving an existing one. It also avoids append mode,
+because repair must be able to replace a bad suffix. Parent directories must
+already exist. A validator opens the log successfully first, so a missing log
+does not create an orphan index. Neither method invents valid records or entries.
+
+`StorageFileOpenError` preserves the requested path and concrete OS error. Returned
+handles belong to the caller; the provider keeps no cache, task or mutex. Default
+file sharing permits independent readers, but these methods do not coordinate
+them, acquire exclusive recovery locks, or make the pair queryable. The caller
+must exclude other writers and withhold recovering indexes from readers. Creating
+a file does not durably synchronize its parent directory or publish stream state.
 
 ## Initialization and failures
 
@@ -589,11 +631,17 @@ establish their own stronger guarantees.
 
 ## Storage boundaries and future work
 
-File opening, handle caching, the single writer/multiple readers model, index
-encoding, sealed-file reads, sequence continuity, checkpoint persistence and
-advancement, durable publication and invalid-tail recovery remain unimplemented.
-This module must not make directory initialization appear to provide any of those
-behaviors.
+The [streams module](../streams/README.md) owns one log/index pair exclusively,
+enforces sequence continuity on append, orders output and reports separate flushed
+and synchronized endpoints. It finalizes a full, synchronized pair without
+changing paths. Its validator obtains handles through the provider, checks the
+untrusted suffix, repairs its index, supports explicitly authorized log truncation,
+and hands over either a synchronized partial writer or full completion metadata.
+
+Handle caching, coordination with independent readers, historical/sealed-file
+reads, checkpoint persistence and advancement, directory-durable publication and
+startup-wide recovery orchestration remain unimplemented. Directory initialization
+alone grants no validation, durability or read readiness.
 
 Read the [record specification](../../../transaction-log-exports/src/record/README.md)
 before integrating record I/O. The provider does not change record framing or

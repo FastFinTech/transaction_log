@@ -16,9 +16,10 @@ const INITIAL_BUFFER_CAPACITY: usize = 64 * 1024;
 
 /// Reads fully validated records from an async socket, file, or other byte source.
 ///
-/// The reader owns a reusable receive buffer. Each wait validates all complete
-/// records currently buffered, then splits and freezes that prefix once. An
-/// incomplete tail stays in the receive buffer. Draining the validated batch
+/// The reader owns a reusable receive buffer. Each wait validates the complete
+/// record prefix, stopping at incomplete or invalid input, then splits and freezes
+/// that prefix once. Any tail stays in the receive buffer; invalid input is reported
+/// on the next wait after the valid batch is drained. Draining the validated batch
 /// creates shared byte handles without repeating validation or copying records.
 /// Returned records remain valid after the reader is dropped or its buffer is
 /// replaced. Refilling may move an unfinished tail.
@@ -117,20 +118,22 @@ impl<R> RecordReader<R> {
 
     fn prepare_batch(&mut self) -> Result<bool, RecordReadError> {
         let mut validated_len = 0;
-        loop {
+        let validation = loop {
             let remaining = &self.buffer[validated_len..];
             let length = match self.pending_length {
                 Some(length) => length,
                 None => {
                     let Some(header) = remaining.first_chunk::<{ protocol::HEADER_LEN }>() else {
-                        break;
+                        break Ok(());
                     };
                     let declared = protocol::read::length(header);
                     let length = usize::from(declared);
                     if length < protocol::MIN_RECORD_LEN {
-                        return Err(RecordReadError::InvalidLength { declared });
+                        break Err(RecordReadError::InvalidLength { declared });
                     }
-                    StreamId::new(protocol::read::stream_id(header))?;
+                    if let Err(error) = StreamId::new(protocol::read::stream_id(header)) {
+                        break Err(RecordReadError::InvalidStreamId(error));
+                    }
                     // A u16 length is inherently within the protocol maximum.
                     self.pending_length = Some(length);
                     length
@@ -138,7 +141,7 @@ impl<R> RecordReader<R> {
             };
 
             if remaining.len() < length {
-                break;
+                break Ok(());
             }
 
             let frame = &remaining[..length];
@@ -147,20 +150,24 @@ impl<R> RecordReader<R> {
             let stored = unsafe { protocol::read::crc(frame) };
             let computed = protocol::read::compute_crc(frame);
             if stored != computed {
-                return Err(RecordReadError::CrcMismatch { stored, computed });
+                break Err(RecordReadError::CrcMismatch { stored, computed });
             }
 
             validated_len += length;
             self.pending_length = None;
-        }
+        };
 
         if validated_len == 0 {
-            return Ok(false);
+            return validation.map(|()| false);
         }
+        // Publish every good record before the first invalid or unfinished one.
+        // Keep the offending bytes, not the error: after this batch is drained,
+        // the next wait rediscovers it at offset zero and returns it. Only corrupt
+        // input repeats validation; good records are split off and never rechecked.
         self.batch = self.buffer.split_to(validated_len).freeze();
         self.batch_offset = 0;
-        // pending_length, if present, belongs to the unfinished tail that now
-        // starts the receive buffer. No completed frame is validated again.
+        // pending_length, if present, belongs to the unfinished or CRC-invalid
+        // frame now at the receive buffer's start. Its header checks still hold.
         Ok(true)
     }
 }
@@ -169,17 +176,20 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
     /// Waits until at least one complete, validated record is ready to read.
     ///
     /// Returns `Ok(true)` when [`try_read_next`](Self::try_read_next) can return a
-    /// record. It validates all complete buffered records and splits that prefix
-    /// once, leaving an incomplete tail for the next batch. It does not wait to
-    /// fill the buffer once a complete record is available. Repeated waits while
-    /// the batch has unread records return immediately without I/O or validation.
+    /// record. It validates the complete prefix up to incomplete or invalid input
+    /// and splits that prefix once, leaving the tail in the receive buffer. It
+    /// does not wait to fill the buffer once a complete record is available.
+    /// Repeated waits while the batch has unread records return immediately
+    /// without I/O or validation.
     ///
-    /// Validation failures are reported before any record from the new batch
-    /// is exposed, even if earlier records in that batch were valid. Returns
-    /// `Ok(false)` only at a clean end of input between records. EOF in a header,
+    /// Valid records preceding a validation failure are exposed first. After that
+    /// batch is drained, the next wait rediscovers and reports the error without
+    /// reading more source bytes. Invalid input at the start fails immediately;
+    /// the reader never skips it to expose later records. No error is stored.
+    /// Returns `Ok(false)` only at a clean end of input between records. EOF in a header,
     /// body, or CRC trailer is an error. EOF is terminal; subsequent calls return
-    /// `Ok(false)` without reading again. On a validation or I/O error the reader
-    /// becomes terminal and subsequent calls return `ReaderFailed`.
+    /// `Ok(false)` without reading again. Once a validation or I/O error is returned,
+    /// the reader becomes terminal and subsequent calls return `ReaderFailed`.
     ///
     /// Cancelling this future preserves received bytes and any validated header
     /// length and stream ID in the reader. Calling it again continues the same
@@ -521,20 +531,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_a_corrupt_batch_before_splitting_or_exposing_any_record() {
-        let mut batch = BytesMut::from(FRAME);
+    async fn publishes_the_valid_prefix_before_rediscovering_a_crc_error() {
+        let mut batch = BytesMut::from(FRAME.repeat(2).as_slice());
         let mut corrupted = FRAME.to_vec();
         corrupted[12] ^= 1;
         batch.extend_from_slice(&corrupted);
         batch.extend_from_slice(FRAME);
-        let mut reader = RecordReader::new(Cursor::new(batch));
+        let source = TestSource::new(batch.freeze(), usize::MAX);
+        let mut reader = RecordReader::new(source);
         let receive_pointer = reader.buffer.as_ptr();
+
+        assert!(reader.wait_to_read().await.unwrap());
+        assert_eq!(reader.batch.len(), 2 * FRAME.len());
+        assert_eq!(reader.batch.as_ptr(), receive_pointer);
+        assert_eq!(reader.buffer.len(), 2 * FRAME.len());
+        assert_eq!(&reader.buffer[..FRAME.len()], &corrupted);
+        let tail_pointer = reader.buffer.as_ptr();
+        assert_eq!(
+            tail_pointer.addr(),
+            receive_pointer.addr() + 2 * FRAME.len()
+        );
+
+        // Neither repeated waits nor error rediscovery may read the source.
+        // If they did, this unrelated error would mask the buffered CRC failure.
+        reader.source.error = Some(io::ErrorKind::ConnectionReset);
+        let mut retained = Vec::new();
+        for _ in 0..2 {
+            assert!(reader.wait_to_read().await.unwrap());
+            assert!(reader.wait_to_read().await.unwrap());
+            retained.push(reader.try_read_next().unwrap().unwrap());
+            assert_eq!(reader.buffer.as_ptr(), tail_pointer);
+            assert_eq!(reader.source.read_calls, 1);
+        }
+        assert!(reader.try_read_next().unwrap().is_none());
+        let expected_stored = u32::from_le_bytes(FRAME[17..21].try_into().unwrap());
+        let expected_computed = reference_crc(&corrupted[..17]);
         assert!(matches!(
             reader.wait_to_read().await,
-            Err(RecordReadError::CrcMismatch { .. })
+            Err(RecordReadError::CrcMismatch { stored, computed })
+                if stored == expected_stored && computed == expected_computed
         ));
-        assert_eq!(reader.buffer.as_ptr(), receive_pointer);
-        assert_eq!(reader.buffer.len(), 3 * FRAME.len());
+        assert_eq!(reader.buffer.as_ptr(), tail_pointer);
         assert!(reader.batch.is_empty());
         assert!(matches!(
             reader.try_read_next(),
@@ -544,6 +581,43 @@ mod tests {
             reader.wait_to_read().await,
             Err(RecordReadError::ReaderFailed)
         ));
+        assert_eq!(reader.source.read_calls, 1);
+        assert_eq!(reader.source.error, Some(io::ErrorKind::ConnectionReset));
+        drop(reader);
+        for record in retained {
+            assert_eq!(record.as_ref(), FRAME);
+        }
+    }
+
+    #[tokio::test]
+    async fn delivers_the_same_valid_prefix_before_corruption_at_every_chunk_size() {
+        let first = encode_frame(RecordId::new(StreamId::MIN, SequenceNumber::MIN), b"");
+        let mut corrupted = FRAME.to_vec();
+        corrupted[12] ^= 1;
+        let input = [&first[..], FRAME, &corrupted, FRAME].concat();
+        for chunk_size in 1..=input.len() {
+            let source = TestSource::new(Bytes::copy_from_slice(&input), chunk_size);
+            let mut reader = RecordReader::new(source);
+            let a = read_record(&mut reader).await.unwrap().unwrap();
+            let b = read_record(&mut reader).await.unwrap().unwrap();
+            assert!(matches!(
+                read_record(&mut reader).await,
+                Err(RecordReadError::CrcMismatch { .. })
+            ));
+            let calls = reader.source.read_calls;
+            assert!(matches!(
+                reader.try_read_next(),
+                Err(RecordReadError::ReaderFailed)
+            ));
+            assert!(matches!(
+                reader.wait_to_read().await,
+                Err(RecordReadError::ReaderFailed)
+            ));
+            assert_eq!(reader.source.read_calls, calls);
+            drop(reader);
+            assert_eq!(a.as_ref(), &first);
+            assert_eq!(b.as_ref(), FRAME);
+        }
     }
 
     #[tokio::test]
@@ -555,25 +629,34 @@ mod tests {
             let crc = reference_crc(&invalid[..crc_offset]);
             invalid[crc_offset..].copy_from_slice(&crc.to_le_bytes());
 
-            // An invalid ID in either the first or a later record rejects the
-            // entire candidate batch, before it is split or exposed.
-            for valid_prefix in [false, true] {
-                let mut input = BytesMut::new();
-                if valid_prefix {
-                    input.extend_from_slice(FRAME);
-                }
+            // A later failure must not withhold the valid prefix, and neither
+            // position may allow the valid record after the failure through.
+            for prefix_count in [0, 2] {
+                let mut input = BytesMut::from(FRAME.repeat(prefix_count).as_slice());
                 input.extend_from_slice(&invalid);
                 input.extend_from_slice(FRAME);
-                let expected = input.clone();
-                let mut reader = RecordReader::new(Cursor::new(input));
+                let source = TestSource::new(input.freeze(), usize::MAX);
+                let mut reader = RecordReader::new(source);
                 let pointer = reader.buffer.as_ptr();
+                let mut retained = Vec::new();
+                if prefix_count > 0 {
+                    assert!(reader.wait_to_read().await.unwrap());
+                    assert_eq!(reader.batch.len(), prefix_count * FRAME.len());
+                    for _ in 0..prefix_count {
+                        retained.push(reader.try_read_next().unwrap().unwrap());
+                    }
+                    assert!(reader.try_read_next().unwrap().is_none());
+                }
                 assert!(matches!(
                     reader.wait_to_read().await,
                     Err(RecordReadError::InvalidStreamId(error))
                         if error.value() == value
                 ));
-                assert_eq!(reader.buffer.as_ref(), expected.as_ref());
-                assert_eq!(reader.buffer.as_ptr(), pointer);
+                assert_eq!(reader.buffer.as_ref(), [&invalid[..], FRAME].concat());
+                assert_eq!(
+                    reader.buffer.as_ptr().addr(),
+                    pointer.addr() + prefix_count * FRAME.len()
+                );
                 assert!(reader.batch.is_empty());
                 assert!(matches!(
                     reader.try_read_next(),
@@ -583,6 +666,11 @@ mod tests {
                     reader.wait_to_read().await,
                     Err(RecordReadError::ReaderFailed)
                 ));
+                assert_eq!(reader.source.read_calls, 1);
+                drop(reader);
+                for record in retained {
+                    assert_eq!(record.as_ref(), FRAME);
+                }
             }
         }
     }
@@ -626,38 +714,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_later_short_lengths_before_splitting_a_batch() {
+    async fn publishes_valid_records_before_rejecting_every_short_length() {
         for declared in 0_u16..16 {
-            let mut input = BytesMut::from(FRAME);
+            let mut input = BytesMut::from(FRAME.repeat(2).as_slice());
             let mut header = FRAME[..12].to_vec();
             header[..2].copy_from_slice(&declared.to_le_bytes());
             input.extend_from_slice(&header);
+            input.extend_from_slice(FRAME);
             let source = TestSource::new(input.freeze(), usize::MAX);
             let mut reader = RecordReader::new(source);
             let receive_pointer = reader.buffer.as_ptr();
-            let capacity = reader.buffer.capacity();
+            assert!(reader.wait_to_read().await.unwrap());
+            assert_eq!(reader.batch.len(), 2 * FRAME.len());
+            assert_eq!(reader.batch.as_ptr(), receive_pointer);
+            let a = reader.try_read_next().unwrap().unwrap();
+            let b = reader.try_read_next().unwrap().unwrap();
+            assert!(reader.try_read_next().unwrap().is_none());
+            let tail_pointer = reader.buffer.as_ptr();
             assert!(matches!(
                 reader.wait_to_read().await,
                 Err(RecordReadError::InvalidLength { declared: actual }) if actual == declared
             ));
             assert_eq!(reader.source.read_calls, 1);
-            assert_eq!(reader.buffer.as_ptr(), receive_pointer);
-            assert_eq!(reader.buffer.capacity(), capacity);
-            assert_eq!(reader.buffer.len(), FRAME.len() + 12);
+            assert_eq!(reader.buffer.as_ptr(), tail_pointer);
+            assert_eq!(reader.buffer.as_ref(), [&header[..], FRAME].concat());
             assert!(reader.batch.is_empty());
+            assert!(matches!(
+                reader.try_read_next(),
+                Err(RecordReadError::ReaderFailed)
+            ));
+            assert!(matches!(
+                reader.wait_to_read().await,
+                Err(RecordReadError::ReaderFailed)
+            ));
+            assert_eq!(reader.source.read_calls, 1);
+            drop(reader);
+            assert_eq!(a.as_ref(), FRAME);
+            assert_eq!(b.as_ref(), FRAME);
         }
     }
 
     #[tokio::test]
-    async fn reports_partial_data_after_a_complete_record() {
-        let mut batch = BytesMut::from(FRAME);
-        batch.extend_from_slice(&FRAME[..7]);
-        let mut reader = RecordReader::new(Cursor::new(batch));
-        assert!(read_record(&mut reader).await.unwrap().is_some());
-        assert!(matches!(
-            read_record(&mut reader).await,
-            Err(RecordReadError::TruncatedHeader { actual: 7 })
-        ));
+    async fn publishes_valid_records_before_every_truncated_tail() {
+        for tail_len in 1..FRAME.len() {
+            let mut batch = BytesMut::from(FRAME.repeat(2).as_slice());
+            batch.extend_from_slice(&FRAME[..tail_len]);
+            let source = TestSource::new(batch.freeze(), usize::MAX);
+            let mut reader = RecordReader::new(source);
+            let a = read_record(&mut reader).await.unwrap().unwrap();
+            let b = read_record(&mut reader).await.unwrap().unwrap();
+            assert_eq!(reader.source.read_calls, 1);
+            let error = reader.wait_to_read().await.unwrap_err();
+            if tail_len < 12 {
+                assert!(
+                    matches!(error, RecordReadError::TruncatedHeader { actual } if actual == tail_len)
+                );
+            } else {
+                assert!(
+                    matches!(error, RecordReadError::TruncatedRecord { expected: 21, actual } if actual == tail_len)
+                );
+            }
+            assert!(matches!(
+                reader.try_read_next(),
+                Err(RecordReadError::ReaderFailed)
+            ));
+            assert!(matches!(
+                reader.wait_to_read().await,
+                Err(RecordReadError::ReaderFailed)
+            ));
+            assert_eq!(reader.source.read_calls, 2);
+            drop(reader);
+            assert_eq!(a.as_ref(), FRAME);
+            assert_eq!(b.as_ref(), FRAME);
+        }
     }
 
     #[tokio::test]
@@ -705,6 +834,38 @@ mod tests {
             read_record(&mut reader).await,
             Err(RecordReadError::ReaderFailed)
         ));
+    }
+
+    #[tokio::test]
+    async fn source_errors_after_a_valid_batch_are_terminal_without_retry() {
+        for tail_len in 0..FRAME.len() {
+            let mut input = BytesMut::from(FRAME.repeat(2).as_slice());
+            input.extend_from_slice(&FRAME[..tail_len]);
+            let source = TestSource::new(input.freeze(), usize::MAX);
+            let mut reader = RecordReader::new(source);
+            assert!(reader.wait_to_read().await.unwrap());
+            reader.source.error = Some(io::ErrorKind::ConnectionReset);
+            let a = read_record(&mut reader).await.unwrap().unwrap();
+            let b = read_record(&mut reader).await.unwrap().unwrap();
+            assert!(reader.try_read_next().unwrap().is_none());
+            assert_eq!(reader.source.read_calls, 1);
+            assert!(matches!(
+                reader.wait_to_read().await,
+                Err(RecordReadError::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset
+            ));
+            assert!(matches!(
+                reader.wait_to_read().await,
+                Err(RecordReadError::ReaderFailed)
+            ));
+            assert!(matches!(
+                reader.try_read_next(),
+                Err(RecordReadError::ReaderFailed)
+            ));
+            assert_eq!(reader.source.read_calls, 2);
+            drop(reader);
+            assert_eq!(a.as_ref(), FRAME);
+            assert_eq!(b.as_ref(), FRAME);
+        }
     }
 
     async fn read_record<R: AsyncRead + Unpin>(

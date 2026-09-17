@@ -611,6 +611,12 @@ background output workers. The transaction-log application decides stream/file
 routing, append position, batching, index updates, durable sync cadence, recovery
 and worker sharing across files. Neither application layer is implemented here.
 
+The transaction-log application's [indexed log writer](../../../transaction-log/src/streams/indexed_log_writer/README.md)
+now composes the existing-record mode with its file-only `IndexWriter`. It enforces a
+file's sequence range and completes log output and destination flushing before
+writing index entries. Its pair-level `sync_data` includes pending output;
+this general writer's `sync_data` remains the separate destination-only operation.
+
 A high-throughput background wrapper must manage multiple buffers if its producer
 continues while output is pending. The current middle layer owns one buffer and
 appends records synchronously, then sends a batch when explicitly asked. The
