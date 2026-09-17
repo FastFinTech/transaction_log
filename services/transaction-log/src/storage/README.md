@@ -162,16 +162,19 @@ and it does not add a partial numeric check in place of inspecting actual storag
 The future checkpoint owner must establish the complete contract when producing
 or loading a trusted recovery checkpoint.
 
-A checkpoint published for recovery must describe a contiguous prefix of valid,
-durable records on the local replica. It may lag durable data, but must never lead
-it. Validity includes record framing, CRC, stream identity and sequence continuity.
-The owner must capture a complete boundary and make the covered data durable before
-durably publishing that checkpoint. Constructing this value establishes none of
-those facts. Checkpoint loading, persistence, advancement and startup integration
-remain future work. `IndexedLogValidator` accepts an explicitly supplied trusted
-endpoint, including trust in its index prefix; it does not load or choose the
-checkpoint itself. It repairs newly validated index suffixes, while an unusable
-trusted index prefix requires the caller to supply an earlier boundary.
+A checkpoint published for recovery certifies a contiguous prefix of valid records
+AND correct index entries on the local replica. It cannot advance until framing,
+CRC, stream identity, sequence continuity and the corresponding exact record end
+offsets are established. Synchronize the covered log data, then the index data,
+before durably publishing the checkpoint. It may lag this durable pair, but must
+never lead either file. Constructing the model establishes none of those facts.
+Checkpoint loading, persistence, advancement and startup integration remain future
+work. `IndexedLogValidator` accepts the explicitly supplied trusted endpoint; it
+does not load or choose the checkpoint itself. It checks prefix presence and the
+final certified index entry's agreement with that endpoint, without revalidating
+earlier records or index entries. It validates and repairs the suffix. A missing
+trusted index prefix or mismatching endpoint requires the caller to supply an
+earlier trustworthy boundary for a separate attempt.
 
 ```rust
 use transaction_log::storage::{RecordEndLocation, StreamCheckpoint};
@@ -248,7 +251,7 @@ file output, and `serde_json::from_slice::<StreamCheckpoint>(&bytes)` to decode
 them. The same traits also support `to_writer_pretty` and `from_reader` for
 synchronous `std::io` destinations/sources. These codecs do not flush, sync or
 atomically publish a checkpoint file. Those operations belong to the future
-persistence owner, which must publish only after covered log data is durable.
+persistence owner, which must publish only after covered log and index data are durable.
 
 Fields are required; missing, duplicate or unknown object fields are errors,
 including inside the endpoint and its nested record ID. There are no default-zero

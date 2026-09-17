@@ -30,20 +30,128 @@ use crate::streams::{IndexWriter, IndexedLogWriter, index_writer::INDEX_ENTRY_LE
 /// timers, checkpoint publication or directory synchronization are supplied here.
 /// Failed or cancelled operations make this instance unusable; reopen to recover.
 pub struct IndexedLogValidator {
+    /// Identity of this owned log/index pair, fixed for the validator's lifetime.
+    ///
+    /// Selects both provider paths and supplies the stream and assigned sequence
+    /// range checked during scanning. `open` requires any supplied `start` to
+    /// belong to this file. Neither repair nor handover advances to another file.
     file_id: LogFileId,
+
+    /// Owned read/write handle to the existing record-data file.
+    ///
+    /// Opened without creation, append mode or truncation. The caller excludes
+    /// other writers; owning this handle does not acquire an OS-level lock.
+    /// Validation may read ahead beyond the last accepted record, so the physical
+    /// cursor is not a recovery boundary. `into_writer` seeks to the verified
+    /// append end; `into_completed` closes the handle after synchronization.
+    /// Only explicit `truncate_invalid_tail` removes bytes from this file.
     log: File,
+
+    /// Owned read/write handle to the paired dense index file.
+    ///
+    /// A missing index is created empty; existing bytes are preserved on open.
+    /// Each eight-byte entry stores one record's absolute exclusive log end.
+    /// Validation reads the index independently of the log cursor. Repair seeks
+    /// to the first mismatching entry and rewrites/truncates that suffix through
+    /// `IndexWriter`; writer handover seeks to the verified index append end.
+    /// The caller must exclude other writers and withhold recovery from queries.
     index: File,
+
+    /// Caller-certified last record and exclusive byte end of the trusted prefix.
+    ///
+    /// `None` means no trusted records: scan from byte zero and the file's first
+    /// assigned ID. `Some` certifies both the log and its matching index prefix.
+    /// Validation checks presence and the final index entry, without revalidating
+    /// earlier log records or index entries. A checkpoint owner must establish
+    /// both prefixes' correctness and durability before publishing that checkpoint.
+    /// This boundary never advances during scanning or repair. New findings live
+    /// in `ends` and `report`; loading or publishing checkpoints belongs upstream.
     start: Option<RecordEndLocation>,
+
+    /// Number of records covered by `start`, including its last record.
+    ///
+    /// Computed once in `open` as the start sequence minus this file's first
+    /// sequence plus one, or zero when `start` is absent. It counts records in
+    /// this file, not the stream's lifetime sequence number. It determines the
+    /// trusted index-prefix size and the next expected sequence. Scanning leaves
+    /// it unchanged; total accepted records are `trusted_records + ends.len()`.
     trusted_records: u64,
-    // Only offsets for the newly scanned suffix, at most 800 KB per validator.
-    // We never retain record bodies or a file-sized payload buffer.
+
+    /// Absolute exclusive log ends of newly accepted records after `start`.
+    ///
+    /// Entry `i` belongs to file-local record index `trusted_records + i`; these
+    /// are native `u64` byte positions, not encoded entries or relative lengths.
+    /// An end is appended only after framing, stream, sequence and CRC checks
+    /// pass. The trusted prefix has no entries here, and record bodies are not
+    /// retained. Repair uses these offsets to rebuild the untrusted index suffix.
+    /// At most `RECORDS_PER_FILE - trusted_records` entries are used (800,000
+    /// bytes when scanning a whole file); Vec growth may reserve extra capacity.
+    /// An interrupted scan can leave partial offsets, but without a usable,
+    /// completed report they grant no repair or handover authority.
     ends: Vec<u64>,
+
+    /// Immutable findings from the first successfully completed validation pass.
+    ///
+    /// `None` until the scan, index comparison and final length checks succeed.
+    /// A reported content error still counts as completed validation: the report
+    /// identifies the valid prefix and invalid tail for an explicit repair choice.
+    /// It preserves original file lengths and diagnostics after repairs and even
+    /// after a later operation fails. `report()` permits inspection in that case;
+    /// repair and handover additionally require `usable`. Repeated successful
+    /// `validate` calls return this snapshot rather than inspecting files again.
     report: Option<LogValidationReport>,
-    // Current lengths change after repairs; the report preserves original findings.
+
+    /// Expected current physical log length in bytes, including any invalid tail.
+    ///
+    /// Starts at zero as a placeholder; `validate` loads the actual metadata.
+    /// Bounds the source scan and detects length changes between recovery phases.
+    /// Successful explicit truncation updates it to the report's valid log end;
+    /// the report retains the original length. It is neither a cursor nor a
+    /// durable/validated boundary by itself. Failed I/O may change the real file
+    /// without updating this field, which is why `usable` must gate further work.
     log_length: u64,
+
+    /// Expected current physical index length in bytes, including partial/excess entries.
+    ///
+    /// Starts at zero as a placeholder and is populated from metadata during
+    /// validation. It bounds index input and is checked for external length
+    /// changes. After successful index repair it equals the report's accepted
+    /// record count times `INDEX_ENTRY_LEN`; the original length stays in `report`.
+    /// It is not an entry count or independent proof of index validity. As with
+    /// `log_length`, interrupted I/O can make it stale on an unusable instance.
     index_length: u64,
+
+    /// Permission to continue this validator's in-place recovery operations.
+    ///
+    /// Starts true, allowing validation but not yet repair or handover. Validation
+    /// and repairs set it false before their I/O and restore it only on complete
+    /// success. Errors, unwinding or cancellation therefore leave the instance
+    /// terminal, even if `report` or readiness flags still describe earlier success.
+    /// Content corruption returned inside a successful report is not an operation
+    /// failure. Raw-handle extraction and report inspection remain available when
+    /// false; consuming handovers cannot return the validator after failed I/O.
     usable: bool,
+
+    /// Whether the index exactly describes the report's entire accepted prefix.
+    ///
+    /// Initially false because the index has not been inspected. Successful
+    /// validation sets it when the suffix matches the scanned records, the trusted
+    /// endpoint agrees and no missing, partial or extra bytes remain. Earlier
+    /// entries retain the checkpoint's certification. Successful `repair_index`
+    /// also sets it after flushing output.
+    /// It may be true while the log still has an invalid tail (`log_ready` false).
+    /// This is repair readiness, not durable sync or permission to serve queries.
+    /// Handover requires `usable`, a report and both readiness flags together.
     index_ready: bool,
+
+    /// Whether the log ends exactly at the report's accepted record boundary.
+    ///
+    /// Initially false until validation establishes that no invalid/extra tail
+    /// remains. If validation reports a tail, only successful explicit truncation
+    /// sets this flag. A clean log can be ready while its index still needs repair.
+    /// Truncation leaves the original report's tail error intact, so this flag
+    /// tracks current readiness separately. It does not establish durability;
+    /// handover synchronizes the pair after checking both flags and `usable`.
     log_ready: bool,
 }
 
@@ -53,7 +161,7 @@ impl IndexedLogValidator {
     /// `start` is the last record already trusted in this file, not the next one
     /// to inspect. `None` means offset zero and the file's first assigned ID. A
     /// full-file endpoint is valid. The caller certifies correct record and index
-    /// prefixes; numeric checks and index-prefix checks do not establish that trust.
+    /// prefixes; presence and endpoint checks do not establish that trust.
     ///
     /// A missing log is an error. A missing index is created empty, then can be
     /// rebuilt from the beginning; with a nonempty trusted prefix, validation
@@ -66,6 +174,8 @@ impl IndexedLogValidator {
         if start.is_some_and(|end| end.log_file_id() != file_id) {
             return Err(Error::InvalidStart("endpoint belongs to another file"));
         }
+        // Count the supplied endpoint inclusively within this file. None means
+        // zero trusted records; it never enters the closure or adds one.
         let trusted_records = start.map_or(0, |end| {
             end.record_id().sequence_number().get()
                 - file_id.first_record_id().sequence_number().get()
@@ -107,21 +217,34 @@ impl IndexedLogValidator {
     ///
     /// Content failures produce a report with the exact valid prefix and first
     /// tail error. Operational failures return `Err`, never a truncation report.
-    /// Repeating a successful call returns its original report without rescanning.
+    /// The report remains owned by this validator. Repeating a successful call
+    /// returns it without rescanning, provided no later operation made the
+    /// validator unusable. Repair does not rewrite these original findings.
+    ///
+    /// An invalid supplied boundary also returns `Err`. Failure or cancellation
+    /// after validation begins leaves the instance unusable for repair or handover.
+    /// A completed report may describe corruption and still permit explicit repair;
+    /// validation itself neither repairs files nor durably synchronizes them.
     ///
     /// Scanning uses RecordReader's batching in a single forward pass. The reader
     /// yields the valid prefix before reporting corrupt input, so every preceding
     /// record receives its sequence check and end offset without rereading the file.
     pub async fn validate(&mut self) -> Result<&LogValidationReport, Error> {
         if self.report.is_some() {
+            // A cached report cannot bypass an intervening repair failure:
+            // validated_report also checks that the instance is still usable.
             return self.validated_report();
         }
         self.check_usable()?;
-        // Includes all await points. A cancelled scan cannot become repair authority.
+        // Set this before the first await. Early errors, panic or cancellation
+        // must leave partial findings unable to authorize repair or handover.
+        // Only a completed validation restores usability, even if it found corruption.
         self.usable = false;
         self.log_length = self.log.metadata().await.map_err(Error::LogIo)?.len();
         self.index_length = self.index.metadata().await.map_err(Error::IndexIo)?.len();
         let start_position = self.start.map_or(0, |end| end.position());
+        // Check only plausibility, not the caller-certified records themselves.
+        // No trusted prefix means count and position are both zero, even at EOF.
         if start_position > self.log_length
             || start_position < self.trusted_records * MIN_RECORD_LEN as u64
             || start_position > self.trusted_records * MAX_RECORD_LEN as u64
@@ -131,7 +254,9 @@ impl IndexedLogValidator {
             ));
         }
 
-        // Bound allocation even if a corrupt index advertises an enormous length.
+        // Load the bounded index once for its checkpoint endpoint and suffix.
+        // Cap input at a full file's index size; retain the actual index_length
+        // so excess entries or bytes still require repair without being loaded.
         let index_limit = self
             .index_length
             .min(RECORDS_PER_FILE * INDEX_ENTRY_LEN as u64);
@@ -146,23 +271,22 @@ impl IndexedLogValidator {
             .await
             .map_err(Error::IndexIo)?;
         if index_bytes.len() as u64 != index_limit {
+            // EOF arrived before the extent observed in metadata. This is not
+            // a stable input from which to authorize index repair.
             return Err(Error::FilesChanged);
         }
-        let trusted_bytes = self.trusted_records as usize * INDEX_ENTRY_LEN;
-        let Some(prefix) = index_bytes.get(..trusted_bytes) else {
-            return Err(Error::TrustedIndexUnavailable);
-        };
-        let mut previous = 0;
-        for entry in prefix.as_chunks::<INDEX_ENTRY_LEN>().0 {
-            let end = u64::from_le_bytes(*entry);
-            if !(MIN_RECORD_LEN as u64..=MAX_RECORD_LEN as u64)
-                .contains(&end.saturating_sub(previous))
-            {
-                return Err(Error::TrustedIndexUnavailable);
-            }
-            previous = end;
-        }
-        if previous != start_position {
+        let mut index_ends = index_bytes
+            .as_chunks::<INDEX_ENTRY_LEN>()
+            .0
+            .iter()
+            .map(|entry| u64::from_le_bytes(*entry));
+        // The checkpoint certifies earlier entries; do not revalidate them.
+        // nth checks that its final complete entry exists and agrees with the
+        // endpoint, leaving the iterator at the suffix. With no checkpoint,
+        // consume nothing: the first entry belongs to the first scanned record.
+        if self.trusted_records != 0
+            && index_ends.nth(self.trusted_records as usize - 1) != Some(start_position)
+        {
             return Err(Error::TrustedIndexUnavailable);
         }
 
@@ -170,6 +294,8 @@ impl IndexedLogValidator {
             .seek(SeekFrom::Start(start_position))
             .await
             .map_err(Error::LogIo)?;
+        // Scan only the suffix within the observed file extent. This bounds input,
+        // not concurrent modification; the owner must still exclude other writers.
         let source = (&mut self.log).take(self.log_length - start_position);
         let mut tail_error = scan_records(
             source,
@@ -180,25 +306,10 @@ impl IndexedLogValidator {
         )
         .await?;
         let record_count = self.trusted_records + self.ends.len() as u64;
-        let valid_length = self.ends.last().copied().unwrap_or(start_position);
-        if tail_error.is_none() && valid_length < self.log_length {
-            if record_count == RECORDS_PER_FILE {
-                tail_error = Some(LogTailError::ExtraData);
-            } else {
-                return Err(Error::FilesChanged);
-            }
-        }
-        let matching_suffix = self
-            .ends
-            .iter()
-            .zip(
-                index_bytes[trusted_bytes..]
-                    .as_chunks::<INDEX_ENTRY_LEN>()
-                    .0,
-            )
-            .take_while(|(expected, entry)| **expected == u64::from_le_bytes(**entry))
-            .count();
+        // Build one accepted endpoint for both the extent check and the report.
+        // Read-ahead can advance the handle beyond this logical record boundary.
         let end = if let Some(&position) = self.ends.last() {
+            // A new accepted record proves count > 0 and a representable sequence.
             let sequence =
                 self.file_id.first_record_id().sequence_number().get() + (record_count - 1);
             Some(RecordEndLocation::new(
@@ -206,8 +317,35 @@ impl IndexedLogValidator {
                 position,
             ))
         } else {
+            // No new accepted records: preserve the checkpoint, including None.
             self.start
         };
+        let valid_length = end.map_or(0, |end| end.position());
+        // The scanner also returns no tail error when it reaches the record cap,
+        // without requiring EOF. Compare the logical accepted end with the known
+        // file extent: even one extra byte after a full file is an invalid tail.
+        if tail_error.is_none() && valid_length < self.log_length {
+            if record_count == RECORDS_PER_FILE {
+                tail_error = Some(LogTailError::ExtraData);
+            } else {
+                // Below the record cap, a clean scan must reach the observed EOF.
+                // An earlier clean EOF is a file change, not truncation authority.
+                return Err(Error::FilesChanged);
+            }
+        }
+        // Preserve only the consecutive matching suffix entries after the trusted
+        // prefix. Stop at the first mismatch or missing complete entry, even if
+        // later entries match. The report also checks total byte length, catching
+        // extra entries and partial trailing entries omitted by this iterator.
+        let matching_suffix = self
+            .ends
+            .iter()
+            .copied()
+            .zip(index_ends)
+            .take_while(|(expected, stored)| expected == stored)
+            .count();
+        // Recheck lengths before publishing findings. This detects size changes,
+        // not same-length overwrites, and does not replace exclusive write ownership.
         self.check_lengths().await?;
         let report = LogValidationReport {
             file_id: self.file_id,
@@ -218,8 +356,13 @@ impl IndexedLogValidator {
             matching_index_entries: self.trusted_records + matching_suffix as u64,
             tail_error,
         };
+        // These independent flags describe repair needs, not durability. The index
+        // must match every accepted record and have exactly the corresponding byte
+        // length; the log must have no invalid tail. Handover supplies synchronization.
         self.index_ready = !report.needs_index_repair();
         self.log_ready = report.tail_error().is_none();
+        // Publish complete original findings before enabling follow-up operations.
+        // No await separates publication, restoring usability and returning the borrow.
         self.report = Some(report);
         self.usable = true;
         Ok(self.report.as_ref().unwrap())
@@ -367,9 +510,35 @@ impl IndexedLogValidator {
     }
 }
 
-// RecordReader yields the valid prefix before reporting corrupt input. Apply
-// sequence/file policy to each record before the next wait can report a later
-// encoding error, preserving the earliest invalid boundary in one forward scan.
+/// Scans the untrusted suffix, collecting ends of consecutive accepted records.
+///
+/// The caller positions and limits `source` to the observed untrusted file suffix.
+/// `file_id` supplies the required stream and first assigned sequence number.
+/// `trusted_records` counts the caller-certified prefix within this file (at most
+/// `RECORDS_PER_FILE`), and `start_position` is its absolute exclusive byte end.
+/// With no trusted prefix, both are zero. `ends` starts empty and receives only
+/// newly accepted absolute exclusive ends; trusted records are not inserted.
+///
+/// # Outcomes and caller responsibilities
+///
+/// - `Ok(None)` means clean source EOF OR the total accepted count reached
+///   `RECORDS_PER_FILE`. It does not prove EOF or absence of trailing file bytes.
+/// - `Ok(Some(error))` reports the first content violation. `ends` retains every
+///   preceding accepted record, excluding the offending record and all later data.
+/// - `Err(error)` is an operational failure, not permission to truncate. Partial
+///   offsets may remain in `ends`, but do not establish a completed validation.
+///
+/// The caller knows the physical file length and must compare it with the last
+/// accepted end (or `start_position` if none were added). Bytes beyond a full
+/// 100,000-record prefix become `LogTailError::ExtraData` in `validate`, including
+/// partial headers or arbitrary bytes. No EOF probe is needed here after the cap.
+/// A clean EOF before the observed extent of a partial file is instead an external
+/// file-change error. Reader read-ahead can move the source cursor past the accepted
+/// end; the collected offsets, not that cursor, define the recovery boundary.
+///
+/// RecordReader yields the valid prefix before reporting corrupt input. Apply
+/// sequence/file policy to each record before the next wait can report a later
+/// encoding error, preserving the earliest invalid boundary in one forward scan.
 async fn scan_records<R: AsyncRead + Unpin>(
     source: R,
     file_id: LogFileId,
@@ -379,22 +548,44 @@ async fn scan_records<R: AsyncRead + Unpin>(
 ) -> Result<Option<LogTailError>, Error> {
     let mut reader = RecordReader::new(source);
     loop {
+        // A full prefix is sufficient, including one supplied entirely as trusted.
+        // The caller checks for trailing bytes using the observed file length.
         if trusted_records + ends.len() as u64 == RECORDS_PER_FILE {
             return Ok(None);
         }
+        // A content error identifies a repairable tail after all previously
+        // yielded records. An I/O/reader-state error cannot certify that boundary,
+        // even if we have collected some offsets, so it fails validation itself.
+        // Keep this match exhaustive: do not replace either error group with a
+        // catch-all. Adding a RecordReadError variant must fail compilation until
+        // its recovery policy is explicitly chosen. A catch-all could silently
+        // classify a new operational failure as corrupt content, allowing valid
+        // file data to be truncated during subsequent repair.
         match reader.wait_to_read().await {
             Ok(false) => return Ok(None),
             Ok(true) => {}
             Err(error @ (RecordReadError::Io(_) | RecordReadError::ReaderFailed)) => {
                 return Err(Error::Read(error));
             }
-            Err(error) => return Ok(Some(LogTailError::Record(error))),
+            Err(
+                error @ (RecordReadError::TruncatedHeader { .. }
+                | RecordReadError::InvalidLength { .. }
+                | RecordReadError::InvalidStreamId(_)
+                | RecordReadError::TruncatedRecord { .. }
+                | RecordReadError::CrcMismatch { .. }),
+            ) => return Ok(Some(LogTailError::Record(error))),
         }
         while let Some(record) = reader.try_read_next().map_err(Error::Read)? {
             let count = trusted_records + ends.len() as u64;
+            // `count` excludes this just-yielded record. Once the preceding
+            // iteration accepted the last assigned record, do not accept another.
             if count == RECORDS_PER_FILE {
                 return Ok(None);
             }
+            // The accepted count is this record's zero-based position in the
+            // file. Derive its sequence from that count rather than maintaining
+            // another cursor. Checked addition reports exhaustion as extra data;
+            // advancing a local RecordId with next() would panic on overflow.
             let Some(sequence) = file_id
                 .first_record_id()
                 .sequence_number()
@@ -404,12 +595,19 @@ async fn scan_records<R: AsyncRead + Unpin>(
                 return Ok(Some(LogTailError::ExtraData));
             };
             let expected = RecordId::new(file_id.stream_id(), SequenceNumber::new(sequence));
+            // RecordReader proves encoding/CRC and the stream-ID domain. This
+            // check adds this file's stream assignment and exact sequence order.
+            // A mismatch leaves the accepted boundary before this record.
             if record.id() != expected {
                 return Ok(Some(LogTailError::UnexpectedRecordId {
                     expected,
                     actual: record.id(),
                 }));
             }
+            // Accept only after every check passes. The first new record starts
+            // at the trusted prefix's end; later ones start at the preceding end.
+            // length() includes header, payload and CRC. Saving the exclusive end
+            // also advances the accepted count used for the next expected ID.
             ends.push(ends.last().copied().unwrap_or(start_position) + u64::from(record.length()));
         }
     }
@@ -603,36 +801,181 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supplied_boundary_skips_trusted_records_and_repairs_only_its_index_suffix() {
+    async fn a_single_checkpointed_record_leaves_the_first_suffix_entry_for_comparison() {
+        let file_id = LogFileId::from_record_id(id(42, 100_000));
+        let log = encoded(42, 100_000, &[0, 3, 1]).await;
+        let start = RecordEndLocation::new(id(42, 100_000), 16);
+        let mut wrong = INDEX;
+        wrong[8] = 34; // First suffix entry is wrong; the following entry still matches.
+        for (index, matching) in [
+            (INDEX.as_slice(), 3),
+            (&INDEX[..8], 1),
+            (wrong.as_slice(), 1),
+        ] {
+            let (_directory, provider) = pair(file_id, &log, Some(index)).await;
+            let mut validator = IndexedLogValidator::open(&provider, file_id, Some(start))
+                .await
+                .unwrap();
+            let report = validator.validate().await.unwrap();
+            assert_eq!(report.record_count(), 3);
+            assert_eq!(report.matching_index_entries(), matching);
+            assert_eq!(report.needs_index_repair(), matching != 3);
+            assert_eq!(
+                report.end(),
+                Some(RecordEndLocation::new(id(42, 100_002), 52))
+            );
+            assert!(report.tail_error().is_none());
+            validator.repair_index().await.unwrap();
+            assert_eq!(
+                tokio::fs::read(provider.index_file_path(file_id))
+                    .await
+                    .unwrap(),
+                INDEX
+            );
+            assert_eq!(
+                tokio::fs::read(provider.log_file_path(file_id))
+                    .await
+                    .unwrap(),
+                log
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_cannot_claim_a_record_in_an_empty_log() {
+        for first_sequence in [0, 100_000] {
+            let record_id = id(7, first_sequence);
+            let file_id = LogFileId::from_record_id(record_id);
+            for position in [0, 16] {
+                // Even an index entry agreeing with the endpoint cannot certify a
+                // record in a zero-byte log. Neither file may be repaired on this claim.
+                let index = u64::to_le_bytes(position);
+                let (_directory, provider) = pair(file_id, &[], Some(&index)).await;
+                let mut validator = IndexedLogValidator::open(
+                    &provider,
+                    file_id,
+                    Some(RecordEndLocation::new(record_id, position)),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    validator.validate().await,
+                    Err(Error::InvalidStart(_))
+                ));
+                assert!(validator.report().is_none());
+                assert!(matches!(
+                    validator.repair_index().await,
+                    Err(Error::Unusable)
+                ));
+                assert!(matches!(
+                    validator.truncate_invalid_tail().await,
+                    Err(Error::Unusable)
+                ));
+                assert!(matches!(
+                    validator.into_writer().await,
+                    Err(Error::Unusable)
+                ));
+                assert!(
+                    tokio::fs::read(provider.log_file_path(file_id))
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    tokio::fs::read(provider.index_file_path(file_id))
+                        .await
+                        .unwrap(),
+                    index
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supplied_boundary_trusts_both_prefixes_and_repairs_only_the_index_suffix() {
         let file_id = LogFileId::from_record_id(id(7, 0));
         let mut log = encoded(7, 0, &[0, 3, 1]).await;
-        // Deliberately bad CRC in the supplied trusted prefix: this proves the
-        // caller's boundary is honored, not recomputed by rescanning old records.
+        // Deliberately poison certified bytes to prove that recovery honors the
+        // supplied boundary. Real checkpoint owners must certify correct records
+        // AND indexes; this test does not claim that these are valid checkpoints.
         log[12] ^= 1;
-        let (_directory, provider) = pair(file_id, &log, Some(&INDEX[..16])).await;
         let start = RecordEndLocation::new(id(7, 1), 35);
-        let mut validator = IndexedLogValidator::open(&provider, file_id, Some(start))
-            .await
-            .unwrap();
-        let report = validator.validate().await.unwrap();
-        assert_eq!(report.record_count(), 3);
-        assert_eq!(report.matching_index_entries(), 2);
-        assert_eq!(report.end(), Some(RecordEndLocation::new(id(7, 2), 52)));
-        assert!(report.tail_error().is_none());
-        assert_eq!(validator.ends, [52]);
-        validator.repair_index().await.unwrap();
-        assert_eq!(
-            tokio::fs::read(provider.index_file_path(file_id))
+        for first_end in [0u64, 16, 35, 36, u64::MAX] {
+            let mut expected_index = INDEX;
+            expected_index[..8].copy_from_slice(&first_end.to_le_bytes());
+            // Keep the checkpoint's final entry intact. A complete, partial or
+            // missing first suffix entry must be compared at the correct position.
+            for suffix_bytes in 0..=8 {
+                let (_directory, provider) =
+                    pair(file_id, &log, Some(&expected_index[..16 + suffix_bytes])).await;
+                let mut validator = IndexedLogValidator::open(&provider, file_id, Some(start))
+                    .await
+                    .unwrap();
+                let report = validator.validate().await.unwrap();
+                assert_eq!(report.record_count(), 3);
+                assert_eq!(
+                    report.matching_index_entries(),
+                    if suffix_bytes == 8 { 3 } else { 2 }
+                );
+                assert_eq!(report.needs_index_repair(), suffix_bytes != 8);
+                assert_eq!(report.end(), Some(RecordEndLocation::new(id(7, 2), 52)));
+                assert!(report.tail_error().is_none());
+                validator.repair_index().await.unwrap();
+                assert_eq!(
+                    tokio::fs::read(provider.index_file_path(file_id))
+                        .await
+                        .unwrap(),
+                    expected_index
+                );
+                assert_eq!(
+                    tokio::fs::read(provider.log_file_path(file_id))
+                        .await
+                        .unwrap(),
+                    log
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_accepted_suffix_preserves_the_checkpoint_endpoint() {
+        let file_id = LogFileId::from_record_id(id(7, 0));
+        let start = RecordEndLocation::new(id(7, 1), 35);
+        let mut corrupt_log = encoded(7, 0, &[0, 3, 1]).await;
+        corrupt_log[51] ^= 1;
+        for log in [&corrupt_log[..35], corrupt_log.as_slice()] {
+            let (_directory, provider) = pair(file_id, log, Some(&INDEX)).await;
+            let mut validator = IndexedLogValidator::open(&provider, file_id, Some(start))
                 .await
-                .unwrap(),
-            INDEX
-        );
-        assert_eq!(
-            tokio::fs::read(provider.log_file_path(file_id))
-                .await
-                .unwrap(),
-            log
-        );
+                .unwrap();
+            let report = validator.validate().await.unwrap();
+            assert_eq!(report.end(), Some(start));
+            assert_eq!(report.record_count(), 2);
+            assert_eq!(report.valid_log_length(), 35);
+            assert_eq!(report.matching_index_entries(), 2);
+            assert!(report.needs_index_repair());
+            if log.len() == 35 {
+                assert!(report.tail_error().is_none());
+            } else {
+                assert!(matches!(
+                    report.tail_error(),
+                    Some(LogTailError::Record(RecordReadError::CrcMismatch { .. }))
+                ));
+            }
+            validator.repair_index().await.unwrap();
+            assert_eq!(
+                tokio::fs::read(provider.index_file_path(file_id))
+                    .await
+                    .unwrap(),
+                INDEX[..16]
+            );
+            assert_eq!(
+                tokio::fs::read(provider.log_file_path(file_id))
+                    .await
+                    .unwrap(),
+                log
+            );
+        }
     }
 
     #[tokio::test]
@@ -672,12 +1015,13 @@ mod tests {
                 Err(Error::Unusable)
             ));
         }
-        for index in [
+        let mut indexes = vec![
             None,
-            Some(INDEX[..15].to_vec()),
             Some([16, 0, 0, 0, 0, 0, 0, 0, 34, 0, 0, 0, 0, 0, 0, 0].to_vec()),
             Some(vec![255; 16]),
-        ] {
+        ];
+        indexes.extend((0..16).map(|length| Some(INDEX[..length].to_vec())));
+        for index in indexes {
             let (_directory, provider) = pair(file_id, &log, index.as_deref()).await;
             let mut validator = IndexedLogValidator::open(
                 &provider,
@@ -813,6 +1157,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_last_uncheckpointed_record_determines_fullness_and_the_tail_boundary() {
+        let file_id = LogFileId::from_record_id(id(9, 0));
+        let prefix = encoded(9, 0, &vec![0; 99_999]).await;
+        let checkpoint = RecordEndLocation::new(id(9, 99_998), 1_599_984);
+        // Independently encode the expected index of these sixteen-byte records.
+        let index: Vec<u8> = (1..=99_999u64)
+            .flat_map(|n| (n * 16).to_le_bytes())
+            .collect();
+        let final_record = encoded(9, 99_999, &[0]).await;
+        let extra_record = encoded(9, 100_000, &[0]).await;
+        for (corrupt_final, append_extra) in [(false, false), (true, false), (false, true)] {
+            let mut log = prefix.clone();
+            log.extend_from_slice(&final_record);
+            if corrupt_final {
+                *log.last_mut().unwrap() ^= 1;
+            }
+            if append_extra {
+                // A fully encoded next-file record must still be rejected as extra
+                // data, not accepted or classified as a sequence error in this file.
+                log.extend_from_slice(&extra_record);
+            }
+            let (_directory, provider) = pair(file_id, &log, Some(&index)).await;
+            let mut validator = IndexedLogValidator::open(&provider, file_id, Some(checkpoint))
+                .await
+                .unwrap();
+            let expected_end = if corrupt_final {
+                checkpoint
+            } else {
+                RecordEndLocation::new(id(9, 99_999), 1_600_000)
+            };
+            let report = validator.validate().await.unwrap();
+            assert_eq!(
+                report.record_count(),
+                if corrupt_final { 99_999 } else { 100_000 }
+            );
+            assert_eq!(report.is_full(), !corrupt_final);
+            assert_eq!(report.end(), Some(expected_end));
+            assert_eq!(report.matching_index_entries(), 99_999);
+            assert_eq!(report.needs_index_repair(), !corrupt_final);
+            if corrupt_final {
+                assert!(matches!(
+                    report.tail_error(),
+                    Some(LogTailError::Record(RecordReadError::CrcMismatch { .. }))
+                ));
+            } else if append_extra {
+                assert!(matches!(report.tail_error(), Some(LogTailError::ExtraData)));
+            } else {
+                assert!(report.tail_error().is_none());
+            }
+            validator.repair_index().await.unwrap();
+            validator.truncate_invalid_tail().await.unwrap();
+            let mut expected_index = index.clone();
+            if !corrupt_final {
+                expected_index.extend_from_slice(&1_600_000u64.to_le_bytes());
+            }
+            assert_eq!(
+                tokio::fs::read(provider.index_file_path(file_id))
+                    .await
+                    .unwrap(),
+                expected_index
+            );
+            assert_eq!(
+                tokio::fs::read(provider.log_file_path(file_id))
+                    .await
+                    .unwrap(),
+                log[..expected_end.position() as usize]
+            );
+            if corrupt_final {
+                assert_eq!(
+                    validator.into_writer().await.unwrap().synced_end(),
+                    Some(checkpoint)
+                );
+            } else {
+                assert_eq!(
+                    validator.into_completed().await.unwrap().end(),
+                    expected_end
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn index_bytes_beyond_the_read_cap_still_require_repair() {
+        let file_id = LogFileId::from_record_id(id(9, 0));
+        let log = encoded(9, 0, &vec![0; 100_000]).await;
+        let index: Vec<u8> = (1..=100_000u64)
+            .flat_map(|n| (n * 16).to_le_bytes())
+            .collect();
+        let end = RecordEndLocation::new(id(9, 99_999), 1_600_000);
+        // Exercise both an entirely scanned file and an entirely certified one.
+        // In each, only the physical index length reveals these unread extra bytes.
+        for start in [None, Some(end)] {
+            for extra_bytes in [1, 7, 8, 9] {
+                let mut oversized_index = index.clone();
+                oversized_index.resize(800_000 + extra_bytes, 0xff);
+                let (_directory, provider) = pair(file_id, &log, Some(&oversized_index)).await;
+                let mut validator = IndexedLogValidator::open(&provider, file_id, start)
+                    .await
+                    .unwrap();
+                let report = validator.validate().await.unwrap();
+                assert!(report.is_full());
+                assert_eq!(report.end(), Some(end));
+                assert_eq!(report.index_length(), oversized_index.len() as u64);
+                assert_eq!(report.matching_index_entries(), 100_000);
+                assert!(report.needs_index_repair());
+                assert!(report.tail_error().is_none());
+                assert_eq!(
+                    tokio::fs::read(provider.index_file_path(file_id))
+                        .await
+                        .unwrap(),
+                    oversized_index
+                );
+                validator.repair_index().await.unwrap();
+                assert_eq!(
+                    tokio::fs::read(provider.index_file_path(file_id))
+                        .await
+                        .unwrap(),
+                    index
+                );
+                assert_eq!(
+                    tokio::fs::read(provider.log_file_path(file_id))
+                        .await
+                        .unwrap(),
+                    log
+                );
+                assert_eq!(validator.into_completed().await.unwrap().end(), end);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn full_files_repair_and_handover_as_completion_without_an_append_writer() {
         let file_id = LogFileId::from_record_id(id(9, 0));
         let mut log = encoded(9, 0, &vec![0; 100_000]).await;
@@ -908,6 +1383,109 @@ mod tests {
         assert!(matches!(
             validator.into_completed().await,
             Err(Error::NotFull)
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_validation_returns_original_findings_before_and_after_repairs() {
+        let file_id = LogFileId::from_record_id(id(7, 0));
+        let mut log = encoded(7, 0, &[0, 3, 1]).await;
+        log[51] ^= 1;
+        let (_directory, provider) = pair(file_id, &log, Some(&INDEX)).await;
+        let mut validator = IndexedLogValidator::open(&provider, file_id, None)
+            .await
+            .unwrap();
+        validator.validate().await.unwrap();
+        // Contents are unchanged. This handle still permits repair but would
+        // reject a log read, proving subsequent validate calls use the cached report.
+        validator.log = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(provider.log_file_path(file_id))
+            .await
+            .unwrap();
+        for phase in 0..3 {
+            let report = validator.validate().await.unwrap();
+            assert_eq!(report.file_id(), file_id);
+            assert_eq!(report.end(), Some(RecordEndLocation::new(id(7, 1), 35)));
+            assert_eq!(report.record_count(), 2);
+            assert_eq!(report.log_length(), 52);
+            assert_eq!(report.index_length(), 24);
+            assert_eq!(report.matching_index_entries(), 2);
+            assert!(report.needs_index_repair());
+            assert!(matches!(
+                report.tail_error(),
+                Some(LogTailError::Record(RecordReadError::CrcMismatch { .. }))
+            ));
+            match phase {
+                0 => validator.repair_index().await.unwrap(),
+                1 => validator.truncate_invalid_tail().await.unwrap(),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            tokio::fs::read(provider.log_file_path(file_id))
+                .await
+                .unwrap(),
+            log[..35]
+        );
+        assert_eq!(
+            tokio::fs::read(provider.index_file_path(file_id))
+                .await
+                .unwrap(),
+            INDEX[..16]
+        );
+        // The old report still describes corruption, but completed repairs permit handover.
+        assert_eq!(
+            validator.into_writer().await.unwrap().synced_end(),
+            Some(RecordEndLocation::new(id(7, 1), 35))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_log_truncation_after_successful_index_repair_prevents_reuse() {
+        let file_id = LogFileId::from_record_id(id(7, 0));
+        let mut log = encoded(7, 0, &[0, 3, 1]).await;
+        log[51] ^= 1;
+        let (_directory, provider) = pair(file_id, &log, Some(&INDEX)).await;
+        let mut validator = IndexedLogValidator::open(&provider, file_id, None)
+            .await
+            .unwrap();
+        validator.validate().await.unwrap();
+        // Replace only this owner's log handle with a read-only one. Index repair
+        // can complete, then set_len must fail without changing the log's contents.
+        validator.log = File::open(provider.log_file_path(file_id)).await.unwrap();
+        assert!(matches!(
+            validator.truncate_invalid_tail().await,
+            Err(Error::LogIo(_))
+        ));
+        assert_eq!(
+            tokio::fs::read(provider.index_file_path(file_id))
+                .await
+                .unwrap(),
+            INDEX[..16]
+        );
+        assert_eq!(
+            tokio::fs::read(provider.log_file_path(file_id))
+                .await
+                .unwrap(),
+            log
+        );
+        let report = validator.report().unwrap();
+        assert_eq!(report.end(), Some(RecordEndLocation::new(id(7, 1), 35)));
+        assert_eq!(report.index_length(), 24);
+        assert!(report.tail_error().is_some());
+        assert!(matches!(validator.validate().await, Err(Error::Unusable)));
+        assert!(matches!(
+            validator.repair_index().await,
+            Err(Error::Unusable)
+        ));
+        assert!(matches!(
+            validator.truncate_invalid_tail().await,
+            Err(Error::Unusable)
+        ));
+        assert!(matches!(
+            validator.into_writer().await,
+            Err(Error::Unusable)
         ));
     }
 

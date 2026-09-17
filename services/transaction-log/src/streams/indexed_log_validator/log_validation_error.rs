@@ -13,7 +13,7 @@ pub enum LogValidationError {
     /// The supplied trusted endpoint cannot describe this file's prefix.
     #[error("invalid validation start: {0}")]
     InvalidStart(&'static str),
-    /// Existing index bytes do not support the supplied trusted prefix.
+    /// The trusted index prefix is missing or its final entry differs from the endpoint.
     #[error(
         "trusted index prefix is unavailable or inconsistent; supply an earlier trusted boundary"
     )]

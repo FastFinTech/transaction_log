@@ -11,9 +11,12 @@ use super::RecordEndLocation;
 /// `checkpoint.end().log_file_id()` to inspect the boundary. Endpoint behavior
 /// belongs to that type rather than duplicate checkpoint accessors.
 ///
-/// A checkpoint published for recovery must describe a contiguous, validated and
-/// durable prefix on this replica. This model stores that boundary; constructing
-/// it does not validate records, inspect files, synchronize data or persist anything.
+/// A checkpoint published for recovery certifies a contiguous prefix of validated
+/// records AND their correct index entries on this replica. Its owner must not
+/// advance it until both are established, and must synchronize the covered log
+/// data, then its index data, before durably publishing the checkpoint. Recovery
+/// trusts the certified prefix instead of revalidating it. This model only stores
+/// the boundary: construction performs no validation, synchronization or I/O.
 /// Those guarantees belong to the future checkpoint/recovery owner.
 ///
 /// Use `Option<StreamCheckpoint>` when no checkpoint exists. Sequence zero is a

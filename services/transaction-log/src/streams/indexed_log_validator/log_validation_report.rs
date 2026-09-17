@@ -25,7 +25,7 @@ pub struct LogValidationReport {
     /// Index byte length observed before scanning, including any partial entry.
     #[getset(get_copy = "pub")]
     pub(super) index_length: u64,
-    /// Consecutive correct index entries, including the trusted prefix.
+    /// Checkpoint-certified entries plus consecutive matching scanned suffix entries.
     #[getset(get_copy = "pub")]
     pub(super) matching_index_entries: u64,
     /// First invalid record or extra-file suffix, if one was found.

@@ -57,6 +57,9 @@ The pair writer coordinates normal output, and the validator applies the same
 ordering during repair and handover.
 
 An owner excludes concurrent writes and supplies trusted prefixes explicitly.
+Checkpoints certify both records and their exact index entries; the owner must
+establish both, synchronize log then index, and only then persist the checkpoint.
+Recovery checks the supplied boundary and trusts the earlier certified contents.
 Failure, panic or cancellation during I/O cannot authorize reuse or publication
 of a partly processed pair. Component READMEs describe the exact failure states,
 recovery preconditions and handover guarantees. Scheduling, checkpoint publication
