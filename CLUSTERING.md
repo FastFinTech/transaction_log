@@ -76,6 +76,20 @@ the definition but intentionally excluded from shared agreement. Handshake
 serialization, cluster-ID verification and active duplicate-ID detection remain
 unimplemented.
 
+## Message transport
+
+The reusable [message I/O crate](lib/message-io/README.md) implements async
+`read_message::<T>()` and `write_message(&value)` extension methods for Tokio byte
+sources/destinations and Serde types. Frames carry a four-byte little-endian body
+length and one Postcard value, with a fixed 1 MiB encoded body limit. Its
+specification owns framing, EOF, size, completion and cancellation contracts.
+
+Application-version agreement occurs before the clustering handshake and remains
+outside this codec. Cluster/gossip/handshake message schemas, validated configuration
+deserialization and connection integration remain planned. No type identifier or
+version negotiation is automatically added by generic message I/O. Bulk record
+replication has not been assigned this encoding.
+
 ## Startup and loss of replicas
 
 During clustered startup, accept only application cluster connections. Do not

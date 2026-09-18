@@ -214,6 +214,7 @@ failure handling, comparison rules and integration commands.
 - [x] Synchronous record builder and compile-time writer modes.
 - [x] Explicit async buffer output, destination flushing and optional file data synchronization.
 - [x] Single-threaded object-pool utility with unused-object reclamation.
+- [x] Reusable async Serde message I/O with bounded, length-prefixed Postcard frames; application messages and connection integration remain pending.
 - [x] Storage provider with owned startup configuration, deterministic log/index/checkpoint paths and stream-directory initialization.
 - [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
 - [x] Typed record start/end locations and a range model with lazy enumeration of bounded, postfix, whole-file and prefix reads.
@@ -245,6 +246,7 @@ remain to be implemented.
 | [`services/transaction-log`](services/transaction-log) | Service scaffold, storage models/paths, file acquisition, indexed appends and pair validation/repair. |
 | [`services/transaction-log-exports`](services/transaction-log-exports) | Public record types, reader, writer and benchmarks. |
 | [`lib/object-pool`](lib/object-pool) | Reusable single-threaded object pool. |
+| [`lib/message-io`](lib/message-io) | Async extension traits for bounded length-prefixed Postcard messages. |
 | [`scripts`](scripts/README.md) | Benchmark execution, reporting and comparison tooling. |
 | [`benchmarks`](benchmarks/README.md) | Selected structured measurements published with the repository. |
 
@@ -283,6 +285,7 @@ design decisions, safety invariants and optimization evidence.
 | [Storage](services/transaction-log/src/storage/README.md) | File identities, startup configuration, path layout, directory initialization and storage boundaries. |
 | [Stream operations](services/transaction-log/src/streams/README.md) | Indexed appends, validation, repair, partial/full handover and failure handling. |
 | [Object pool](lib/object-pool/README.md) | Ownership, reclamation policy and usage. |
+| [Message I/O](lib/message-io/README.md) | Framing, Serde extension APIs, size limits, ownership and partial-I/O/cancellation contracts. |
 | [Benchmark specification](services/transaction-log-exports/benches/README.md) | Workloads, timing contracts and measurement history. |
 
 Several module READMEs are included directly in Rustdoc and their Rust examples

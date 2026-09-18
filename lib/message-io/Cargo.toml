@@ -1,0 +1,11 @@
+[package]
+name = "message-io"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }

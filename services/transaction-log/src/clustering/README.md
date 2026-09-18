@@ -39,6 +39,11 @@ remain to be specified before implementing handshakes. Runtime owners must enfor
 full-cluster startup readiness and the master's replica-loss exit policy; the
 configuration module does no I/O or live-state management.
 
+The reusable [message I/O crate](../../../../lib/message-io/README.md) supplies
+bounded length-prefixed Postcard serialization through async read/write extension
+traits. Application message schemas and service integration remain planned;
+application-version agreement belongs before clustering rather than in the codec.
+
 ## Verification
 
 Follow the [configuration validation guidance](configuration/README.md#validation-and-future-integration)
