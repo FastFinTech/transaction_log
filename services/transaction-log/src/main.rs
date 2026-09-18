@@ -1,3 +1,4 @@
+pub mod clustering;
 pub mod storage;
 pub mod streams;
 

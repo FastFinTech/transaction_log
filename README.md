@@ -229,6 +229,7 @@ failure handling, comparison rules and integration commands.
 - [ ] Multi-file lifecycle coordination and stream-specific index queries.
 - [ ] Durable flush scheduling, checkpoint persistence and startup-wide recovery orchestration.
 - [ ] Replication and cluster coordination.
+- [x] In-memory singleton/clustered configuration with validated shared cluster definitions, local identity checks and order-independent definition agreement; startup integration and persisted mode enforcement remain pending.
 - [ ] Storage, indexing, replication, recovery and latency benchmarks.
 - [ ] Dedicated performance CI workers and durable benchmark-history publication.
 
@@ -273,6 +274,9 @@ design decisions, safety invariants and optimization evidence.
 
 | Documentation | Scope |
 | --- | --- |
+| [Clustering and read replicas](CLUSTERING.md) | Planned permanent deployment modes, fixed membership/master, startup gating, replica-loss exit policy and Kubernetes deployment requirements; open replication/read contracts. |
+| [Clustering](services/transaction-log/src/clustering/README.md) | Module boundaries and planned handshake/runtime responsibilities. |
+| [Clustering configuration](services/transaction-log/src/clustering/configuration/README.md) | Implemented shared definitions, local identity, members, parsing/validation and order-independent agreement with typed mismatches; planned startup and endpoint boundaries. |
 | [Exports crate overview](services/transaction-log-exports/src/lib.rs) | Public types and API entry points. |
 | [Record specification](services/transaction-log-exports/src/record/README.md) | Wire format, ownership, validation and reader integration. |
 | [Writer specification](services/transaction-log-exports/src/record_writer/README.md) | Constructor modes, buffering, completion, cancellation and hot-path rationale. |
