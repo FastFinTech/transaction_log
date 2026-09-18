@@ -1,6 +1,6 @@
 use super::LogTailError;
-use crate::storage::{LogFileId, RECORDS_PER_FILE, RecordEndLocation};
 use crate::streams::index_writer::INDEX_ENTRY_LEN;
+use crate::streams::{LogFileId, RECORDS_PER_FILE, RecordEndLocation};
 use getset::{CopyGetters, Getters};
 
 /// Immutable findings from a completed validation pass, before any repair.

@@ -1,305 +1,199 @@
-# Clustering configuration
+# Validated clustering configuration
 
-`clustering::configuration` implements the in-memory deployment configuration and
-its validation. The [clustering overview](../README.md) describes module boundaries,
-and the [root clustering design](../../../../../CLUSTERING.md) describes
-the planned lifecycle. Networking, initialization metadata, recovery, replication
-and process-exit policy are not implemented here. The executable does not yet
-consume this configuration.
+`clustering::configuration` owns deployment values and established configuration,
+distinct from the
+[raw inputs](../../configuration/README.md). Startup converts raw inputs
+with `ClusteringConfiguration::try_from` before reporting the application version.
+The executable then exits. Reading stored configuration, comparing deployment
+settings, assigning UUIDs and initializing storage are not wired into startup.
+The [clustering overview](../README.md) and [lifecycle design](../../../../../CLUSTERING.md)
+own the planned runtime behavior; configuration does not enforce it.
 
-## Types and ownership
+## Module coverage and public contracts
 
-- `clustering_configuration.rs`: `ClusteringConfiguration` explicitly selects
-  `Singleton` or `Clustered(ClusterMembership)`.
-- `cluster_definition.rs`: shared master/replica definition, canonical replica
-  ordering, agreement checks and the authoritative `MINIMUM_REPLICA_COUNT` (two).
-- `cluster_definition_error.rs`: static shared-definition validation failures.
-- `cluster_definition_mismatch.rs`: typed differences between valid definitions.
-- `cluster_membership.rs`: local identity paired with a validated shared definition,
-  local membership validation and role lookup.
-- `clustering_configuration_error.rs`: local identity validation failures.
-- `member_id.rs` and `member_id_error.rs`: an owned, opaque member name and its
-  raw-name validation error.
-- `member_id_error_kind.rs`: typed reasons for name validation failures.
-- `hostname.rs`: parsing and immutable storage of a configured DNS hostname.
-- `hostname_error.rs` and `hostname_error_kind.rs`: original rejected hostname
-  input and typed validation reasons.
-- `member.rs`: a logical member identity paired with a configured hostname.
-- `mod.rs`: declarations, re-exports and this specification's Rustdoc inclusion.
+- `clustering_configuration.rs`: `Single` or `Cluster(ClusterMembership)`, composition
+  of validated values and conversion from raw fields, with same-file tests.
+- `established_clustering_configuration.rs`: deployment configuration paired with
+  its permanent UUID in either mode, derived Serde and same-file tests.
+- `clustering_configuration_error.rs`: one error type for mode, node name,
+  conditional fields and concrete hostname errors.
+- `node_name.rs`: the fixed `NodeName` slots and their parsing/tests.
+- `cluster_membership.rs`: local slot and shared domain, infallible construction,
+  derived Serde, role lookup and hostname formatting, with same-file tests.
+- `hostname.rs`, `hostname_error.rs`, `hostname_error_kind.rs`: DNS-name value,
+  parsing/tests, retained original input and typed validation reasons.
+- `mod.rs`: thin declarations, exports and this specification's Rustdoc inclusion.
 
-## Member identity and parsing
+## Fixed topology and conversion
 
-`MemberId` is an immutable value identifying a logical member within configured
-cluster membership. Its private name is exposed by the read-only `name()` getter.
-Equality and hashing use the stored name. Parsing a name establishes only its
-syntax; it does not prove membership, authenticate a peer or identify a cluster.
+Only `master`, `replica-1` and `replica-2` are valid node names. `NodeName::parse`
+trims surrounding whitespace, is case-sensitive and preserves rejected input in
+`InvalidNodeName`. The enum prevents invalid slots after parsing. There are no
+arbitrary member names, configurable replica count, hostname pairs or member lists.
 
-`MemberId::parse(String)` trims surrounding whitespace with `str::trim` and requires
-the result to contain 3–64 ASCII characters. Allowed characters are
-`A..Z`, `a..z`, `0..9`, hyphen (`-`) and underscore (`_`); the first and last
-characters must be letters or digits. For example, `replica-01` and `Replica_A`
-are valid. Interior whitespace, control characters, Unicode, dots, path separators
-and other punctuation are rejected. Repeated interior hyphens/underscores are valid.
+The local node name is permanent once its storage is initialized. Neither restart
+nor a changed `--cluster-my-node-name` may reassign that storage to a different
+slot. Future startup must compare configuration with persisted node identity and
+reject changes; static conversion alone cannot enforce this persisted-state rule.
+Persisted-state comparison and startup storage integration remain planned.
 
-The three-character minimum encourages meaningful names rather than single-letter
-identities. The 64-byte maximum bounds identity size while accommodating
-descriptive names.
-ASCII avoids visually ambiguous Unicode variants and makes byte and character
-lengths identical for valid names. Alphanumeric boundaries keep names readable;
-these are application identity rules, not a DNS-name contract. Names identify
-logical configured members, not socket addresses, cluster IDs or storage paths.
-Case is preserved and significant. The trimmed version is stored; there is no
-other normalization. Surrounding Unicode whitespace is trimmed as well, while
-Unicode within the resulting name is rejected. Membership comparisons use these
-trimmed identities, so `" master "` and `"master"` identify the same member.
-`"Master"` and `"master"` remain different identities. Configuration duplicate
-checks operate on parsed names, so differently padded inputs cannot create
-distinct replicas.
+Deployment mode is also permanent for initialized storage: `--cluster-mode` cannot
+switch that storage between single and cluster. Future startup must reject mode
+changes against persisted metadata; startup comparison remains planned.
 
-| Input | Result |
-| --- | --- |
-| `"  replica-01  "` | Stored name `"replica-01"`. |
-| `"Replica_A"` | Stored unchanged, including case. |
-| `"ab"` or whitespace only | `TooShort`. |
-| 65 ASCII letters, after trimming | `TooLong`. |
-| `"replica.01"` or `"replica 01"` | `InvalidCharacter`. |
-| `"-replica"` or `"replica_"` | `InvalidBoundary`. |
+`ClusterMembership` stores only `my_node_name: NodeName` and
+`cluster_domain: Hostname`. The shared configuration is just the domain; there is
+no separate definition object or cached hostname array. Borrowing getters expose
+these private fields. `is_master()` derives the role. `hostname(NodeName)` formats
+an owned `node.domain` string for any fixed slot, without DNS resolution or
+revalidating the stored domain. A root dot is preserved.
 
-`MemberId::MIN_NAME_LENGTH` and `MAX_NAME_LENGTH` are the authoritative limits.
-Validation checks minimum length, maximum length, allowed characters, then
-boundaries, returning the first failure. Empty or whitespace-only input therefore
-returns `TooShort`. `MemberIdError::name()` preserves the original untrimmed
-input, and `kind()` returns a `MemberIdErrorKind`. Invalid-character errors report
-the zero-based byte offset in the trimmed name, rather than in the original input.
-For non-ASCII UTF-8 this is the start of the first invalid character. For example,
-`"  ab c  "` retains that input in the error but reports byte offset 2.
-Length is measured in trimmed UTF-8 bytes before ASCII validation: a Unicode name
-can fail a length check before its characters are inspected.
+`ClusterMembership::new(NodeName, Hostname)` takes ownership of already validated
+field values without additional checks. There is no membership `TryFrom` or
+custom deserializer. Membership does not impose a separate cluster-domain length
+limit: a domain may satisfy the standalone hostname limit while a prefixed node
+hostname exceeds it. `hostname` formats a string without checking that result.
 
-Parsing takes ownership of the supplied `String`. It retains that allocation
-when no trimming is needed; successful parsing with surrounding whitespace copies
-the trimmed name into a new string. On failure the error owns the original input.
-There is no unchecked public constructor, setter or mutable name access, so
-consumers can rely on the established name validity without revalidation.
+Raw conversion accepts trimmed, lowercase `single` or `cluster`, with no aliases.
+Single mode forbids the raw cluster group, including a group of empty strings.
+Cluster requires the group. The raw parser already requires both `my_node_name`
+and `cluster_domain` whenever the group is activated. Conversion order is mode;
+group presence/absence; node parsing; domain parsing; membership construction.
+Errors preserve original mode/node input or wrap the concrete `HostnameError`.
 
-## Hostname parsing
+Shared agreement is ordinary `cluster_domain()` equality. Domain casing and
+surrounding whitespace normalize; a root dot remains significant because it
+changes resolver behavior. Local slots intentionally differ across machines, so
+handshakes must compare domains rather than whole memberships. No list
+sorting, duplicate checks or list-mismatch error machinery is needed. Runtime must
+still reject duplicate active slots and verify the expected peer at each derived
+hostname; different DNS names can point to the same process.
 
-`Hostname` is the configured network name, separate from `MemberId`, which remains
-only a logical member name. `Hostname::parse(String)` owns the input, trims with
-`str::trim`, validates it and stores lowercase ASCII. `name()` borrows that stored
-string. Private fields and read-only access preserve validity. Equality and
-hashing compare the stored form, so case and surrounding whitespace do not
-distinguish hostnames. This differs intentionally from case-sensitive member IDs.
+## Established configuration
 
-The hostname rules are:
+`EstablishedClusteringConfiguration` pairs two private, read-only fields:
+`cluster_id: uuid::Uuid` and `clustering_configuration: ClusteringConfiguration`.
+Both singleton and clustered deployments have a UUID. The deployment mode is
+represented only inside configuration; cluster configuration also contains the
+shared domain and this node's permanent slot. There is no duplicate mode or slot.
 
-- One or more dot-separated labels, each containing 1–63 ASCII bytes.
-- Labels contain only letters, digits and hyphens, with a letter or digit at
-  each end. Digits may begin labels. Single-label names such as `master` are valid.
-- At most 253 bytes excluding one optional final root dot. A name with that dot
-  can therefore contain 254 stored bytes. The constants `MAX_NAME_LENGTH` and
-  `MAX_LABEL_LENGTH` on `Hostname` are the authoritative limits.
-- Preserve the optional final dot. An explicitly absolute name such as
-  `master.db.` remains distinct from `master.db`, which can be subject to resolver
-  search rules. Do not strip the dot during connection setup.
-- Reject Unicode labels, underscores, wildcards, interior whitespace, URL syntax,
-  embedded ports and path separators. No IDNA conversion is performed; ASCII
-  `xn--` labels pass the same syntax checks without validating their IDNA content.
-- Reject inputs recognized as IP literals by `std::net::IpAddr`, including an
-  IPv4 literal with an optional final dot. This type is for configured DNS names.
+The type belongs to clustering because it represents established application
+state, independently of where it is persisted. `new` assembles an externally
+supplied UUID and validated configuration; it does not generate UUIDs, establish
+agreement, initialize storage or prove that establishment has happened. These
+lifecycle operations remain deferred. The planned master generates the cluster
+UUID during first establishment and shares it with both replicas; subsequent
+loads retain the UUID. It is not a user-supplied deployment setting. No particular
+UUID version is required by this value model.
 
-The label syntax follows the hostname rules in
-[RFC 1123 section 2.1](https://www.rfc-editor.org/rfc/rfc1123.html#section-2.1).
-The label and overall limits reflect the DNS encoding limits in
-[RFC 1035 section 2.3.4](https://www.rfc-editor.org/rfc/rfc1035.html#section-2.3.4):
-length bytes and the terminal root label count toward the 255-byte wire limit,
-giving a maximum of 253 text bytes without the final dot. This is an application
-hostname contract, not a parser for arbitrary DNS record names.
+Peers must agree on UUID and domain while occupying different local slots.
+Whole-value equality includes the slot, so it is not the cluster handshake's
+agreement check. Fresh storage has no established configuration; deciding whether
+it can join an initialized cluster belongs to establishment, not Serde or storage.
 
-| Input | Result |
-| --- | --- |
-| `"  MASTER.DB  "` | Stored `"master.db"`. |
-| `"master-0.db.svc.cluster.local"` | Stored unchanged. |
-| `"MASTER.DB."` | Stored `"master.db."`, retaining the root dot. |
-| Empty or whitespace only | `Empty`. |
-| `"master..db"` | `EmptyLabel { label_index: 1 }`. |
-| `"db.master_0"` | `InvalidCharacter { byte_index: 9 }`. |
-| `"db.-master"` | `InvalidBoundary { label_index: 1 }`. |
-| `"127.0.0.1"` or `"::1"` | `IpLiteral`. |
+Serde is derived with `deny_unknown_fields`. UUIDs are strings in human-readable
+formats using the `uuid` crate's representation; nested configuration uses its
+existing field parsers. Missing, duplicate and unknown struct fields are rejected.
+Singleton JSON is, for example:
 
-Validation returns the first failure: empty trimmed input, overall length, IP
-literal, then labels in input order. Each label is checked for emptiness, length,
-allowed characters and boundaries. `HostnameError::name()` owns the original
-untrimmed input and case; `kind()` reports the typed reason. Label indexes are
-zero-based and exclude the optional root dot. Character byte offsets refer to
-the trimmed input before lowercasing. No error reports an offset into normalized
-or original padded text instead.
+```json
+{"cluster_id":"12345678-9abc-def0-1234-56789abcdef0","clustering_configuration":"single"}
+```
 
-Parsing performs no DNS lookup or I/O and establishes neither existence nor
-reachability. It also does not authenticate a member. Rust's standard library has
-no validated hostname value type; `IpAddr` and `SocketAddr` describe numeric
-addresses, while `ToSocketAddrs` performs resolution. The small application value
-therefore stores configured hostname syntax and delegates IP-literal recognition
-to the standard parser. Future connection code owns resolution and retry policy.
-See [std::net](https://doc.rust-lang.org/std/net/index.html) and
-[ToSocketAddrs](https://doc.rust-lang.org/std/net/trait.ToSocketAddrs.html).
+Clustered JSON is:
 
-Parsing retains the supplied allocation when no trimming is needed and lowercases
-it in place. Trimming on success creates a new string. Failures retain the original
-input. These costs occur during configuration, not per record; no performance
-claim is made.
+```json
+{"cluster_id":"12345678-9abc-def0-1234-56789abcdef0","clustering_configuration":{"cluster":{"my_node_name":"master","cluster_domain":"cluster.example"}}}
+```
 
-Fixed-port endpoint wiring remains planned. No port number is selected here,
-and no connection discovery API is introduced.
+The [storage provider](../../storage/README.md#provider-metadata-operations) saves/restores this type
+directly using Serde in `clustering.json`, with no intermediate persistence model.
+Storage owns filesystem operations and I/O/serialization errors; clustering owns
+the type. Startup does not yet invoke those operations. Cloning configuration
+copies its domain string; these values are not per-record hot-path state.
+Same-file tests cover independent JSON fixtures in both modes and all slots,
+normalization, UUID/slot distinctions and malformed metadata.
 
-## Member composition
+## Hostname syntax, ownership and rationale
 
-`Member::new(id: MemberId, hostname: Hostname)` takes ownership of two validated
-values and returns `Member` infallibly. Its fields are private, with borrowing
-`id()` and `hostname()` getters and no mutable access. It performs no parsing,
-allocation, DNS lookup or I/O. Member identity and network location stay separate:
-changing a configured hostname does not change the logical member ID.
+### Serialization
 
-`Member` contains no role, port, cluster ID or runtime state. Role belongs to
-membership, while fixed ports and connection setup remain application concerns.
-Derived equality compares both ID and hostname, so two configuration values with
-the same ID but different hostnames are unequal as complete members. Membership
-validation must compare `member.id()` instead of whole members to prevent an
-address change from bypassing identity conflict checks. Cloning a member clones
-its owned identity and hostname strings.
+The configuration types implement format-independent Serde traits, including
+the established model described above. UUID assignment and storage read/write
+operations remain separate from these value types.
+JSON clustering configuration is `"single"` or
+`{"cluster":{"my_node_name":"master","cluster_domain":"cluster.example"}}`.
+`NodeName` and `Hostname` serialize as strings; deserialization calls their
+existing parsers, preserving trimming, case handling and syntax checks.
+`ClusteringConfiguration` and `ClusterMembership` derive Serde. Membership loading
+uses each field type's existing validation. Missing, duplicate and unknown
+membership fields are rejected through the derive and `deny_unknown_fields`.
+Derived node hostname lengths are not checked by this model. Serde loading validates
+static values only; it cannot enforce storage permanence or peer agreement.
 
-## Shared definition and local membership
+Serialization through owned string conversions clones the hostname value;
+these startup operations are not part of record processing.
 
-`ClusterDefinition` owns the permanent master `Member` and replica `Member`s.
-It contains no local identity, cluster ID or runtime state. Every machine should
-use the same shared definition plus its own local ID.
+### DNS validation
 
-`ClusterDefinition::validate(master: Member, replicas: Vec<Member>)` establishes:
+`Hostname::parse(String)` trims with `str::trim`, validates and stores lowercase
+ASCII. Private fields and a read-only `name()` getter preserve validity; equality
+and hashing compare stored text. It permits one optional trailing root dot and
+preserves it: `db.example.` is explicitly absolute, while `db.example` can be
+affected by resolver search rules. Multiple trailing dots are rejected.
 
-1. At least two replicas (excluding the master).
-2. No replica has the master's ID.
-3. No replica repeats an earlier replica ID.
-4. Hostnames are unique across the master and replicas.
+Names contain one or more nonempty labels, each 1–63 ASCII bytes, using letters,
+digits and hyphens with alphanumeric boundaries. Single-label names and labels
+starting with digits are allowed. The maximum is 253 bytes excluding the optional
+root dot (254 stored bytes including it). `MAX_NAME_LENGTH` and `MAX_LABEL_LENGTH`
+are authoritative. Reject Unicode, underscores, wildcards, interior whitespace,
+URLs, ports and paths. There is no IDNA conversion; ASCII `xn--` labels receive
+ordinary syntax checks rather than IDNA validation. IP literals recognized by
+`std::net::IpAddr` are rejected, including IPv4 with an optional root dot.
 
-Count is checked first. Each replica is then checked in supplied order for master
-ID, duplicate ID and duplicate hostname, returning the first error. Parsed names
-are not validated again. No maximum replica count is imposed.
-`ClusterDefinitionError` retains the rejected count or conflicting parsed identity;
-`DuplicateHostname` retains the hostname and both member IDs. Conflicting values
-are cloned only when needed to return an owned error.
+Checks return the first failure: empty trimmed input, overall length, IP literal,
+then each label in order for emptiness, length, characters and boundaries.
+`HostnameError::name()` retains original padding and case; `kind()` is typed.
+Label indexes are zero-based and exclude the root label; character byte offsets
+refer to the trimmed input before lowercasing. For example, `"  DB._host  "`
+reports byte offset 3 while retaining the original input.
 
-Unique hostnames prevent distinct members targeting the same configured name and
-fixed port. Comparisons use already-trimmed, lowercase `Hostname` values, retaining
-root-dot differences. No DNS lookup or alias/address uniqueness check occurs;
-different configured names may still resolve to the same destination.
+Label syntax follows [RFC 1123 section 2.1](https://www.rfc-editor.org/rfc/rfc1123.html#section-2.1);
+lengths account for DNS label length bytes and the root label in the 255-byte wire
+limit from [RFC 1035 section 2.3.4](https://www.rfc-editor.org/rfc/rfc1035.html#section-2.3.4).
+This validates hostnames, not arbitrary DNS record names. Rust has no standard
+validated DNS hostname type; `IpAddr` handles numeric address recognition.
+Parsing establishes neither existence, reachability nor authentication.
 
-After successful validation, replicas are sorted in place by the case-sensitive
-member ID name. The supplied order carries no meaning and is not retained.
-Canonical order makes derived definition
-equality independent of input order and mismatch reporting deterministic. Member
-strings are moved rather than cloned; sorting does not allocate another vector.
-`master_member()` borrows the master and `replica_members()` borrows a read-only
-slice in canonical ID order. `contains_member(&MemberId)` checks the master and
-replica IDs, independently of their hostnames.
+Hostname parsing retains an untrimmed input's allocation and lowercases in place;
+trimming on success copies the trimmed text. Failures retain the original input.
+Membership owns only its domain string; raw conversion clones the borrowed raw
+node/domain strings, and cloning membership clones the domain. Formatting a node
+hostname allocates a new string, rather than caching three addresses for occasional use.
+These are configuration operations, not per-record work. There are no locks,
+workers, DNS queries, unsafe code or performance measurements here.
 
-`ClusteringConfiguration::clustered(local: MemberId, definition: ClusterDefinition)`
-takes ownership of a validated shared definition, then checks that the local ID
-belongs to it. An unlisted ID returns `ClusteringConfigurationError::UnknownLocalMember`,
-moving the unmatched ID into the error. This returns `Clustered(ClusterMembership)`;
-`Singleton` contains no definition or local identity.
+## Planned lifecycle and validation
 
-The separate [raw input type](../../configuration/clustering/README.md) declares
-environment, CLI and file-document mappings. Conversion from those raw strings
-into these validated types and startup consumption remain deferred.
+All three permanent members must connect and resynchronize at startup before
+command-handler admission. Once serving, losing either replica ends the cluster
+session; no live joins or replacement connections are admitted. Coordinated
+restart/resynchronization must cascade to command handlers. Cluster identity,
+storage identities, mode permanence, recovery and durable acknowledgement rules
+remain runtime/persistence responsibilities, not guarantees of these value objects.
+Fixed ports are planned but numbers have not been selected.
 
-`ClusterMembership` contains only `local_member_id` and `definition`, exposed by
-borrowing getters. Its internal validation does not repeat definition validation.
-`is_master()` derives the role from the local ID and definition's master ID; false
-means the local identity is one of the configured replicas. No separate local
-hostname or role is stored that could disagree with the definition. Comparing
-whole memberships includes the local ID; handshake agreement must compare their
-shared definitions instead, since local IDs intentionally differ.
-
-Private fields, read-only access and validated construction preserve all these
-contracts. Cloning definitions/memberships clones their owned strings and vector;
-no shared state, locks or background work are introduced. None of these values
-establishes authentication, exclusive execution, connection readiness, durable
-replication or command admission.
-
-## Definition agreement
-
-`expected.verify_matches(&actual)` returns `Ok(())` when validated shared definitions
-agree, independently of replica input order. It compares the full master and
-replica ID/hostname information using parsed values. No hash, serialization, wire
-protocol, DNS lookup or live connection checks are involved.
-
-`ClusterDefinitionMismatch` returns the first difference with expected/actual
-orientation:
-
-| Difference | Retained context |
-| --- | --- |
-| Different master ID | `Master { expected, actual }`. |
-| Different hostname for a master or replica ID | `Hostname { member_id, expected, actual }`. |
-| An expected replica is absent | `MissingReplica { member_id }`. |
-| An additional actual replica is present | `UnexpectedReplica { member_id }`. |
-
-Comparison checks master ID, master hostname, then expected replicas in canonical
-ID order for missing IDs or changed hostnames, then actual replicas for additional
-IDs in canonical order. A replacement replica therefore reports the missing
-expected ID before the unexpected one. This is a first-mismatch diagnostic, not
-an accumulated diff; reversing expected/actual reverses missing/extra orientation.
-Error values own cloned context; successful comparisons allocate no error data.
-Derived `PartialEq`/`Eq` have the same agreement semantics because validated
-replica lists are canonicalized. Member IDs remain case-sensitive and hostname
-root dots remain significant.
-
-## Boundaries and design rationale
-
-This is static configuration validation, not proof that members are connected,
-authenticated, recovered or current. It does not establish exclusive execution,
-persist a cluster ID, or enforce the permanent mode against existing storage.
-Those require startup and connection owners with the relevant state.
-
-Configured hostnames with fixed service ports are the agreed direction. Hostname
-syntax and member composition are implemented; port numbers, resolution,
-serialization and configuration-file loading remain deferred. A cluster ID will be generated at initialization,
-so it is not a caller-selected field in this configuration. The fixed replica
-minimum is application policy rather than a configurable quorum setting.
-
-Definition validation performs simple pairwise duplicate checks without a temporary
-set, followed by sorting. Agreement checks also search the small replica lists
-directly. Duplicate checks and agreement are quadratic in replica count; these
-are configuration/handshake operations for a small fixed cluster. No per-record work, locks,
-workers or I/O are introduced. No performance improvement is claimed or measured.
-
-## Validation and future integration
-
-Same-file definition tests cover the minimum count, canonical order and equality
-under reordered input, unique IDs/hostnames, validation precedence and all mismatch
-variants with retained expected/actual context. They cover normalized hostname
-agreement, root-dot differences, case-sensitive IDs, missing/extra replicas and
-canonical first-mismatch ordering. Membership tests cover each local role, the same
-shared definition across local identities, trimmed IDs and unlisted/wrong-case IDs.
-Member-name tests cover
-empty/short input, the literal 2/3 and 64/65-byte boundaries, surrounding whitespace
-trimming, all ASCII bytes, Unicode and lookalike rejection, invalid-character
-offsets, alphanumeric boundaries and preservation of names and case. Membership
-definition tests also cover duplicate replicas and master conflicts after trimming,
-conflicting IDs with different hostnames, and hostname conflicts normalized from
-different casing and surrounding whitespace.
-Hostname tests use literal length boundaries (63/64 label bytes and 253/254 name
-bytes), including absolute names with a final dot, and cover normalization,
-single-label names, empty labels, ASCII/Unicode rejection, IP literals,
-invalid-character offsets, label boundaries and first-error ordering.
-Run from the workspace root:
+Same-file tests cover all slots and invalid alternatives, normalization, root-dot
+agreement, formatted hostnames, the standalone hostname length boundary with and
+without a root dot, invalid domain syntax, mode/conditional-field errors and role
+selection. Membership decoding tests retain field validation and malformed-object
+coverage without reinstating cross-field length checks.
+Hostname tests cover 63/64-byte labels, 253/254-byte full names, all ASCII classes,
+Unicode, IP literals, malformed labels, error offsets and precedence.
 
 ```sh
 cargo test -p transaction-log --locked
 cargo fmt --all --check
 cargo clippy -p transaction-log --all-targets --locked -- -D warnings
+cargo doc -p transaction-log --no-deps --locked
 ```
-
-Future startup must compare this mode and membership with persisted initialization
-state before opening service connections. Runtime replica eligibility, full-cluster
-readiness and command completion remain separate contracts; static validation must
-not be presented as enforcing those behaviors.

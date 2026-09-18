@@ -15,10 +15,13 @@ scaffold; startup recovery orchestration, queries, replication and client protoc
 handling remain in development.
 
 The service entry point (`services/transaction-log/src/main.rs`) loads
-the raw clustering inputs from CLI arguments and environment variables. `--help`
+raw startup inputs from CLI arguments and environment variables. `--help`
 prints generated option descriptions; missing required inputs produce a loading
 error. After loading, it prints `Transaction Log v<version>` to standard output,
-then exits successfully. Domain validation and cluster startup remain planned.
+then exits. No storage access or setup is wired into startup.
+Typed conversion validates the fixed three-node topology; server startup and log
+recovery remain planned. Storage defaults to `/data` on Linux and `./data` on Windows;
+`--storage-directory` or `TL_STORAGE_DIRECTORY` overrides it for local runs.
 Cargo embeds the service's inherited workspace package version at compile time;
 the executable does not read a manifest or runtime version setting. CI can assign
 a release version before compilation; automated version assignment and version
@@ -228,7 +231,7 @@ failure handling, comparison rules and integration commands.
 - [x] Storage provider with owned startup configuration, deterministic log/index/checkpoint paths and stream-directory initialization.
 - [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
 - [x] Typed record start/end locations and a range model with lazy enumeration of bounded, postfix, whole-file and prefix reads.
-- [x] Stream checkpoint model and JSON serialization for storage identities, record endpoints and checkpoints, with identifier validation; persistence and recovery integration remain pending.
+- [x] Stream-owned file identities, record endpoints/ranges and checkpoint model, with validated Serde metadata; checkpoint persistence and recovery integration remain pending.
 - [x] Indexed log writer with stream/sequence checks, log-before-index flushing, separate flushed/durable progress and full-file finalization.
 - [x] File-only index writer with reusable buffering and separate buffer output, file flushing and data synchronization.
 - [x] Provider-based recovery file acquisition, supplied-boundary validation, index repair, explicit invalid-log-tail truncation and synchronized partial/full handover.
@@ -240,7 +243,7 @@ failure handling, comparison rules and integration commands.
 - [ ] Multi-file lifecycle coordination and stream-specific index queries.
 - [ ] Durable flush scheduling, checkpoint persistence and startup-wide recovery orchestration.
 - [ ] Replication and cluster coordination.
-- [x] In-memory singleton/clustered configuration with validated shared cluster definitions, local identity checks and order-independent definition agreement; startup integration and persisted mode enforcement remain pending.
+- [x] Raw and validated single/cluster configuration with fixed node slots and derived DNS hostnames; storage supports configuration read/write, while startup integration remains deferred.
 - [ ] Storage, indexing, replication, recovery and latency benchmarks.
 - [ ] Dedicated performance CI workers and durable benchmark-history publication.
 
@@ -266,11 +269,11 @@ The workspace uses Rust edition 2024 and is currently tested with Rust 1.98.1.
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all --check
-cargo run -- --cluster-mode singleton
+cargo run -- --cluster-mode single --storage-directory ./data
 cargo run -- --help
 ```
 
-The application currently prints its embedded version; it does not start a log server.
+The application validates configuration, prints its embedded version and exits. Storage startup integration remains deferred.
 For VS Code or Devin, install the extensions recommended in
 [.vscode/extensions.json](.vscode/extensions.json), including rust-analyzer,
 CodeLLDB and Dependi. The **Debug Transaction Log** launch configuration builds
@@ -289,12 +292,15 @@ design decisions, safety invariants and optimization evidence.
 | --- | --- |
 | [Clustering and read replicas](CLUSTERING.md) | Planned permanent deployment modes, fixed membership/master, startup gating, replica-loss exit policy and Kubernetes deployment requirements; open replication/read contracts. |
 | [Clustering](services/transaction-log/src/clustering/README.md) | Module boundaries and planned handshake/runtime responsibilities. |
-| [Clustering configuration](services/transaction-log/src/clustering/configuration/README.md) | Implemented shared definitions, local identity, members, parsing/validation and order-independent agreement with typed mismatches; planned startup and endpoint boundaries. |
-| [Raw clustering inputs](services/transaction-log/src/configuration/clustering/README.md) | Raw fields with environment, CLI and file-document attributes; validated conversion and startup integration remain planned. |
+| [Clustering configuration](services/transaction-log/src/clustering/configuration/README.md) | Deployment settings, established configuration with permanent UUID, fixed topology, node/domain parsing and Serde contracts. |
+| [Raw clustering inputs](services/transaction-log/src/configuration/README.md) | Mode, local node name and cluster domain with environment, CLI and file-document attributes; startup loading and typed validation. |
+| [Application messages](services/transaction-log/src/messages/README.md) | Collection point for application wire messages and their message-io/Postcard wire contract. |
 | [Exports crate overview](services/transaction-log-exports/src/lib.rs) | Public types and API entry points. |
 | [Record specification](services/transaction-log-exports/src/record/README.md) | Wire format, ownership, validation and reader integration. |
 | [Writer specification](services/transaction-log-exports/src/record_writer/README.md) | Constructor modes, buffering, completion, cancellation and hot-path rationale. |
-| [Storage](services/transaction-log/src/storage/README.md) | File identities, startup configuration, path layout, directory initialization and storage boundaries. |
+| [Storage](services/transaction-log/src/storage/README.md) | Root configuration, physical paths, file acquisition, directory initialization and configuration persistence. |
+| [Stream locations](services/transaction-log/src/streams/location/README.md) | Logical file identities, sequence grouping, record boundaries and lazy range enumeration. |
+| [Stream checkpoint](services/transaction-log/src/streams/README.md#stream-checkpoint-model) | Stream-owned checkpoint model, Serde representation and certification/publication contract; persistence remains deferred. |
 | [Stream operations](services/transaction-log/src/streams/README.md) | Indexed appends, validation, repair, partial/full handover and failure handling. |
 | [Object pool](lib/object-pool/README.md) | Ownership, reclamation policy and usage. |
 | [Message I/O](lib/message-io/README.md) | Framing, Serde extension APIs, size limits, ownership and partial-I/O/cancellation contracts. |

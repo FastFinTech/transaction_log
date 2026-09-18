@@ -1,4 +1,4 @@
-use crate::storage::{LogFileId, RecordEndLocation};
+use crate::streams::{LogFileId, RecordEndLocation};
 use getset::CopyGetters;
 
 /// Completion metadata for a full validated and synchronized log/index pair.

@@ -2,7 +2,7 @@ use getset::CopyGetters;
 use serde::{Deserialize, Serialize};
 use transaction_log_exports::RecordId;
 
-use super::LogFileId;
+use super::{LogFileId, RecordStartLocation};
 
 /// The exclusive byte end of a record within its assigned log file.
 ///
@@ -53,6 +53,25 @@ impl RecordEndLocation {
     pub fn log_file_id(self) -> LogFileId {
         LogFileId::from_record_id(self.record_id)
     }
+
+    /// Derives the next record's inclusive start.
+    ///
+    /// Preserves this exclusive byte position within the same file. When the next
+    /// record belongs to a new file, its start position is zero. This only derives
+    /// metadata: it does not prove the next record exists or validate either offset.
+    ///
+    /// # Panics
+    ///
+    /// Panics at sequence exhaustion through [`RecordId::next`], in debug and release.
+    pub fn next_record_start(self) -> RecordStartLocation {
+        let next_id = self.record_id.next();
+        let position = if LogFileId::from_record_id(next_id) == self.log_file_id() {
+            self.position
+        } else {
+            0
+        };
+        RecordStartLocation::new(next_id, position)
+    }
 }
 
 #[cfg(test)]
@@ -60,6 +79,52 @@ mod tests {
     use transaction_log_exports::{SequenceNumber, StreamId};
 
     use super::{RecordEndLocation, RecordId};
+
+    #[test]
+    fn next_start_preserves_offsets_or_resets_at_file_boundaries_without_wrapping() {
+        for stream in [StreamId::MIN, StreamId::MAX] {
+            for (sequence, position, next_sequence, next_position, next_file) in [
+                (0, 16, 1, 16, 0),
+                (99_998, u64::MAX, 99_999, u64::MAX, 0),
+                (99_999, 6_553_500_000, 100_000, 0, 1),
+                (100_000, 0, 100_001, 0, 1),
+                (199_999, 32, 200_000, 0, 2),
+                (u64::MAX - 1, 42, u64::MAX, 42, 184_467_440_737_095),
+            ] {
+                let end = RecordEndLocation::new(
+                    RecordId::new(stream, SequenceNumber::new(sequence)),
+                    position,
+                );
+                let start = end.next_record_start();
+                assert_eq!(
+                    start.record_id(),
+                    RecordId::new(stream, SequenceNumber::new(next_sequence))
+                );
+                assert_eq!(start.position(), next_position);
+                assert_eq!(start.log_file_id().file_number().get(), next_file);
+            }
+        }
+    }
+
+    #[test]
+    fn next_start_panics_at_exhaustion_like_record_id_next() {
+        for stream in [StreamId::MIN, StreamId::MAX] {
+            for position in [0, u64::MAX] {
+                let id = RecordId::new(stream, SequenceNumber::MAX);
+                let end = RecordEndLocation::new(id, position);
+                let expected = std::panic::catch_unwind(|| id.next()).unwrap_err();
+                let actual = std::panic::catch_unwind(|| end.next_record_start()).unwrap_err();
+                let message = |panic: &Box<dyn std::any::Any + Send>| {
+                    panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .expect("sequence exhaustion uses a string panic")
+                };
+                assert_eq!(message(&actual), message(&expected));
+            }
+        }
+    }
 
     #[test]
     fn exclusive_ends_stay_in_the_last_included_records_file() {

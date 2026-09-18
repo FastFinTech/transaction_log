@@ -18,7 +18,8 @@ Public callers continue to import `transaction_log::streams::IndexedLogValidator
 | `mod.rs` | This Rustdoc specification, declarations and re-exports. |
 
 Read the [shared stream contracts](../README.md#shared-contracts),
-[storage specification](../../storage/README.md) and
+[storage specification](../../storage/README.md),
+[stream location specification](../location/README.md) and
 [record specification](../../../../transaction-log-exports/src/record/README.md)
 for file acquisition, trusted locations and record validity. Repair uses the
 [index writer](../index_writer/README.md); partial handover transfers ownership to
@@ -39,8 +40,10 @@ then the corresponding index data, before durably publishing the checkpoint.
 Recovery trusts that certification; checkpoint persistence remains future work.
 
 Opening uses `StorageProvider::open_log_for_validation` first, then
-`open_index_for_repair`. The log must exist. A missing derived index is created
-empty; existing bytes are preserved. Creating that empty file is distinct from
+`open_index_for_repair`. Provider failures propagate as
+`LogValidationError::Open(StorageError)`, preserving the requested path and
+original cause. The log must exist. A missing derived index is created empty;
+existing bytes are preserved. Creating that empty file is distinct from
 the subsequent non-mutating validation pass. With a nonempty trusted boundary,
 a missing index prefix or mismatching final entry produces `TrustedIndexUnavailable`. The
 caller must supply an earlier trustworthy boundary for a separate attempt.
@@ -187,8 +190,10 @@ accepted/repaired prefix. For example:
 
 ```no_run
 use tokio::fs::File;
-use transaction_log::{storage::{LogFileId, RecordEndLocation, StorageProvider},
-    streams::{IndexedLogValidator, IndexedLogWriter, LogValidationError}};
+use transaction_log::storage::StorageProvider;
+use transaction_log::streams::{
+    LogFileId, RecordEndLocation, IndexedLogValidator, IndexedLogWriter, LogValidationError,
+};
 
 async fn resume_partial(
     provider: &StorageProvider,

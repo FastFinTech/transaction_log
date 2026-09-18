@@ -1,152 +1,147 @@
 # Clustering and read replicas
 
-This document records the initial deployment and cluster lifecycle design.
-In-memory deployment configuration and static membership validation are implemented
-in [clustering::configuration](services/transaction-log/src/clustering/configuration/README.md).
-Replication and command-handler connections are planned; the service
-does not implement the lifecycle rules yet. The [main README](README.md) tracks overall
-implementation progress.
+This document records the agreed initial deployment and recovery design.
+[Validated configuration](services/transaction-log/src/clustering/configuration/README.md)
+and [raw inputs](services/transaction-log/src/configuration/README.md)
+are implemented, including startup loading and static validation. Startup prints the version and exits without accessing storage. Setup, networking, cluster enrollment,
+replication, command-handler connections and the lifecycle below remain planned.
+The [main README](README.md) tracks overall progress.
 
-## Permanent deployment mode
+## Permanent mode and fixed membership
 
-A database is initialized as either a singleton or a member of a cluster. Its
-mode is permanent for that initialized database: singleton storage cannot later
-be opened in clustered mode, and clustered storage cannot be opened in singleton
-mode. Restarting a process or editing its configuration does not change the mode.
+A database is initialized as either single or cluster. Its persisted mode is
+permanent: standalone storage cannot later become clustered, and clustered storage
+cannot be opened standalone. Configuration changes and process restarts do not
+change initialized state. Local mode/node/domain metadata and no-overwrite
+publication are implemented in the [storage module](services/transaction-log/src/storage/README.md#clustering-configuration-persistence).
+Cluster enrollment and complete cross-platform durable publication remain to be specified.
+The same permanence applies to `--cluster-mode`; future startup must reject disagreement with stored configuration.
 
-"Initialized" describes this boundary more precisely than "started": the choice
-belongs to persisted database state, rather than an individual process lifetime.
-The initialization format and crash-safe publication procedure remain to be
-specified.
+Each cluster has exactly one permanent master and two permanent replicas:
+`master`, `replica-1`, `replica-2`. There is no replica count setting, arbitrary
+member list, live enrollment, election, promotion or automatic master failover.
+The local node name (`--cluster-my-node-name`) is permanent for initialized storage.
+Restarting or editing configuration must not change it; startup must reject a
+configured slot that differs from persisted local configuration. This startup check remains planned.
+If the master fails, commands remain unavailable until the same logical master
+recovers. Deployment may replace its process while preserving storage and identity.
 
-## Fixed membership and master
+The planned master generates a cluster UUID at first establishment; ordinary
+restarts retain it. `EstablishedClusteringConfiguration` represents that UUID
+with deployment configuration in either mode, and the storage provider saves and
+restores it directly. UUID establishment and startup use remain unimplemented.
+The configured domain is a routing namespace, not a cluster ID.
+Persisted member/storage identities must prevent replacement or empty storage from
+silently substituting for an initialized member. Exactly two processes claiming
+replica slots do not prove a safe recovery. Enrollment, storage
+identities and durable-history reconciliation remain to be specified.
 
-Cluster membership is explicitly defined by configuration. The master is a
-permanent role; there is no master election, replica promotion or automatic
-failover. If the master fails, command processing is unavailable until that same
-logical master restarts. A replacement Kubernetes pod can run the same logical
-master using its persisted storage and identity.
+## Minimal configuration and derived DNS
 
-The master generates a cluster ID during first initialization and persists it.
-Ordinary restarts retain that ID. The ID distinguishes this initialized cluster
-from another cluster, including a newly initialized master that happens to use
-the same network address. Replica connections must belong to that cluster and
-match configured member identities. Multiple connections from one replica must
-not count as multiple replicas.
+Single mode needs only `TL_CLUSTER_MODE=single`. A cluster member supplies:
 
-Configured member identities use the implemented `MemberId` value. Its parsing,
-name constraints, trimming and case-sensitive comparison rules are specified in
-the [member identity documentation](services/transaction-log/src/clustering/configuration/README.md#member-identity-and-parsing).
-Member names identify roles within the configuration; the persisted cluster ID
-identifies the initialized cluster itself.
+```text
+TL_CLUSTER_MODE=cluster
+TL_CLUSTER_MY_NODE_NAME=replica-1
+TL_CLUSTER_DOMAIN=payments.example.com
+```
 
-A cluster ID does not establish that a replica's data is current. An old replica
-from the same cluster still needs its state checked and any required catch-up.
-The cluster-ID format, initial replica enrollment and handshake remain to be
-specified.
+The application derives `master.payments.example.com`,
+`replica-1.payments.example.com` and `replica-2.payments.example.com`.
+Deployment owns DNS/routing those names to the intended instances. No individual
+hostname mappings are configured. All machines use the same domain and differ
+only in their explicit local node slot. Domain case/whitespace normalize; an
+optional trailing root dot is retained. Derived names must fit hostname limits.
+The configuration specifications own parsing and error contracts.
 
-## Configured hostnames and fixed ports
+Replicas initiate clustering connections to the master. Cluster, command-handler
+and read traffic use fixed separate ports; numbers and listener wiring are not
+selected yet. Runtime handshakes must verify expected peer slots and reject
+duplicate active slots. Different DNS names may lead to the same process; DNS
+is neither authentication nor storage identity. Shared agreement compares validated
+cluster domains, excluding local slots. Membership stores only the local slot and
+domain; the three node hostnames are derived when needed.
 
-Network locations remain separate from logical member identity. The agreed
-direction is configured DNS hostnames and fixed service ports, with replicas
-initiating connections to the permanent master. This needs resolution of
-configured names, rather than discovery that changes or enrolls cluster members.
-DNS can locate replacement pods without changing their logical identities.
-Cluster traffic, command-handler traffic and read traffic use separate ports;
-the actual port numbers have not been selected.
+Local debugging can use three containers with network aliases, or separate native
+processes with local address mappings and listeners bound to distinct addresses.
+Each node needs separate storage. Development networking and debugger timeout
+behavior are not yet implemented. In Kubernetes, peer names must be available
+before application readiness to avoid a startup DNS/readiness cycle; address
+publication and pod startup ordering belong to deployment design.
 
-The standalone `Hostname` type implements parsing and validation, documented in
-the [hostname specification](services/transaction-log/src/clustering/configuration/README.md#hostname-parsing).
-It performs no DNS lookup. `MemberId` still represents only a member name.
-`Member` combines a validated `MemberId` and `Hostname`. `ClusterDefinition`
-owns the shared master and replica members; `ClusterMembership` pairs that
-definition with a local member ID selecting this process's role. Conflict checks
-compare IDs independently of hostnames.
-Parsed hostnames must also be unique across the master and replicas because
-service ports are fixed. Hostname parsing trims and lowercases input before these
-comparisons. This catches repeated configured names without resolving DNS aliases
-or proving distinct network addresses.
-Fixed-port endpoint wiring and connection setup remain planned.
+## Coordinated operating sessions
 
-The implemented definition agreement check compares master and replica IDs and
-hostnames, with replica input order ignored. Replicas are stored in canonical
-member-ID order. Typed mismatches identify a different master, changed member
-hostname, missing replica or unexpected replica. Local IDs are validated against
-the definition but intentionally excluded from shared agreement. Handshake
-serialization, cluster-ID verification and active duplicate-ID detection remain
-unimplemented.
+During startup, accept clustering connections and perform recovery/resynchronization.
+For fresh storage, first validate inputs and inspect the root without modifying it.
+Only after all members establish the cluster and agree may startup publish permanent
+local configuration. Failed first connection/settings attempts must leave fresh storage
+unassigned so settings can be corrected. The executable currently performs only the
+read-only cluster check; establishment and delayed publication remain planned.
+Do not admit command handlers until all three fixed members are connected and
+their durable histories reconciled. Open sockets alone are insufficient readiness.
+Recovery must preserve acknowledged data even if the master lacks records retained
+by replicas; a restart cannot simply declare the master's log authoritative.
+
+Once serving, membership is frozen. Losing either replica ends the cluster session:
+the master stops command admission, invalidates handler connections and exits.
+There is no degraded operation, runtime rejoin or replacement connection. Master
+failure also ends command service. Restart/resynchronization is a coordinated
+cluster operation, cascading to command-handler restart/reconnection. Replicas must
+not continue exposing a stale session as ready. A master process restart alone is
+not proof that all members have entered a fresh, reconciled session.
+
+Deployment restarts failed processes, and every new session passes the full startup
+gate. This intentionally favors a simpler consistent recovery boundary over
+continuous availability and avoids potentially terabyte-scale catch-up during
+normal operation. Failure detection, timeouts, coordination, shutdown sequencing
+and readiness publication remain unspecified. No runtime enforcement exists yet.
+
+An interrupted command has an unknown outcome, not proof of failure: committed
+data may outlive a lost acknowledgement. Stable command identities, outcome
+resolution and duplicate prevention must make handler recovery safe. Restarting
+processes alone does not supply those guarantees.
+
+Reliable operation for months and 99.99% availability are targets, not established
+results. Full-session recovery duration and interruption frequency must be measured;
+there are no cluster performance measurements or availability guarantees yet.
 
 ## Message transport
 
-The reusable [message I/O crate](lib/message-io/README.md) implements async
-`read_message::<T>()` and `write_message(&value)` extension methods for Tokio byte
-sources/destinations and Serde types. Frames carry a four-byte little-endian body
-length and one Postcard value, with a fixed 1 MiB encoded body limit. Its
-specification owns framing, EOF, size, completion and cancellation contracts.
+The [message I/O crate](lib/message-io/README.md) implements async
+`read_message::<T>()` and `write_message(&value)` for Tokio byte sources/destinations
+and Serde types. A four-byte little-endian body length precedes one Postcard value,
+bounded to 1 MiB. The crate owns framing, EOF, completion and cancellation contracts
+and is intended for intermittent non-hot-path use.
 
-Application-version agreement occurs before the clustering handshake and remains
-outside this codec. Cluster/gossip/handshake message schemas, validated configuration
-deserialization and connection integration remain planned. No type identifier or
-version negotiation is automatically added by generic message I/O. Bulk record
+Application-version agreement precedes the clustering handshake. Application
+schemas, cluster/session identity checks and connection integration remain planned;
+generic message I/O adds no type identifier or version negotiation. Bulk record
 replication has not been assigned this encoding.
-
-## Startup and loss of replicas
-
-During clustered startup, accept only application cluster connections. Do not
-accept command-handler connections until the entire configured cluster is
-connected. The precise recovery and readiness boundary for opening those
-connections remains to be defined; an open socket alone does not prove that a
-replica is ready to participate in replication.
-
-Once serving commands, the master must exit if fewer than two replicas remain
-attached, regardless of the reason for their loss. Kubernetes is responsible for
-restarting the process. This deliberately avoids an application state that keeps
-the master alive while waiting to resume command processing. Admission must stop
-when the failure condition is detected; shutdown must not keep accepting commands.
-
-Every restart goes through the full-cluster startup gate again. With more than
-two configured replicas, ongoing operation can tolerate a missing member while
-at least two remain, but startup cannot. A prolonged outage can therefore cause
-repeated restarts or leave a restarted master waiting for the missing members.
-This favors the required replication conditions over command availability.
-
-Detection of replica loss, whether lag or persistence failure makes an attached
-replica ineligible, and handling of commands already in flight remain open.
-Process exit does not imply that an interrupted command accepted no data or can
-be safely replayed.
 
 ## Kubernetes deployment responsibility
 
-Exclusive execution of the logical master is a deployment requirement. The
-intended Kubernetes deployment uses a StatefulSet with one master pod and a
-persistent volume using `ReadWriteOncePod` with a supported CSI driver.
-StatefulSets provide at-most-one semantics for a pod identity; `ReadWriteOncePod`
-constrains volume access to one pod. Ordinary `ReadWriteOnce` constrains access to
-one node and can permit multiple pods on that node to access the volume.
+Exclusive execution of the logical master is required. The intended deployment
+uses a StatefulSet with one master pod and a persistent volume using
+`ReadWriteOncePod` with a supported CSI driver. StatefulSets provide at-most-one
+semantics for a pod identity; `ReadWriteOncePod` constrains access to one pod.
+Ordinary `ReadWriteOnce` constrains access to one node and can allow several pods
+on that node to access the same volume.
 
-Forced replacement requires confirming that the old master has stopped.
-Force-deleting a StatefulSet pod can violate its at-most-one semantics if the
-old process is still running. The application design relies on this deployment
-contract rather than adding master election or distributed locking.
+Forced replacement requires confirming that the old master stopped. Force-deleting
+a StatefulSet pod can violate at-most-one semantics if the old process is running.
+The design relies on deployment enforcement, without master election or distributed
+locking. Kubernetes manifests and operational procedures are not implemented.
 
 References: [StatefulSet force deletion](https://kubernetes.io/docs/tasks/run-application/force-delete-stateful-set-pod/)
-and [persistent volume access modes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes).
+and [volume access modes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes).
 
-Kubernetes manifests and operational procedures have not yet been implemented.
+## Open durability and read contracts
 
-## Open replication and read contracts
+- Write acknowledgement: receipt, append, flush and durable synchronization differ.
+- Startup recovery, commitment evidence and reconciliation of divergent histories.
+- Failure detection and whether lag/persistence errors end a session.
+- In-flight outcomes, replay, duplicate prevention and handler recovery.
+- Read freshness and admission during startup or after session loss.
+- Safe replacement of failed storage without discarding acknowledged data.
 
-The lifecycle choices above do not yet define:
-
-- What a replica must acknowledge before a command succeeds: received bytes,
-  appended records, flushed data and durable synchronization are distinct events.
-- Recovery, catch-up and the exact conditions under which a replica counts toward
-  the minimum of two.
-- In-flight command outcomes, client retry rules and duplicate prevention after
-  a disconnect or master restart.
-- Read-replica freshness guarantees, including whether disconnected or lagging
-  replicas may continue serving reads.
-- How a failed member can be replaced without admitting an unintended replica.
-
-These require further design discussion before implementation. There are no
-cluster performance measurements or availability guarantees yet.
+These require further design before runtime implementation.

@@ -19,6 +19,24 @@ documentation precise and useful rather than adding length for its own sake.
 
 ## Working with the owner
 
+When the owner authorizes work, confirm the concrete scope in a brief commentary
+before editing: identify the requested change and its boundary. Authorization
+such as "go ahead" applies to the specific agreed step, not every related idea
+discussed earlier.
+Extended discussion can explore an entire lifecycle while authorizing only one
+small implementation step. Do not infer broader permission from the discussion's
+length, detail, apparent agreement or accumulated design decisions. Those decisions
+provide context for the authorized step; they do not authorize implementing later
+steps. In particular, agreement about eventual startup behavior does not authorize
+wiring it into startup when the current request concerns only a model or API.
+If the scope is materially ambiguous, ask one focused question
+before implementing the ambiguous part; otherwise state the understood scope
+and proceed without requesting approval again. Adding a model or storage API
+does not authorize startup wiring, setup, UUID assignment, configuration comparison
+or application policy. Treat those as separate steps unless explicitly included.
+If additional behavior seems necessary, explain the dependency and resolve its
+scope with the owner rather than silently expanding the implementation.
+
 Develop substantial features in small, coherent steps that the owner can read
 and criticize. Implement the agreed step without bundling speculative later
 architecture into it. Discussion and brainstorming are not instructions to

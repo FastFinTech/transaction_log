@@ -12,6 +12,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 transaction-log-exports = { path = "../transaction-log-exports" }
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,9 +1,12 @@
-use std::path::{Path, PathBuf};
-
+use super::{StorageConfig, StorageError};
+use crate::clustering::configuration::EstablishedClusteringConfiguration;
+use crate::streams::LogFileId;
+use std::{
+    fs,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+};
 use transaction_log_exports::StreamId;
-
-use super::{LogFileId, StorageConfig, StorageFileOpenError, StorageProviderError};
-
 /// Owns storage configuration, constructs paths, and initializes stream directories.
 ///
 /// Paths follow the fixed decimal layout documented in this module's README.
@@ -12,6 +15,9 @@ use super::{LogFileId, StorageConfig, StorageFileOpenError, StorageProviderError
 /// Validation opens existing logs and opens or creates their repairable indexes.
 /// The caller owns returned handles; deeper directory creation and file rotation
 /// remain owner responsibilities. The provider does not cache open handles.
+/// Established clustering configuration is loaded/published directly through
+/// Serde. UUID assignment and deployment-configuration comparison belong to
+/// application lifecycle policy, not these storage operations.
 ///
 /// The provider is immutable and can be shared through `Arc<StorageProvider>`.
 /// It has no path cache, locks, background tasks or initialization flag.
@@ -48,16 +54,16 @@ impl StorageProvider {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageProviderError`] at the first directory that cannot be
+    /// Returns [`StorageError`] at the first directory that cannot be
     /// created, preserving the requested path and the underlying I/O error.
-    pub async fn initialize(&self) -> Result<(), StorageProviderError> {
+    pub async fn initialize(&self) -> Result<(), StorageError> {
         for stream_id in StreamId::all() {
             let path = self.stream_directory(stream_id);
             // create_dir_all accepts existing directories and creates missing
             // parents. A separate existence check would add I/O and a race.
             tokio::fs::create_dir_all(&path)
                 .await
-                .map_err(|source| StorageProviderError::new(path, source))?;
+                .map_err(|source| StorageError::io(path, source))?;
         }
         Ok(())
     }
@@ -67,7 +73,7 @@ impl StorageProvider {
     /// Returns a newly allocated path whether or not it exists and whether or not
     /// initialization has run. This performs no I/O or validation of file contents.
     pub fn log_file_path(&self, id: LogFileId) -> PathBuf {
-        self.file_path(id, "log")
+        self.log_or_index_file_path(id, "log")
     }
 
     /// Constructs the absolute `.idx` path paired with a file ID's log file.
@@ -75,7 +81,7 @@ impl StorageProvider {
     /// The directory and numeric basename match [`Self::log_file_path`]. This
     /// allocates a path but neither creates nor inspects an index file.
     pub fn index_file_path(&self, id: LogFileId) -> PathBuf {
-        self.file_path(id, "idx")
+        self.log_or_index_file_path(id, "idx")
     }
 
     /// Opens an existing log for validation and explicitly requested tail repair.
@@ -87,14 +93,14 @@ impl StorageProvider {
     pub async fn open_log_for_validation(
         &self,
         id: LogFileId,
-    ) -> Result<tokio::fs::File, StorageFileOpenError> {
+    ) -> Result<tokio::fs::File, StorageError> {
         let path = self.log_file_path(id);
         tokio::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .await
-            .map_err(|source| StorageFileOpenError::new(path, source))
+            .map_err(|source| StorageError::io(path, source))
     }
 
     /// Opens the paired index for inspection and repair, creating it if missing.
@@ -107,7 +113,7 @@ impl StorageProvider {
     pub async fn open_index_for_repair(
         &self,
         id: LogFileId,
-    ) -> Result<tokio::fs::File, StorageFileOpenError> {
+    ) -> Result<tokio::fs::File, StorageError> {
         let path = self.index_file_path(id);
         tokio::fs::OpenOptions::new()
             .read(true)
@@ -116,7 +122,7 @@ impl StorageProvider {
             .truncate(false)
             .open(&path)
             .await
-            .map_err(|source| StorageFileOpenError::new(path, source))
+            .map_err(|source| StorageError::io(path, source))
     }
 
     /// Constructs the absolute `checkpoint.json` path for one stream's checkpoint.
@@ -137,7 +143,7 @@ impl StorageProvider {
     }
 
     /// Keeps directory grouping and numeric filenames identical for log/index pairs.
-    fn file_path(&self, id: LogFileId, extension: &str) -> PathBuf {
+    fn log_or_index_file_path(&self, id: LogFileId, extension: &str) -> PathBuf {
         let file_number = format!("{:015}", id.file_number());
         let mut path = self.stream_directory(id.stream_id());
 
@@ -150,6 +156,96 @@ impl StorageProvider {
         path.push(format!("{file_number}.{extension}"));
         path
     }
+
+    /// Loads stored clustering settings, returning `None` only when the file is absent.
+    ///
+    /// Performs bounded blocking startup I/O without creating directories or assigning
+    /// a UUID. Malformed or unreadable metadata is an error, never fresh storage.
+    pub fn read_clustering_configuration(
+        &self,
+    ) -> Result<Option<EstablishedClusteringConfiguration>, StorageError> {
+        let path = self.root_directory().join(FILE_NAME);
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let pending = self.root_directory().join(PENDING_FILE_NAME);
+                match fs::metadata(&pending) {
+                    Ok(_) => {
+                        return Err(StorageError::io(
+                            pending,
+                            io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "unpublished clustering configuration requires recovery",
+                            ),
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(source) => return Err(StorageError::io(pending, source)),
+                }
+            }
+            Err(source) => return Err(StorageError::io(path, source)),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| StorageError::io(path.clone(), source))?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(StorageError::TooLarge {
+                path,
+                max_bytes: MAX_BYTES,
+            });
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| StorageError::Json { path, source })
+    }
+
+    /// Publishes first-load configuration and UUID without replacing existing metadata.
+    ///
+    /// Creates the root if necessary, synchronizes a new staging file and publishes
+    /// it with a no-overwrite hard link. Requires hard-link support and exclusive
+    /// ownership of the root. Existing published or unpublished staging files cause
+    /// an error; callers must inspect interrupted writes rather than reassign UUIDs.
+    ///
+    /// Blocking startup I/O has no async cancellation point. Errors can leave staging
+    /// or published metadata: reread before deciding how to recover. Unix syncs the
+    /// root directory; Windows has no portable directory-durability guarantee here.
+    /// Parent directories are not recursively synchronized. This does not generate
+    /// a UUID, check peer agreement, enforce a process lock or establish readiness.
+    pub fn write_clustering_configuration(
+        &self,
+        configuration: &EstablishedClusteringConfiguration,
+    ) -> Result<(), StorageError> {
+        let root = self.root_directory();
+        let path = root.join(FILE_NAME);
+        let bytes = serde_json::to_vec(configuration).map_err(|source| StorageError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        fs::create_dir_all(root).map_err(|source| StorageError::io(root.to_owned(), source))?;
+        let pending = root.join(PENDING_FILE_NAME);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)
+            .map_err(|source| StorageError::io(pending.clone(), source))?;
+        file.write_all(&bytes)
+            .map_err(|source| StorageError::io(pending.clone(), source))?;
+        file.sync_all()
+            .map_err(|source| StorageError::io(pending.clone(), source))?;
+        drop(file);
+        fs::hard_link(&pending, &path).map_err(|source| StorageError::io(path, source))?;
+        #[cfg(unix)]
+        fs::File::open(root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| StorageError::io(root.to_owned(), source))?;
+        fs::remove_file(&pending).map_err(|source| StorageError::io(pending, source))?;
+        #[cfg(unix)]
+        fs::File::open(root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| StorageError::io(root.to_owned(), source))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -159,7 +255,7 @@ mod tests {
     use std::io;
     use std::path::Path;
 
-    use crate::storage::LogFileNumber;
+    use crate::streams::LogFileNumber;
 
     use super::{LogFileId, StorageConfig, StorageProvider, StreamId};
 
@@ -402,5 +498,127 @@ mod tests {
             assert!(error.source().unwrap().is::<io::Error>());
             assert_eq!(fs::read(collision).unwrap(), b"preserve this file");
         }
+    }
+}
+
+const FILE_NAME: &str = "clustering.json";
+const PENDING_FILE_NAME: &str = ".clustering.pending";
+const MAX_BYTES: u64 = 4096;
+
+#[cfg(test)]
+mod clustering_configuration_tests {
+    use super::*;
+    use crate::{
+        clustering::configuration::{
+            ClusterMembership, ClusteringConfiguration, Hostname, NodeName,
+        },
+        storage::StorageConfig,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn absent_read_has_no_side_effects_and_both_modes_round_trip() {
+        for node in [
+            None,
+            Some(NodeName::Master),
+            Some(NodeName::Replica1),
+            Some(NodeName::Replica2),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("data");
+            let provider = StorageProvider::new(StorageConfig::new(root.clone()).unwrap());
+            assert!(provider.read_clustering_configuration().unwrap().is_none());
+            assert!(!root.exists());
+            let config = match node {
+                None => ClusteringConfiguration::Single,
+                Some(node) => ClusteringConfiguration::Cluster(ClusterMembership::new(
+                    node,
+                    Hostname::parse("cluster.example".into()).unwrap(),
+                )),
+            };
+            let stored = EstablishedClusteringConfiguration::new(Uuid::from_u128(1), config);
+            provider.write_clustering_configuration(&stored).unwrap();
+            assert_eq!(
+                provider.read_clustering_configuration().unwrap(),
+                Some(stored)
+            );
+            assert!(!root.join(PENDING_FILE_NAME).exists());
+        }
+    }
+
+    #[test]
+    fn reads_independent_fixture_and_refuses_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(temp.path().to_owned()).unwrap());
+        let path = temp.path().join(FILE_NAME);
+        let fixture = br#"{"cluster_id":"00000000-0000-0000-0000-000000000001","clustering_configuration":"single"}"#;
+        fs::write(&path, fixture).unwrap();
+        let loaded = provider.read_clustering_configuration().unwrap().unwrap();
+        assert_eq!(
+            loaded,
+            EstablishedClusteringConfiguration::new(
+                Uuid::from_u128(1),
+                ClusteringConfiguration::Single
+            )
+        );
+        let replacement = EstablishedClusteringConfiguration::new(
+            Uuid::from_u128(2),
+            ClusteringConfiguration::Single,
+        );
+        assert!(
+            provider
+                .write_clustering_configuration(&replacement)
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), fixture);
+    }
+
+    #[test]
+    fn malformed_oversized_and_interrupted_metadata_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(temp.path().to_owned()).unwrap());
+        let path = temp.path().join(FILE_NAME);
+        for fixture in [
+            b"".as_slice(),
+            b"{}",
+            b"null",
+            br#"{"cluster_id":"bad","clustering_configuration":"single"}"#,
+        ] {
+            fs::write(&path, fixture).unwrap();
+            assert!(matches!(
+                provider.read_clustering_configuration(),
+                Err(StorageError::Json { .. })
+            ));
+            assert_eq!(fs::read(&path).unwrap(), fixture);
+        }
+        fs::write(&path, vec![b' '; MAX_BYTES as usize + 1]).unwrap();
+        match provider.read_clustering_configuration().unwrap_err() {
+            StorageError::TooLarge {
+                path: rejected,
+                max_bytes,
+            } => {
+                assert_eq!(rejected, path);
+                assert_eq!(max_bytes, 4096);
+            }
+            error => panic!("expected size-limit error, got {error:?}"),
+        }
+        fs::remove_file(path).unwrap();
+        fs::write(temp.path().join(PENDING_FILE_NAME), b"partial").unwrap();
+        assert!(matches!(
+            provider.read_clustering_configuration(),
+            Err(StorageError::Io { .. })
+        ));
+        assert!(
+            provider
+                .write_clustering_configuration(&EstablishedClusteringConfiguration::new(
+                    Uuid::from_u128(1),
+                    ClusteringConfiguration::Single
+                ))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(temp.path().join(PENDING_FILE_NAME)).unwrap(),
+            b"partial"
+        );
     }
 }

@@ -43,7 +43,7 @@ impl RecordRangeLocation {
     /// CRCs or readable file extents. Those checks remain with the resolver.
     ///
     /// ```
-    /// use transaction_log::storage::{RecordEndLocation, RecordRangeLocation, RecordStartLocation};
+    /// use transaction_log::streams::{RecordEndLocation, RecordRangeLocation, RecordStartLocation};
     /// use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
     ///
     /// let id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
@@ -53,13 +53,13 @@ impl RecordRangeLocation {
     /// assert_eq!(range.start().position(), 0);
     /// assert_eq!(range.end().record_id(), id);
     /// assert_eq!(range.iter().count(), 1);
-    /// # Ok::<(), transaction_log::storage::RecordRangeLocationError>(())
+    /// # Ok::<(), transaction_log::streams::RecordRangeLocationError>(())
     /// ```
     ///
     /// Endpoint roles cannot be swapped:
     ///
     /// ```compile_fail,E0308
-    /// use transaction_log::storage::{RecordEndLocation, RecordRangeLocation, RecordStartLocation};
+    /// use transaction_log::streams::{RecordEndLocation, RecordRangeLocation, RecordStartLocation};
     /// use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
     ///
     /// let id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
@@ -165,7 +165,7 @@ mod tests {
         LogFileId, LogFileRange, RecordEndLocation, RecordRangeLocation, RecordRangeLocationError,
         RecordStartLocation,
     };
-    use crate::storage::LogFileNumber;
+    use crate::streams::LogFileNumber;
 
     #[test]
     fn equal_ids_locate_one_record_including_empty_and_maximum_payloads() {

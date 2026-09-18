@@ -10,8 +10,9 @@ use transaction_log_exports::{
 };
 
 use super::{CompletedIndexedLog, LogTailError, LogValidationError as Error, LogValidationReport};
-use crate::storage::{LogFileId, RECORDS_PER_FILE, RecordEndLocation, StorageProvider};
+use crate::storage::StorageProvider;
 use crate::streams::{IndexWriter, IndexedLogWriter, index_writer::INDEX_ENTRY_LEN};
+use crate::streams::{LogFileId, RECORDS_PER_FILE, RecordEndLocation};
 
 /// Validates one exclusively owned log/index pair from a caller-supplied boundary.
 ///

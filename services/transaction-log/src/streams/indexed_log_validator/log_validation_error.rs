@@ -1,4 +1,4 @@
-use crate::storage::StorageFileOpenError;
+use crate::storage::StorageError;
 use crate::streams::{IndexWriteError, IndexedLogWriteError};
 use std::io;
 use thiserror::Error;
@@ -9,7 +9,7 @@ use transaction_log_exports::RecordReadError;
 pub enum LogValidationError {
     /// Provider failed to open the requested log/index path.
     #[error(transparent)]
-    Open(#[from] StorageFileOpenError),
+    Open(#[from] StorageError),
     /// The supplied trusted endpoint cannot describe this file's prefix.
     #[error("invalid validation start: {0}")]
     InvalidStart(&'static str),

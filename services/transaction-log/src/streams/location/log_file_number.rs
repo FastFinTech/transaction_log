@@ -7,7 +7,7 @@ use super::LogFileNumberError;
 
 /// Number of consecutive sequence positions assigned to each ordinary log file.
 ///
-/// This is a storage-layout constant, not a per-process tuning parameter. The
+/// This is a stream sequence-layout constant, not a per-process tuning parameter. The
 /// final range ends at `u64::MAX` and has fewer representable positions.
 pub const RECORDS_PER_FILE: u64 = 100_000;
 

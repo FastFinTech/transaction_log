@@ -16,6 +16,7 @@ Public callers continue to import `transaction_log::streams::IndexedLogWriter`.
 
 Read the [shared stream contracts](../README.md#shared-contracts),
 [storage specification](../../storage/README.md),
+[stream location specification](../location/README.md),
 [record specification](../../../../transaction-log-exports/src/record/README.md) and
 [record writer specification](../../../../transaction-log-exports/src/record_writer/README.md)
 for the underlying formats and ownership contracts. The sibling
@@ -30,6 +31,14 @@ log output uses `RecordWriter<L, ExistingRecords>` and the index uses
 writer owns record identity, sequencing, progress and lifecycle state.
 Both files stay at their permanent storage paths, with identical formats while
 active and finalized. Finalization changes permission to append, not placement.
+
+Appending derives one `RecordStartLocation` from the buffered end through
+`RecordEndLocation::next_record_start()`, or uses the file's first ID at position
+zero for an empty pair. That start supplies both the expected ID and the offset
+used to calculate the new end. The existing full-file check still prevents
+appending into the next file. Stream-wide sequence exhaustion panics through
+`RecordId::next()`, consistent with the endpoint helper. This is a readability
+change, not a measured performance improvement; it introduces no allocation.
 
 `new(file_id, log, index)` accepts an empty pair positioned at zero, with an owned
 `tokio::fs::File` for the index. The caller establishes emptiness and exclusive
@@ -139,7 +148,7 @@ owner; a partial file is a valid writable prefix.
 
 ```no_run
 use tokio::fs::File;
-use transaction_log::{storage::LogFileId, streams::{IndexedLogWriteError, IndexedLogWriter}};
+use transaction_log::streams::{LogFileId, IndexedLogWriteError, IndexedLogWriter};
 use transaction_log_exports::Record;
 
 async fn append_batch(

@@ -14,7 +14,8 @@ Public callers continue to import `transaction_log::streams::IndexWriter`.
 | `mod.rs` | This Rustdoc specification, declarations and re-exports. |
 
 Read the [shared stream contracts](../README.md#shared-contracts) and
-[storage specification](../../storage/README.md) for the file format. The
+[dense index layout](#dense-index-layout) below for the file format and the
+[storage specification](../../storage/README.md) for physical paths. The
 [indexed log writer](../indexed_log_writer/README.md) and
 [validator](../indexed_log_validator/README.md) establish valid entries. The
 [record writer specification](../../../../transaction-log-exports/src/record_writer/README.md)
@@ -104,3 +105,67 @@ file-only public constructor. Tests do not simulate power loss.
 Follow the [module verification guidance](../README.md#verification-and-performance).
 No index-file throughput measurements are available yet. Buffer reuse and generic
 dispatch describe the implementation, not measured performance gains.
+
+## Dense index layout
+
+The agreed index is a dense list of exclusive record end positions: one `u64`
+for every record in a contiguous prefix of its log file. No separate index-entry
+or collection model type is needed. `IndexWriter`, composed by `IndexedLogWriter`,
+encodes entries into a reusable byte buffer containing only its pending batch.
+Future index readers can seek directly to entries or load a list as `Vec<u64>`;
+they need not retain the entire index merely to resolve a range.
+
+The `.idx` file contains consecutive eight-byte little-endian integers, with
+no per-entry record ID, padding, header or collection-length prefix. Its paired
+`LogFileId` comes from the requested storage path. The entry's ordinal supplies
+its sequence number, so storing that identity again would be redundant. This is
+a binary format, distinct from the human-readable checkpoint JSON. A Rust vector's
+native memory representation must not be treated as its portable file encoding.
+
+For a record belonging to the requested file:
+
+```text
+n = record.sequence_number - log_file_id.first_record_id().sequence_number
+index_entry_byte_position = n * 8
+record_start = 0 if n == 0, otherwise end_positions[n - 1]
+record_end = end_positions[n]
+record_byte_range = record_start..record_end
+```
+
+Positions count bytes from the beginning of the log file. Each end includes the
+complete record's CRC trailer; the next record starts immediately there. Log
+records begin at byte zero with no file header or inter-record padding. Looking
+up an end position needs one entry; finding both start and end needs two adjacent
+entries, except for the first record. No index scan or binary search is needed.
+These formulas describe layout and lookup work, not measured disk latency.
+
+The initial zero boundary is implicit and is not stored. A completed file's
+last record end is in entry 99,999 (the 100,000th entry), at byte offset 799,992
+in the index. Reading that entry supplies the log file's complete record end
+without querying log-file metadata; no extra terminal entry is required.
+
+A full 100,000-record file has 800,000 bytes of index entries (about 781.25 KiB).
+A partial index contains only its actual prefix's entries; unused slots must not
+be interpreted as records. An empty index has no entries, and sequence zero
+remains a real record. The terminal file range permits only 51,616 entries because
+sequences end at `u64::MAX`. End positions need `u64`: 100,000 maximum-size records
+occupy 6,553,500,000 log bytes, exceeding a `u32` offset.
+
+Index data is derived from the log and is rebuildable. `IndexedLogValidator`
+checks whole eight-byte entries, prefix plausibility and actual record boundaries
+and IDs for the newly scanned suffix. The supplied starting boundary certifies
+both earlier prefixes; structural checks on that trusted prefix do not establish
+its original validity. Structural checks
+alone cannot detect every stale or corrupt offset. The log remains authoritative;
+an index endpoint is not evidence of CRC validity, sequence continuity or durable
+storage, and cannot replace a trusted recovery checkpoint. An index may lag the
+log, so a missing entry alone does not establish that the record is absent.
+
+`IndexWriter` owns encoding and file output; `IndexedLogWriter` supplies the offsets
+of accepted records and coordinates output with the paired log. The pair writer
+completes the log batch and its destination flush before beginning index output,
+then flushes the index. Concurrent index readers must account for a partial last
+entry and respect the owner's published boundary. Ordered flushes establish read
+visibility, not an atomic two-file commit or durability. The validator uses the
+same `IndexWriter` to repair a bad/missing index suffix before handover. Historical
+index lookup and range-serving APIs remain future work.

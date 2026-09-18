@@ -2,7 +2,7 @@ use getset::CopyGetters;
 use tokio::{fs::File, io::AsyncWrite};
 use transaction_log_exports::{AsyncSyncData, ExistingRecords, Record, RecordWriter};
 
-use crate::storage::{LogFileId, RECORDS_PER_FILE, RecordEndLocation};
+use crate::streams::{LogFileId, RECORDS_PER_FILE, RecordEndLocation, RecordStartLocation};
 
 use super::{IndexedLogWriteError, indexed_log_writer_state::IndexedLogWriterState};
 use crate::streams::IndexWriter;
@@ -139,16 +139,16 @@ impl<L, I> IndexedLogWriter<L, I> {
         if self.is_full() {
             return Err(IndexedLogWriteError::Full);
         }
-        let expected = match self.buffered_end {
-            Some(end) => end.record_id().next(),
-            None => self.file_id.first_record_id(),
+        let start = match self.buffered_end {
+            Some(end) => end.next_record_start(),
+            None => RecordStartLocation::new(self.file_id.first_record_id(), 0),
         };
+        let expected = start.record_id();
         let actual = record.id();
         if actual != expected {
             return Err(IndexedLogWriteError::UnexpectedRecordId { expected, actual });
         }
-        let position =
-            self.buffered_end.map_or(0, |end| end.position()) + u64::from(record.length());
+        let position = start.position() + u64::from(record.length());
         // The two appends are one logical acceptance. If either unexpectedly
         // fails or unwinds, do not allow a partly updated pair to continue.
         self.state = IndexedLogWriterState::Unusable;

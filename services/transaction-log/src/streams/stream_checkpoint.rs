@@ -1,7 +1,7 @@
 use getset::CopyGetters;
 use serde::{Deserialize, Serialize};
 
-use super::RecordEndLocation;
+use crate::streams::RecordEndLocation;
 
 /// An immutable snapshot of the end of one stream's checkpointed record prefix.
 ///
@@ -27,7 +27,7 @@ use super::RecordEndLocation;
 /// the endpoint, and rejects missing, duplicate or unknown object fields at every
 /// level. These metadata checks do not establish that the checkpoint agrees with
 /// storage or is safe to use for recovery.
-/// [`super::StorageProvider::checkpoint_file_path`] supplies its per-stream path;
+/// [`crate::storage::StorageProvider::checkpoint_file_path`] supplies its per-stream path;
 /// the model itself does not choose a location or perform file I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CopyGetters, Serialize, Deserialize)]
 #[getset(get_copy = "pub")]

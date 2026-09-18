@@ -1,4 +1,5 @@
 use getset::Getters;
+use serde::{Deserialize, Serialize};
 
 use super::{HostnameError, HostnameErrorKind};
 
@@ -7,11 +8,26 @@ use super::{HostnameError, HostnameErrorKind};
 /// Stored in lowercase with surrounding whitespace removed. A final root dot
 /// is preserved, so relative and explicitly absolute names remain distinct.
 /// Valid syntax does not establish DNS existence, reachability or peer identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Getters)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Getters, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Hostname {
     /// The trimmed, lowercase hostname, including a final root dot if supplied.
     #[getset(get = "pub")]
     name: String,
+}
+
+impl TryFrom<String> for Hostname {
+    type Error = HostnameError;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::parse(name)
+    }
+}
+
+impl From<Hostname> for String {
+    fn from(hostname: Hostname) -> Self {
+        hostname.name
+    }
 }
 
 impl Hostname {
