@@ -118,8 +118,9 @@ on allocations or work performed by arbitrary custom Serde implementations.
 Vector capacity may exceed initialized length due to ordinary growth; the limit
 applies to encoded body bytes, not an exact total-memory budget.
 
-No unsafe code is used. This simple API targets control messages and makes no
-throughput or zero-copy claim. Persistent scratch buffers and record batching
+No unsafe code is used. This is not a high-performance codec: it is designed for
+intermittent, non-hot-path use, such as control messages. It makes no throughput
+or zero-copy claim. Persistent scratch buffers and record batching
 are deferred until ownership/use requirements or measurements justify them.
 
 ## Validation
@@ -127,13 +128,18 @@ are deferred until ownership/use requirements or measurements justify them.
 Tests belong alongside the read/write behavior. Cover independent encoded fixtures,
 fragmentation, consecutive messages, owned results, zero-byte bodies, exact size
 limits, malformed encoding, trailing bytes, clean/truncated EOF, encoding failures
-before I/O, partial I/O errors and cancellation/unpolled behavior. Keep ordinary
+before I/O, partial I/O errors and cancellation/unpolled behavior. Also exercise
+wake/resume cycles, buffered read-ahead and explicit flushing, serializer and
+deserializer panics, pinned sources/destinations, and duplex backpressure with
+small transport buffers. Numeric boundaries and malformed values use independent
+literal fixtures rather than relying only on encoder/decoder round trips. Keep ordinary
 tests separate from long benchmarks; there are no message-I/O benchmarks yet.
 
 From the workspace root:
 
 ```sh
 cargo test -p message-io --locked
+cargo test -p message-io --release --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all --check
 cargo doc -p message-io --no-deps --locked

@@ -173,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn preserves_io_error_and_write_zero_after_partial_acceptance() {
         let fixture = [4, 0, 0, 0, 3, b'a', b'b', b'c'];
-        for stop_at in [0, 1, 3, 4, 6] {
+        for stop_at in 0..8 {
             for stop in [Stop::Error, Stop::Zero] {
                 let mut writer = Destination::new(stop_at, stop);
                 let MessageWriteError::Io(error) = writer.write_message("abc").await.unwrap_err()
@@ -194,7 +194,7 @@ mod tests {
     fn cancellation_and_panics_preserve_partial_acceptance() {
         let fixture = [4, 0, 0, 0, 3, b'a', b'b', b'c'];
         let mut context = Context::from_waker(Waker::noop());
-        for stop_at in [0, 1, 3, 4, 6] {
+        for stop_at in 0..8 {
             let mut writer = Destination::new(stop_at, Stop::Pending);
             {
                 let mut future = std::pin::pin!(writer.write_message("abc"));
@@ -235,5 +235,287 @@ mod tests {
         destination.write_message(&message).await.unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(writer, [1, 0, 0, 0, 1]);
+    }
+
+    struct YieldingDestination {
+        bytes: Vec<u8>,
+        chunk: usize,
+        yield_next: bool,
+        yields: usize,
+    }
+
+    impl AsyncWrite for YieldingDestination {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.yield_next {
+                self.yield_next = false;
+                self.yields += 1;
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let count = bytes.len().min(self.chunk);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            self.yield_next = true;
+            Poll::Ready(Ok(count))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn resumes_after_wakes_without_reencoding_or_replaying_bytes() {
+        struct Counted<'a>(&'a Cell<usize>);
+        impl Serialize for Counted<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.set(self.0.get() + 1);
+                serializer.serialize_str("abc")
+            }
+        }
+        for chunk in 1..=8 {
+            let calls = Cell::new(0);
+            let mut writer = YieldingDestination {
+                bytes: Vec::new(),
+                chunk,
+                yield_next: true,
+                yields: 0,
+            };
+            writer.write_message(&Counted(&calls)).await.unwrap();
+            writer.write_message(&false).await.unwrap();
+            assert_eq!(
+                writer.bytes,
+                [4, 0, 0, 0, 3, b'a', b'b', b'c', 1, 0, 0, 0, 0]
+            );
+            assert_eq!(calls.get(), 1);
+            assert!(writer.yields >= 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn encoder_error_after_partial_serialization_writes_nothing() {
+        use serde::ser::SerializeTuple;
+        struct PartialFailure;
+        impl Serialize for PartialFailure {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut tuple = serializer.serialize_tuple(2)?;
+                tuple.serialize_element("already encoded")?;
+                Err(serde::ser::Error::custom("late failure"))
+            }
+        }
+        let mut writer = vec![99];
+        let error = writer.write_message(&PartialFailure).await.unwrap_err();
+        assert!(matches!(error, MessageWriteError::Encode(_)));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<postcard::Error>()
+                .is_some()
+        );
+        assert_eq!(writer, [99]);
+        writer.write_message(&false).await.unwrap();
+        assert_eq!(writer, [99, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn encoder_panic_after_partial_serialization_never_touches_destination() {
+        use serde::ser::SerializeTuple;
+        struct PartialPanic;
+        impl Serialize for PartialPanic {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut tuple = serializer.serialize_tuple(2)?;
+                tuple.serialize_element(&true)?;
+                panic!("encoder panic")
+            }
+        }
+        let mut writer = vec![99];
+        let mut context = Context::from_waker(Waker::noop());
+        {
+            let mut future = std::pin::pin!(writer.write_message(&PartialPanic));
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future
+                    .as_mut()
+                    .poll(&mut context)))
+                .is_err()
+            );
+        }
+        assert_eq!(writer, [99]);
+    }
+
+    #[tokio::test]
+    async fn distinguishes_custom_buffer_error_from_actual_overflow_even_when_swallowed() {
+        use serde::ser::SerializeTuple;
+        struct BufferFailure;
+        impl Serialize for BufferFailure {
+            fn serialize<S: Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("buffer failure"))
+            }
+        }
+        struct SwallowedOverflow<'a>(&'a str);
+        impl Serialize for SwallowedOverflow<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut tuple = serializer.serialize_tuple(1)?;
+                let _ = tuple.serialize_element(self.0);
+                tuple.end()
+            }
+        }
+        let mut writer = Vec::new();
+        assert!(matches!(
+            writer.write_message(&BufferFailure).await,
+            Err(MessageWriteError::Encode(_))
+        ));
+        assert!(matches!(
+            writer
+                .write_message(&SwallowedOverflow(&"a".repeat(1_048_576)))
+                .await,
+            Err(MessageWriteError::TooLarge)
+        ));
+        assert!(writer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_message_can_remain_buffered_until_explicit_flush() {
+        let mut writer = tokio::io::BufWriter::with_capacity(64, Vec::new());
+        writer.write_message("abc").await.unwrap();
+        writer.write_message(&true).await.unwrap();
+        assert!(writer.get_ref().is_empty());
+        assert_eq!(
+            writer.buffer(),
+            &[4, 0, 0, 0, 3, b'a', b'b', b'c', 1, 0, 0, 0, 1]
+        );
+        writer.flush().await.unwrap();
+        assert!(writer.buffer().is_empty());
+        assert_eq!(
+            writer.get_ref(),
+            &[4, 0, 0, 0, 3, b'a', b'b', b'c', 1, 0, 0, 0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_failure_is_separate_from_successful_message_acceptance() {
+        let destination = Destination::new(3, Stop::Error);
+        let mut writer = tokio::io::BufWriter::with_capacity(64, destination);
+        writer.write_message("abc").await.unwrap();
+        assert!(writer.get_ref().bytes.is_empty());
+        let error = writer.flush().await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(4321));
+        assert_eq!(writer.get_ref().bytes, [4, 0, 0]);
+        // The connection owner now discards the buffered destination.
+    }
+
+    #[tokio::test]
+    async fn writes_independent_numeric_and_nested_wire_fixtures() {
+        for (value, expected) in [
+            (0u64, &[1, 0, 0, 0, 0][..]),
+            (127, &[1, 0, 0, 0, 127][..]),
+            (128, &[2, 0, 0, 0, 128, 1][..]),
+            (16_384, &[3, 0, 0, 0, 128, 128, 1][..]),
+            (
+                u64::MAX,
+                &[10, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1][..],
+            ),
+        ] {
+            let mut writer = Vec::new();
+            writer.write_message(&value).await.unwrap();
+            assert_eq!(writer, expected);
+        }
+        let mut writer = Vec::new();
+        writer
+            .write_message(&(128u16, Some("hi"), vec![true, false, true]))
+            .await
+            .unwrap();
+        assert_eq!(writer, [10, 0, 0, 0, 128, 1, 1, 2, b'h', b'i', 3, 1, 0, 1]);
+    }
+
+    #[tokio::test]
+    async fn duplex_backpressure_preserves_many_consecutive_messages_and_clean_eof() {
+        use crate::{MessageReadError, MessageReadExt};
+        for capacity in [1, 3, 4, 17] {
+            let (mut sender, mut receiver) = tokio::io::duplex(capacity);
+            let operation = async {
+                tokio::join!(
+                    async {
+                        for index in 0u32..32 {
+                            let length = [0, 1, 127, 128, 255, 1024][index as usize % 6];
+                            let text = "x".repeat(length);
+                            sender
+                                .write_message(&(index, text, Some(index % 2 == 0)))
+                                .await
+                                .unwrap();
+                        }
+                        sender.shutdown().await.unwrap();
+                    },
+                    async {
+                        for expected in 0u32..32 {
+                            let (index, text, flag) = receiver
+                                .read_message::<(u32, String, Option<bool>)>()
+                                .await
+                                .unwrap();
+                            let length = [0, 1, 127, 128, 255, 1024][expected as usize % 6];
+                            assert_eq!(index, expected);
+                            assert_eq!(text, "x".repeat(length));
+                            assert_eq!(flag, Some(expected % 2 == 0));
+                        }
+                        assert!(matches!(
+                            receiver.read_message::<bool>().await,
+                            Err(MessageReadError::EndOfStream)
+                        ));
+                    }
+                );
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), operation)
+                .await
+                .expect("duplex exchange stalled");
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_duplex_peer_preserves_transport_error() {
+        let (mut writer, reader) = tokio::io::duplex(1);
+        drop(reader);
+        let MessageWriteError::Io(error) = writer.write_message(&true).await.unwrap_err() else {
+            panic!()
+        };
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn pinned_non_unpin_destination_is_supported_without_unsafe() {
+        use std::{cell::RefCell, marker::PhantomPinned};
+        struct PinnedWriter {
+            bytes: RefCell<Vec<u8>>,
+            _pin: PhantomPinned,
+        }
+        impl AsyncWrite for PinnedWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.as_ref()
+                    .get_ref()
+                    .bytes
+                    .borrow_mut()
+                    .extend_from_slice(bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut writer = std::pin::pin!(PinnedWriter {
+            bytes: RefCell::new(Vec::new()),
+            _pin: PhantomPinned
+        });
+        writer.write_message(&true).await.unwrap();
+        assert_eq!(*writer.bytes.borrow(), [1, 0, 0, 0, 1]);
     }
 }
