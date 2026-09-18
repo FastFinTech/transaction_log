@@ -9,6 +9,9 @@ trusted endpoint, repairs index suffixes, supports explicit invalid-log-tail
 removal, and hands over either a partial writer or a completed full file.
 `StreamCheckpoint` represents the certified local log/index boundary as a typed,
 Serde-enabled value; it does not itself load or publish checkpoint files.
+`StreamInitializer` is a scaffold for startup recovery of one stream, with an
+`initialize` method and five placeholder steps. It has no constructor or recovery
+behavior yet.
 
 The owner supplies an empty or validated pair, buffers ordered records, commands
 flushing and synchronization, and explicitly finalizes a full file. Live
@@ -22,6 +25,7 @@ for validation uses the storage provider's named log/index opening methods.
 | --- | --- |
 | [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. |
 | [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Persistence remains deferred. |
+| [Stream initializer](stream_initializer/README.md) | Scaffold for single-stream startup recovery and eventual active-writer handover. No behavior or startup integration is implemented. |
 | [Indexed log writer](indexed_log_writer/README.md) | Append ordered records to a log/index pair; control flushing, synchronization, progress and finalization. Start here for normal output. |
 | [Indexed log validator](indexed_log_validator/README.md) | Validate an existing pair from a supplied trusted boundary, repair its index, explicitly truncate invalid log tails, then hand over a partial writer or completed full file. Start here for recovery. |
 | [Index writer](index_writer/README.md) | Encode offsets into a reusable buffer and send, flush or synchronize an owned file. Shared by the pair writer and validator. |
