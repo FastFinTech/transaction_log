@@ -208,6 +208,10 @@ belongs to it. An unlisted ID returns `ClusteringConfigurationError::UnknownLoca
 moving the unmatched ID into the error. This returns `Clustered(ClusterMembership)`;
 `Singleton` contains no definition or local identity.
 
+The separate [raw input type](../../configuration/clustering/README.md) declares
+environment, CLI and file-document mappings. Conversion from those raw strings
+into these validated types and startup consumption remain deferred.
+
 `ClusterMembership` contains only `local_member_id` and `definition`, exposed by
 borrowing getters. Its internal validation does not repeat definition validation.
 `is_master()` derives the role from the local ID and definition's master ID; false

@@ -16,6 +16,11 @@ their validation errors and the fixed minimum replica count. The
 validation, ownership, comparison and testing contracts. They are not re-exported
 at the clustering root.
 
+Unvalidated input strings live separately under
+[`configuration::clustering`](../configuration/clustering/README.md).
+Field attributes declare environment, CLI and file-document mappings. Conversion
+into the validated types and startup integration remain planned.
+
 Future handshake and runtime modules belong alongside `configuration`, rather
 than inside it. Static configuration establishes valid names, distinct IDs and
 hostnames, and a local identity present in the configured membership. It does not

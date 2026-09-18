@@ -14,6 +14,16 @@ repairs indexes and hands over partial or full files. The service executable is 
 scaffold; startup recovery orchestration, queries, replication and client protocol
 handling remain in development.
 
+The service entry point (`services/transaction-log/src/main.rs`) loads
+the raw clustering inputs from CLI arguments and environment variables. `--help`
+prints generated option descriptions; missing required inputs produce a loading
+error. After loading, it prints `Transaction Log v<version>` to standard output,
+then exits successfully. Domain validation and cluster startup remain planned.
+Cargo embeds the service's inherited workspace package version at compile time;
+the executable does not read a manifest or runtime version setting. CI can assign
+a release version before compilation; automated version assignment and version
+handshakes are not yet implemented.
+
 ## Design priorities
 
 - **Measure the hot path.** Independent reader and writer benchmarks support
@@ -256,10 +266,11 @@ The workspace uses Rust edition 2024 and is currently tested with Rust 1.98.1.
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all --check
-cargo run
+cargo run -- --cluster-mode singleton
+cargo run -- --help
 ```
 
-The application currently prints `Hello world`; it does not start a log server.
+The application currently prints its embedded version; it does not start a log server.
 For VS Code or Devin, install the extensions recommended in
 [.vscode/extensions.json](.vscode/extensions.json), including rust-analyzer,
 CodeLLDB and Dependi. The **Debug Transaction Log** launch configuration builds
@@ -279,6 +290,7 @@ design decisions, safety invariants and optimization evidence.
 | [Clustering and read replicas](CLUSTERING.md) | Planned permanent deployment modes, fixed membership/master, startup gating, replica-loss exit policy and Kubernetes deployment requirements; open replication/read contracts. |
 | [Clustering](services/transaction-log/src/clustering/README.md) | Module boundaries and planned handshake/runtime responsibilities. |
 | [Clustering configuration](services/transaction-log/src/clustering/configuration/README.md) | Implemented shared definitions, local identity, members, parsing/validation and order-independent agreement with typed mismatches; planned startup and endpoint boundaries. |
+| [Raw clustering inputs](services/transaction-log/src/configuration/clustering/README.md) | Raw fields with environment, CLI and file-document attributes; validated conversion and startup integration remain planned. |
 | [Exports crate overview](services/transaction-log-exports/src/lib.rs) | Public types and API entry points. |
 | [Record specification](services/transaction-log-exports/src/record/README.md) | Wire format, ownership, validation and reader integration. |
 | [Writer specification](services/transaction-log-exports/src/record_writer/README.md) | Constructor modes, buffering, completion, cancellation and hot-path rationale. |
