@@ -48,7 +48,11 @@ The public `log_file_path` and `index_file_path` methods share the private
 `log_or_index_file_path` helper for their numeric directory layout and basename.
 Checkpoint and clustering metadata paths do not use that helper.
 All provider methods live together in `storage_provider.rs`, including blocking startup read/write
-methods for `EstablishedClusteringConfiguration`;
+methods for `EstablishedClusteringConfiguration`.
+Shared file-name constants precede the provider type, public operations precede
+private path helpers, and test modules follow the implementation. Metadata read
+limits are named constants scoped to their respective read methods; independent
+size-limit fixtures in tests use the specified byte counts.
 `storage_error.rs` retains path and concrete I/O/JSON
 errors. `read_clustering_configuration` reads root `clustering.json`, returns
 `None` for absent metadata, rejects unpublished staging files, bounds reads to
@@ -81,7 +85,17 @@ metadata tests cover JSON rejection and size limits. The same error contract app
 
 ## Stream checkpoints
 
-The [streams checkpoint module](../streams/README.md#stream-checkpoint-model) owns `StreamCheckpoint`, its Serde representation, certification requirements and publication ordering. Storage owns only the checkpoint file path; checkpoint persistence and startup integration remain deferred.
+The [streams checkpoint module](../streams/README.md#stream-checkpoint-model) owns
+`StreamCheckpoint`, its Serde representation, certification requirements and
+publication ordering. `read_checkpoint(stream_id).await` reads its JSON file with
+a 4 KiB inclusive limit, returning `None` only for a `NotFound` open failure
+(including an absent parent). It creates or modifies nothing. Other I/O, JSON and
+size failures use the shared `StorageError` with the requested path.
+Deserialization validates the model; stream-identity and log/index agreement
+checks belong to recovery. Cancellation publishes no result or storage changes.
+Checkpoint writing and startup integration remain deferred. Same-file provider
+tests cover literal JSON, exact/over-limit input, absent paths, malformed metadata
+and a directory in place of a checkpoint file.
 
 ## Dense index format
 

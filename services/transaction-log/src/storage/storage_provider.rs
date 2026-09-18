@@ -1,12 +1,16 @@
 use super::{StorageConfig, StorageError};
 use crate::clustering::configuration::EstablishedClusteringConfiguration;
-use crate::streams::LogFileId;
+use crate::streams::{LogFileId, StreamCheckpoint};
 use std::{
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 use transaction_log_exports::StreamId;
+
+const FILE_NAME: &str = "clustering.json";
+const PENDING_FILE_NAME: &str = ".clustering.pending";
+
 /// Owns storage configuration, constructs paths, and initializes stream directories.
 ///
 /// Paths follow the fixed decimal layout documented in this module's README.
@@ -135,26 +139,40 @@ impl StorageProvider {
         self.stream_directory(stream_id).join("checkpoint.json")
     }
 
-    /// Shared base layout for initialization and all file-path methods.
-    fn stream_directory(&self, stream_id: StreamId) -> PathBuf {
-        self.root_directory()
-            .join("streams")
-            .join(format!("{stream_id:04}"))
-    }
+    /// Reads one stream's checkpoint, returning `None` when its path is absent.
+    ///
+    /// Reads at most 4 KiB plus one byte to detect oversized metadata. Malformed
+    /// JSON and other I/O failures are errors. Creates or modifies nothing.
+    /// Deserialization validates the model; the recovery owner must check the
+    /// checkpoint's stream identity and agreement with the actual log/index pair.
+    pub async fn read_checkpoint(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<Option<StreamCheckpoint>, StorageError> {
+        use tokio::io::AsyncReadExt;
 
-    /// Keeps directory grouping and numeric filenames identical for log/index pairs.
-    fn log_or_index_file_path(&self, id: LogFileId, extension: &str) -> PathBuf {
-        let file_number = format!("{:015}", id.file_number());
-        let mut path = self.stream_directory(id.stream_id());
+        const MAX_CHECKPOINT_BYTES: u64 = 4096;
 
-        // Valid file numbers fit in 15 ASCII decimal digits. Their first twelve
-        // digits form four range directories; the final three select one of up
-        // to 1,000 log/index pairs in that leaf. Keep the full number as basename.
-        for start in (0..12).step_by(3) {
-            path.push(&file_number[start..start + 3]);
+        let path = self.checkpoint_file_path(stream_id);
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(StorageError::io(path, source)),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_CHECKPOINT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|source| StorageError::io(path.clone(), source))?;
+        if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
+            return Err(StorageError::TooLarge {
+                path,
+                max_bytes: MAX_CHECKPOINT_BYTES,
+            });
         }
-        path.push(format!("{file_number}.{extension}"));
-        path
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| StorageError::Json { path, source })
     }
 
     /// Loads stored clustering settings, returning `None` only when the file is absent.
@@ -164,6 +182,8 @@ impl StorageProvider {
     pub fn read_clustering_configuration(
         &self,
     ) -> Result<Option<EstablishedClusteringConfiguration>, StorageError> {
+        const MAX_CLUSTERING_CONFIGURATION_BYTES: u64 = 4096;
+
         let path = self.root_directory().join(FILE_NAME);
         let file = match fs::File::open(&path) {
             Ok(file) => file,
@@ -186,13 +206,13 @@ impl StorageProvider {
             Err(source) => return Err(StorageError::io(path, source)),
         };
         let mut bytes = Vec::new();
-        file.take(MAX_BYTES + 1)
+        file.take(MAX_CLUSTERING_CONFIGURATION_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(|source| StorageError::io(path.clone(), source))?;
-        if bytes.len() as u64 > MAX_BYTES {
+        if bytes.len() as u64 > MAX_CLUSTERING_CONFIGURATION_BYTES {
             return Err(StorageError::TooLarge {
                 path,
-                max_bytes: MAX_BYTES,
+                max_bytes: MAX_CLUSTERING_CONFIGURATION_BYTES,
             });
         }
         serde_json::from_slice(&bytes)
@@ -245,6 +265,27 @@ impl StorageProvider {
             .and_then(|directory| directory.sync_all())
             .map_err(|source| StorageError::io(root.to_owned(), source))?;
         Ok(())
+    }
+    /// Shared base layout for initialization and all file-path methods.
+    fn stream_directory(&self, stream_id: StreamId) -> PathBuf {
+        self.root_directory()
+            .join("streams")
+            .join(format!("{stream_id:04}"))
+    }
+
+    /// Keeps directory grouping and numeric filenames identical for log/index pairs.
+    fn log_or_index_file_path(&self, id: LogFileId, extension: &str) -> PathBuf {
+        let file_number = format!("{:015}", id.file_number());
+        let mut path = self.stream_directory(id.stream_id());
+
+        // Valid file numbers fit in 15 ASCII decimal digits. Their first twelve
+        // digits form four range directories; the final three select one of up
+        // to 1,000 log/index pairs in that leaf. Keep the full number as basename.
+        for start in (0..12).step_by(3) {
+            path.push(&file_number[start..start + 3]);
+        }
+        path.push(format!("{file_number}.{extension}"));
+        path
     }
 }
 
@@ -501,9 +542,63 @@ mod tests {
     }
 }
 
-const FILE_NAME: &str = "clustering.json";
-const PENDING_FILE_NAME: &str = ".clustering.pending";
-const MAX_BYTES: u64 = 4096;
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reads_literal_checkpoint_and_enforces_the_inclusive_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let path = provider.checkpoint_file_path(StreamId::MAX);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let json = r#"{"end":{"record_id":{"stream_id":4095,"sequence_number":18446744073709551615},"position":3382654560}}"#;
+        let mut bytes = json.as_bytes().to_vec();
+        bytes.resize(4096, b' ');
+        fs::write(&path, &bytes).unwrap();
+        let checkpoint = provider
+            .read_checkpoint(StreamId::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.end().record_id().stream_id(), StreamId::MAX);
+        assert_eq!(
+            checkpoint.end().record_id().sequence_number().get(),
+            u64::MAX
+        );
+        assert_eq!(checkpoint.end().position(), 3_382_654_560);
+        bytes.push(b' ');
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(provider.read_checkpoint(StreamId::MAX).await,
+            Err(StorageError::TooLarge { path: failed, max_bytes: 4096 }) if failed == path));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn distinguishes_absence_from_invalid_json_and_io_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let path = provider.checkpoint_file_path(StreamId::MIN);
+        assert_eq!(provider.read_checkpoint(StreamId::MIN).await.unwrap(), None);
+        assert!(!path.parent().unwrap().exists());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for json in [
+            "",
+            "{}",
+            "null",
+            r#"{"end":{"record_id":{"stream_id":0,"sequence_number":0},"position":16}} trailing"#,
+        ] {
+            fs::write(&path, json).unwrap();
+            assert!(matches!(provider.read_checkpoint(StreamId::MIN).await,
+                Err(StorageError::Json { path: failed, .. }) if failed == path));
+            assert_eq!(fs::read_to_string(&path).unwrap(), json);
+        }
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(provider.read_checkpoint(StreamId::MIN).await,
+            Err(StorageError::Io { path: failed, .. }) if failed == path));
+    }
+}
 
 #[cfg(test)]
 mod clustering_configuration_tests {
@@ -591,7 +686,7 @@ mod clustering_configuration_tests {
             ));
             assert_eq!(fs::read(&path).unwrap(), fixture);
         }
-        fs::write(&path, vec![b' '; MAX_BYTES as usize + 1]).unwrap();
+        fs::write(&path, vec![b' '; 4097]).unwrap();
         match provider.read_clustering_configuration().unwrap_err() {
             StorageError::TooLarge {
                 path: rejected,

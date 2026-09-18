@@ -2,9 +2,10 @@
 
 `StreamInitializer` is the planned startup recovery coordinator for **one stream**.
 It is re-exported as `streams::StreamInitializer`. The type and async method
-skeletons exist, but recovery is not implemented. There is no constructor,
-recovery state or app startup integration. The private placeholder field prevents
-construction before those contracts are defined.
+skeletons exist, and checkpoint loading is implemented. `new(&StorageProvider,
+StreamId)` selects one stream, borrows its provider and performs no I/O. The
+initializer retains the successfully loaded `Option<StreamCheckpoint>` privately.
+Subsequent recovery and app startup integration remain unimplemented.
 
 ## Method skeletons
 
@@ -18,11 +19,23 @@ errors with `?` and returning `Result<IndexedLogWriter<File>>`:
 4. `advance_checkpoint`: synchronize covered data and publish the checkpoint.
 5. `prepare_active_writer`: hand over a partial pair or create a fresh pair.
 
-Every step contains `todo!()`; calling `initialize` would panic at step one.
+Only `load_checkpoint` is implemented; the other steps contain `todo!()`.
+Calling `initialize` propagates loading errors or panics at file discovery.
 The intermediate methods provisionally return `anyhow::Result<()>`. Recovery
 state, concrete error contracts and per-file sequencing will be settled during
 implementation. In particular, the skeleton does not yet implement incremental
 checkpoint publication after each completed file.
+
+### Checkpoint loading
+
+`load_checkpoint` calls the provider's async `read_checkpoint`. A missing path
+means no checkpoint and creates nothing. Malformed JSON, oversized metadata and
+other I/O failures propagate with their concrete `StorageError` and path intact.
+The initializer rejects a checkpoint belonging to another stream, reporting the
+path and both stream IDs. It replaces its retained checkpoint only after a
+successful read and identity check; failure preserves previous state and aborts
+`initialize` before file discovery. Cancellation likewise cannot accept a partial
+result. Loading does not inspect log/index contents or certify readiness.
 
 ## Intended responsibility
 
@@ -68,8 +81,8 @@ to salvage records across a gap. Cluster coordination will subsequently reload
 the required data. Local initialization does not perform that synchronization
 or establish cluster readiness; those remain separate lifecycle responsibilities.
 
-Checkpoint persistence, discovery of consecutive files, fresh-pair creation,
-failure/cancellation handling and the constructor/state API remain to be
+Checkpoint publication, discovery of consecutive files, fresh-pair creation,
+and recovery failure/cancellation handling remain to be
 designed and implemented. The recovery policy above is agreed, but the scaffold
 still performs no deletion or truncation. No workers, locks or concurrency
 policy have been selected.
@@ -80,8 +93,10 @@ performance measurements or optimization claims.
 ## Source and validation
 
 `stream_initializer.rs` owns the type; `mod.rs` includes this specification and
-re-exports it. There is no observable behavior to unit-test yet. Check the scaffold
-with service compilation, formatting, Clippy and Rustdoc. When recovery is added,
+re-exports it. Same-file tests cover absence without side effects, a literal
+checkpoint boundary, wrong-stream rejection and concrete storage errors.
+Provider tests cover bounded reads, malformed JSON and filesystem failures.
+Check with service tests, formatting, Clippy and Rustdoc. When recovery is added,
 keep tests beside its implementation and cover checkpoints, file boundaries,
 index repair, gaps, corrupt input and interrupted recovery using independent
 fixtures and observable filesystem results.
