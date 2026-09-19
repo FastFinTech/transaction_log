@@ -1,6 +1,6 @@
 use super::{StorageConfig, StorageError};
 use crate::clustering::configuration::EstablishedClusteringConfiguration;
-use crate::streams::{LogFileId, StreamCheckpoint};
+use crate::streams::{LogFileId, LogFileNumber, StreamCheckpoint};
 use std::{
     fs,
     io::{self, Read, Write},
@@ -88,6 +88,146 @@ impl StorageProvider {
         self.log_or_index_file_path(id, "idx")
     }
 
+    /// Finds the highest existing canonical `.log` file for one stream.
+    ///
+    /// Searches range directories in descending order, backtracking through empty
+    /// branches. An absent stream directory or a tree without logs returns `None`.
+    /// Indexes, unrelated names, misplaced logs and symbolic links are ignored.
+    /// Empty log files count; contents, continuity and checkpoints are not checked.
+    ///
+    /// The caller must exclude concurrent tree changes. Directory enumeration and
+    /// entry-type failures propagate with their paths. This creates nothing and
+    /// retains only pending siblings along the fixed-depth search, not all log IDs.
+    pub async fn maximum_log_file(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<Option<LogFileId>, StorageError> {
+        struct PendingDirectory {
+            /// Directory to enumerate next: the stream base or a range directory.
+            path: PathBuf,
+            /// Number of three-digit range components below the stream base.
+            /// Zero is the stream base; four is a leaf containing log/index files.
+            depth: usize,
+            /// Concatenated range components interpreted as a number, without
+            /// the file number's remaining digits. For `000/000/000/001`, this
+            /// is 1 at depth four, covering file numbers 1,000 through 1,999.
+            /// At depth zero it is 0 and no range component has been selected.
+            prefix: u64,
+        }
+
+        /// Enumerates valid child ranges in descending order. Only an absent
+        /// stream base is empty; failures in discovered branches propagate.
+        async fn range_directories(
+            directory: &PendingDirectory,
+        ) -> Result<Vec<PendingDirectory>, StorageError> {
+            let mut entries = match tokio::fs::read_dir(&directory.path).await {
+                Ok(entries) => entries,
+                Err(source) if directory.depth == 0 && source.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                Err(source) => return Err(StorageError::io(directory.path.clone(), source)),
+            };
+            let mut children = Vec::new();
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|source| StorageError::io(directory.path.clone(), source))?
+            {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if name.len() != 3 || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                    continue;
+                }
+                let prefix = directory.prefix * 1000 + name.parse::<u64>().unwrap();
+                let first_file = prefix * 1000u64.pow(4 - directory.depth as u32);
+                if first_file > LogFileNumber::MAX.get() {
+                    continue;
+                }
+                let kind = entry
+                    .file_type()
+                    .await
+                    .map_err(|source| StorageError::io(entry.path(), source))?;
+                if kind.is_dir() {
+                    children.push(PendingDirectory {
+                        path: entry.path(),
+                        depth: directory.depth + 1,
+                        prefix,
+                    });
+                }
+            }
+            children.sort_unstable_by_key(|directory| std::cmp::Reverse(directory.prefix));
+            Ok(children)
+        }
+
+        /// Selects the highest canonical regular log in one leaf directory.
+        async fn maximum_log_in_directory(
+            provider: &StorageProvider,
+            stream_id: StreamId,
+            path: &Path,
+        ) -> Result<Option<LogFileId>, StorageError> {
+            let mut entries = tokio::fs::read_dir(path)
+                .await
+                .map_err(|source| StorageError::io(path.to_owned(), source))?;
+            let mut maximum = None;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|source| StorageError::io(path.to_owned(), source))?
+            {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let Some(number) = name.strip_suffix(".log") else {
+                    continue;
+                };
+                if number.len() != 15 || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+                    continue;
+                }
+                let Ok(number) = LogFileNumber::new(number.parse().unwrap()) else {
+                    continue;
+                };
+                let id = LogFileId::new(stream_id, number);
+                if provider.log_file_path(id) != entry.path() {
+                    continue;
+                }
+                let kind = entry
+                    .file_type()
+                    .await
+                    .map_err(|source| StorageError::io(entry.path(), source))?;
+                // All candidates are constructed with this search's stream ID.
+                if kind.is_file()
+                    && maximum
+                        .is_none_or(|previous: LogFileId| id.file_number() > previous.file_number())
+                {
+                    maximum = Some(id);
+                }
+            }
+            Ok(maximum)
+        }
+
+        let mut pending = vec![PendingDirectory {
+            path: self.stream_directory(stream_id),
+            depth: 0,
+            prefix: 0,
+        }];
+        while let Some(directory) = pending.pop() {
+            if directory.depth == 4 {
+                if let Some(id) = maximum_log_in_directory(self, stream_id, &directory.path).await?
+                {
+                    return Ok(Some(id));
+                }
+            } else {
+                let children = range_directories(&directory).await?;
+                // Reverse descending children so pop() visits the highest first.
+                pending.extend(children.into_iter().rev());
+            }
+        }
+        Ok(None)
+    }
+
     /// Opens an existing log for validation and explicitly requested tail repair.
     ///
     /// Uses read/write access without creating, truncating or append mode. The
@@ -127,6 +267,38 @@ impl StorageProvider {
             .open(&path)
             .await
             .map_err(|source| StorageError::io(path, source))
+    }
+
+    /// Removes a log and its paired index, accepting already-absent files.
+    ///
+    /// Removes the log first, then the index; it never removes directories.
+    /// Other errors stop cleanup, so partial deletion is possible and retryable.
+    /// Requires exclusive recovery ownership. Unix synchronizes the affected
+    /// directory and its ancestors through the configured root after deletion;
+    /// portable directory durability is not provided on Windows.
+    pub async fn remove_log_and_index(&self, id: LogFileId) -> Result<(), StorageError> {
+        let mut removed = false;
+        for path in [self.log_file_path(id), self.index_file_path(id)] {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed = true,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => return Err(StorageError::io(path, source)),
+            }
+        }
+        if removed {
+            self.sync_log_file_directory(id)?;
+        }
+        Ok(())
+    }
+
+    /// Synchronizes a pair's directory entries, not its log/index data.
+    ///
+    /// Blocking Unix I/O synchronizes its parent and ancestors through the
+    /// configured root. Windows has no portable directory-sync implementation.
+    /// The caller must synchronize both files separately before checkpointing.
+    pub fn sync_log_file_directory(&self, id: LogFileId) -> Result<(), StorageError> {
+        let path = self.log_file_path(id);
+        self.sync_directories_to_root(path.parent().unwrap())
     }
 
     /// Constructs the absolute `checkpoint.json` path for one stream's checkpoint.
@@ -173,6 +345,41 @@ impl StorageProvider {
         serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|source| StorageError::Json { path, source })
+    }
+
+    /// Publishes or replaces a supplied checkpoint using synchronized staging JSON.
+    ///
+    /// Blocking startup I/O requires an existing stream directory and exclusive
+    /// ownership. The caller certifies and synchronizes the covered log/index
+    /// prefix first. This operation does not compare checkpoints or validate logs.
+    /// `.checkpoint.pending` is never loaded as a checkpoint and may be overwritten
+    /// after an interrupted attempt. After syncing its contents, rename replaces
+    /// `checkpoint.json`; Unix then syncs ancestors through the configured root.
+    /// Windows directory durability and the root's own parent are not synchronized.
+    /// Errors may leave staging or an already-published checkpoint; reread before
+    /// recovery. There is no async cancellation point within this operation.
+    pub fn write_checkpoint(&self, checkpoint: &StreamCheckpoint) -> Result<(), StorageError> {
+        let stream_id = checkpoint.end().record_id().stream_id();
+        let path = self.checkpoint_file_path(stream_id);
+        let bytes = serde_json::to_vec(checkpoint).map_err(|source| StorageError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        let directory = self.stream_directory(stream_id);
+        let pending = directory.join(".checkpoint.pending");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&pending)
+            .map_err(|source| StorageError::io(pending.clone(), source))?;
+        file.write_all(&bytes)
+            .map_err(|source| StorageError::io(pending.clone(), source))?;
+        file.sync_all()
+            .map_err(|source| StorageError::io(pending.clone(), source))?;
+        drop(file);
+        fs::rename(&pending, &path).map_err(|source| StorageError::io(path, source))?;
+        self.sync_directories_to_root(&directory)
     }
 
     /// Loads stored clustering settings, returning `None` only when the file is absent.
@@ -266,6 +473,22 @@ impl StorageProvider {
             .map_err(|source| StorageError::io(root.to_owned(), source))?;
         Ok(())
     }
+    /// Synchronizes directory links inside this provider's configured root only.
+    fn sync_directories_to_root(&self, directory: &Path) -> Result<(), StorageError> {
+        #[cfg(unix)]
+        for path in directory.ancestors() {
+            fs::File::open(path)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| StorageError::io(path.to_owned(), source))?;
+            if path == self.root_directory() {
+                break;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = directory;
+        Ok(())
+    }
+
     /// Shared base layout for initialization and all file-path methods.
     fn stream_directory(&self, stream_id: StreamId) -> PathBuf {
         self.root_directory()
@@ -299,6 +522,103 @@ mod tests {
     use crate::streams::LogFileNumber;
 
     use super::{LogFileId, StorageConfig, StorageProvider, StreamId};
+
+    #[tokio::test]
+    async fn maximum_log_search_backtracks_past_empty_and_index_only_branches() {
+        let temporary = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(temporary.path().into()).unwrap());
+        assert_eq!(
+            provider.maximum_log_file(StreamId::MIN).await.unwrap(),
+            None
+        );
+        assert!(!temporary.path().join("streams").exists());
+        let stream = temporary.path().join("streams/0000");
+        fs::create_dir_all(stream.join("184/467/440/737")).unwrap();
+        fs::write(stream.join("184/467/440/737/184467440737095.idx"), b"index").unwrap();
+        fs::create_dir_all(stream.join("001/000/000/000")).unwrap();
+        let leaf = stream.join("000/000/000/001");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(leaf.join("000000000001234.log"), b"").unwrap();
+        fs::write(leaf.join("000000000001999.log"), b"unvalidated").unwrap();
+        fs::create_dir_all(stream.join("000/000/000/002")).unwrap();
+        let expected = LogFileId::new(StreamId::MIN, LogFileNumber::new(1999).unwrap());
+        assert_eq!(
+            provider.maximum_log_file(StreamId::MIN).await.unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            fs::read(provider.log_file_path(expected)).unwrap(),
+            b"unvalidated"
+        );
+        assert_eq!(
+            provider.maximum_log_file(StreamId::MAX).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn maximum_log_search_handles_every_directory_carry_and_terminal_number() {
+        let temporary = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(temporary.path().into()).unwrap());
+        for number in [
+            0,
+            999,
+            1000,
+            999_999,
+            1_000_000,
+            999_999_999,
+            1_000_000_000,
+            999_999_999_999,
+            1_000_000_000_000,
+            LogFileNumber::MAX.get(),
+        ] {
+            let id = LogFileId::new(StreamId::MAX, LogFileNumber::new(number).unwrap());
+            let path = provider.log_file_path(id);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"").unwrap();
+            assert_eq!(
+                provider.maximum_log_file(StreamId::MAX).await.unwrap(),
+                Some(id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_log_search_ignores_noncanonical_entries_and_reports_io_errors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(temporary.path().into()).unwrap());
+        let stream = temporary.path().join("streams/0000");
+        let leaf = stream.join("000/000/000/000");
+        fs::create_dir_all(&leaf).unwrap();
+        for name in [
+            "1.log",
+            "00000000000000x.log",
+            "000000000001000.log",
+            "000000000000999.idx",
+            "999999999999999.log",
+            "notes",
+        ] {
+            fs::write(leaf.join(name), b"preserve").unwrap();
+        }
+        fs::create_dir(leaf.join("000000000000998.log")).unwrap();
+        fs::create_dir_all(stream.join("junk/000/000/000")).unwrap();
+        fs::create_dir_all(stream.join("999/999/999/999")).unwrap();
+        assert_eq!(
+            provider.maximum_log_file(StreamId::MIN).await.unwrap(),
+            None
+        );
+        fs::write(leaf.join("000000000000000.log"), b"").unwrap();
+        assert_eq!(
+            provider.maximum_log_file(StreamId::MIN).await.unwrap(),
+            Some(LogFileId::new(StreamId::MIN, LogFileNumber::MIN))
+        );
+
+        let obstructed = temporary.path().join("streams/4095");
+        fs::write(&obstructed, b"not a directory").unwrap();
+        let error = provider.maximum_log_file(StreamId::MAX).await.unwrap_err();
+        assert_eq!(error.path(), obstructed);
+        assert!(matches!(error, super::StorageError::Io { .. }));
+    }
 
     #[test]
     fn paths_match_the_layout_at_every_group_boundary() {
@@ -545,6 +865,86 @@ mod tests {
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_publication_replaces_metadata_and_reuses_interrupted_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let path = provider.checkpoint_file_path(StreamId::MIN);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first_json =
+            r#"{"end":{"record_id":{"stream_id":0,"sequence_number":0},"position":16}}"#;
+        let next_json =
+            r#"{"end":{"record_id":{"stream_id":0,"sequence_number":1},"position":32}}"#;
+        let first: StreamCheckpoint = serde_json::from_str(first_json).unwrap();
+        let next: StreamCheckpoint = serde_json::from_str(next_json).unwrap();
+        provider.write_checkpoint(&first).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), first_json);
+        let pending = path.parent().unwrap().join(".checkpoint.pending");
+        fs::write(&pending, b"interrupted metadata").unwrap();
+        assert_eq!(
+            provider.read_checkpoint(StreamId::MIN).await.unwrap(),
+            Some(first)
+        );
+        provider.write_checkpoint(&next).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), next_json);
+        assert_eq!(
+            provider.read_checkpoint(StreamId::MIN).await.unwrap(),
+            Some(next)
+        );
+        assert!(!pending.exists());
+
+        fs::create_dir(&pending).unwrap();
+        let error = provider.write_checkpoint(&first).unwrap_err();
+        assert_eq!(error.path(), pending);
+        assert_eq!(fs::read_to_string(path).unwrap(), next_json);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_publication_requires_existing_parents_and_does_not_load_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("absent");
+        let provider = StorageProvider::new(StorageConfig::new(root.clone()).unwrap());
+        let checkpoint: StreamCheckpoint = serde_json::from_str(
+            r#"{"end":{"record_id":{"stream_id":0,"sequence_number":0},"position":16}}"#,
+        )
+        .unwrap();
+        assert!(provider.write_checkpoint(&checkpoint).is_err());
+        assert!(!root.exists());
+        let path = provider.checkpoint_file_path(StreamId::MIN);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let pending = path.parent().unwrap().join(".checkpoint.pending");
+        fs::write(pending, b"never certified").unwrap();
+        assert_eq!(provider.read_checkpoint(StreamId::MIN).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn pair_removal_is_idempotent_handles_orphan_indexes_and_preserves_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let file = LogFileId::new(StreamId::MIN, LogFileNumber::MIN);
+        provider.remove_log_and_index(file).await.unwrap();
+        assert!(!directory.path().join("streams").exists());
+        let log = provider.log_file_path(file);
+        let index = provider.index_file_path(file);
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&index, b"orphan").unwrap();
+        provider.remove_log_and_index(file).await.unwrap();
+        assert!(!index.exists());
+        fs::write(&log, b"discard").unwrap();
+        fs::write(&index, b"discard").unwrap();
+        provider.remove_log_and_index(file).await.unwrap();
+        provider.remove_log_and_index(file).await.unwrap();
+        assert!(!log.exists());
+        assert!(!index.exists());
+        assert!(log.parent().unwrap().exists());
+        fs::write(&log, b"discard").unwrap();
+        fs::create_dir(&index).unwrap();
+        let error = provider.remove_log_and_index(file).await.unwrap_err();
+        assert_eq!(error.path(), index);
+        assert!(!log.exists());
+        assert!(index.is_dir());
+    }
 
     #[tokio::test]
     async fn reads_literal_checkpoint_and_enforces_the_inclusive_size_limit() {

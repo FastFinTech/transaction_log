@@ -1,7 +1,7 @@
 use thiserror::Error;
 use transaction_log_exports::{RecordId, RecordReadError};
 
-/// Content that invalidates the suffix after the report's last accepted record.
+/// Content that invalidates the suffix after the last accepted record.
 ///
 /// File I/O failures are separate operation errors and never authorize truncation.
 #[derive(Debug, Error)]

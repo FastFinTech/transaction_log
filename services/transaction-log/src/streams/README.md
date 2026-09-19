@@ -4,19 +4,19 @@ This application module implements `IndexWriter`, buffered dense-index file
 output, and `IndexedLogWriter`, the append lifecycle of one stream's log file
 and its paired index. The pair writer composes the index writer and the exports
 crate's `RecordWriter` rather than implementing either encoding/output layer.
-`IndexedLogValidator` supplies the recovery boundary: it validates from a supplied
-trusted endpoint, repairs index suffixes, supports explicit invalid-log-tail
-removal, and hands over either a partial writer or a completed full file.
+`IndexedLogValidator` composes the focused log/index validators in
+`validation`, returning a synchronized endpoint and append-positioned files for a
+partial pair. Startup orchestration and writer construction remain separate work.
 `StreamCheckpoint` represents the certified local log/index boundary as a typed,
 Serde-enabled value; it does not itself load or publish checkpoint files.
-`StreamInitializer` is a scaffold for startup recovery of one stream, with an
-`initialize` method and five steps. Construction and checkpoint loading are
-implemented; the remaining four steps are placeholders.
+`StreamInitializer` is a disabled scaffold for startup recovery of one stream.
+Its source is commented out and is not declared in this module. Adapting it to the
+current validator, completing writer handover and startup integration remain deferred.
 
 The owner supplies an empty or validated pair, buffers ordered records, commands
 flushing and synchronization, and explicitly finalizes a full file. Live
-subscriptions, historical requests, scheduling, checkpoint publication and
-multi-file startup/rotation coordination remain future work. File acquisition
+subscriptions, historical requests, scheduling, runtime checkpoint updates,
+startup integration and live file rotation remain future work. File acquisition
 for validation uses the storage provider's named log/index opening methods.
 
 ## Where to start
@@ -24,26 +24,35 @@ for validation uses the storage provider's named log/index opening methods.
 | Component | Responsibility |
 | --- | --- |
 | [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. |
-| [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Persistence remains deferred. |
-| [Stream initializer](stream_initializer/README.md) | Single-stream checkpoint loading and scaffold for subsequent recovery and active-writer handover. Startup integration remains deferred. |
+| [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write are implemented; initializer advancement is disabled. |
+| [Stream initializer](stream_initializer/README.md) | Disabled scaffold and requirements for single-stream recovery, later-file cleanup and checkpoint publication. |
 | [Indexed log writer](indexed_log_writer/README.md) | Append ordered records to a log/index pair; control flushing, synchronization, progress and finalization. Start here for normal output. |
-| [Indexed log validator](indexed_log_validator/README.md) | Validate an existing pair from a supplied trusted boundary, repair its index, explicitly truncate invalid log tails, then hand over a partial writer or completed full file. Start here for recovery. |
+| [Indexed log validator](validation/indexed_log_validator/README.md) | Recover and synchronize one existing pair from a supplied trusted boundary. Return its endpoint and append-positioned files when partial. Start here for recovery. |
 | [Index writer](index_writer/README.md) | Encode offsets into a reusable buffer and send, flush or synchronize an owned file. Shared by the pair writer and validator. |
+| [Validation](validation/README.md) | Focused log and index recovery, their combined validator, and shared file capabilities and test support. Startup integration remains deferred. |
+
+Log and index validation accept Tokio files and explicit file wrappers through
+`ValidationFile`, re-exported from both `streams` and `streams::validation`.
+The [validation specification](validation/README.md#shared-file-capabilities) owns
+the common capability and completion contracts. Index validation additionally
+requires `AsyncWrite`; the log result retains its file in `ValidatedLogFile<F>`.
 
 `stream_checkpoint.rs` directly owns the checkpoint model and its same-file tests.
 The writer and validator folders keep their components, supporting types and detailed specifications
 together; tests remain in the source file of the behavior they exercise.
 The component `mod.rs` files contain declarations, README inclusion and re-exports.
 This top-level `mod.rs` preserves the public imports, including
-`streams::IndexWriter`, `streams::IndexedLogWriter` and
-`streams::IndexedLogValidator` and `streams::StreamCheckpoint`. Location types
+`streams::IndexWriter`, `streams::IndexedLogWriter`,
+`streams::IndexedLogValidator` and `streams::StreamCheckpoint`.
+`IndexedLogValidationError` and `ValidatedFilePair`
+are also re-exported. Location types
 are available through both `streams::location` and top-level streams re-exports;
 the writer/validator component modules remain private.
 
 The index writer is a sibling because both normal appending and index repair use
 it. Recovery-only findings, errors and completion metadata live with the
-validator. The validator hands ownership to the pair
-writer after establishing and synchronizing the append boundary.
+validation module. The validator returns owned files after establishing and
+synchronizing the append boundary; constructing the pair writer belongs to its caller.
 
 ## Shared contracts
 
@@ -147,7 +156,7 @@ serialized representation.
 `StreamCheckpoint::new(end)` is an infallible data constructor. It does not
 claim to validate the relationship between the record and its supplied position,
 and it does not add a partial numeric check in place of inspecting actual storage.
-The future checkpoint owner must establish the complete contract when producing
+The checkpoint/recovery owner must establish the complete contract when producing
 or loading a trusted recovery checkpoint.
 
 A checkpoint published for recovery certifies a contiguous prefix of valid records
@@ -156,9 +165,9 @@ CRC, stream identity, sequence continuity and the corresponding exact record end
 offsets are established. Synchronize the covered log data, then the index data,
 before durably publishing the checkpoint. It may lag this durable pair, but must
 never lead either file. Constructing the model establishes none of those facts.
-Checkpoint loading and stream-identity checking are implemented by the initializer.
-Publication, advancement and startup integration remain future
-work. `IndexedLogValidator` accepts the explicitly supplied trusted endpoint; it
+Storage implements checkpoint reading and publication. Stream-identity checking
+and advancement belong to the currently disabled initializer; startup integration
+remains future work. `IndexedLogValidator` accepts the explicitly supplied trusted endpoint; it
 does not load or choose the checkpoint itself. It checks prefix presence and the
 final certified index entry's agreement with that endpoint, without revalidating
 earlier records or index entries. It validates and repairs the suffix. A missing
@@ -186,8 +195,8 @@ assert_eq!(serde_json::from_slice::<StreamCheckpoint>(&bytes)?, checkpoint);
 at `{root}/streams/{stream_id:04}/checkpoint.json`. The path depends only on the
 stream, so advancing across log-file ranges does not change the checkpoint's
 location. Initialization creates its parent directory but no checkpoint file.
-The initializer checks that the decoded checkpoint's stream ID matches the
-requested stream; agreement with the actual file pair requires separate validation.
+The planned initializer must check that the decoded checkpoint's stream ID matches
+the requested stream; agreement with the actual pair requires separate validation.
 
 ### Planned historical-read availability
 
@@ -240,8 +249,10 @@ Use `serde_json::to_vec_pretty(&checkpoint)` to prepare bytes for asynchronous
 file output, and `serde_json::from_slice::<StreamCheckpoint>(&bytes)` to decode
 them. The same traits also support `to_writer_pretty` and `from_reader` for
 synchronous `std::io` destinations/sources. These codecs do not flush, sync or
-atomically publish a checkpoint file. Those operations belong to the future
-persistence owner, which must publish only after covered log and index data are durable.
+atomically publish a checkpoint file. The storage provider implements
+publication; the initializer certifies and synchronizes the covered log/index
+prefix first. See the initializer and storage specifications for failure and
+platform-specific directory-durability contracts.
 
 Fields are required; missing, duplicate or unknown object fields are errors,
 including inside the endpoint and its nested record ID. There are no default-zero

@@ -50,8 +50,8 @@ pub struct IndexedLogWriter<L, I = File> {
     flushed_end: Option<RecordEndLocation>,
     /// Last complete record covered by a successful synchronization of both outputs.
     ///
-    /// Starts as `None`, including on resumption: validation does not establish
-    /// durability. After an I/O failure, this remains the last known success.
+    /// Starts as `None`, including on resumption: construction does not record
+    /// earlier synchronization. After an I/O failure, this remains the last known success.
     #[getset(get_copy = "pub")]
     synced_end: Option<RecordEndLocation>,
     log: RecordWriter<L, ExistingRecords>,
@@ -76,7 +76,7 @@ impl<L> IndexedLogWriter<L> {
 impl<L, I> IndexedLogWriter<L, I> {
     /// Takes ownership at the end of an empty or validated contiguous file prefix.
     ///
-    /// Application-internal handover used by the validator after repair. `end` must belong
+    /// Application-internal handover for a recovery owner after repair. `end` must belong
     /// to `file_id`, follow its last complete record, and cover a contiguous prefix
     /// starting at the file's first assigned ID. The index must have exactly one
     /// correct entry per record. Invalid tails must already have been repaired.

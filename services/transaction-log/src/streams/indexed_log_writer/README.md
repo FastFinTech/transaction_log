@@ -21,7 +21,7 @@ Read the [shared stream contracts](../README.md#shared-contracts),
 [record writer specification](../../../../transaction-log-exports/src/record_writer/README.md)
 for the underlying formats and ownership contracts. The sibling
 [index writer](../index_writer/README.md) owns offset output; the
-[validator](../indexed_log_validator/README.md) establishes recovery handovers.
+[validator](../validation/indexed_log_validator/README.md) establishes recovery handovers.
 
 ## Ownership and construction
 
@@ -45,7 +45,9 @@ change, not a measured performance improvement; it introduces no allocation.
 write ownership. Construction does no I/O. The default index type lets normal
 callers name the pair writer as `IndexedLogWriter<File>`.
 The application-internal `from_validated(file_id, log, index, end)` is the handover
-point used by `IndexedLogValidator`. `None` means an empty pair. A supplied endpoint
+point for a recovery owner. `IndexedLogValidator` returns synchronized files and
+their endpoint; constructing a writer from that result remains separate work.
+`None` means an empty pair. A supplied endpoint
 must describe a contiguous validated prefix beginning with the file's first
 assigned record, with exactly one correct index entry for each complete record.
 Any invalid tail must already be repaired, and both handles must be positioned
@@ -62,10 +64,10 @@ deserialization can establish a trusted pair. The validator establishes content
 readiness; its caller establishes exclusive recovery/write ownership.
 
 The handed-over prefix starts as buffered/flushed progress, with no pending
-buffers. The internal constructor starts `synced_end` absent: validation alone
-does not establish durability. The validator's public `into_writer` synchronizes
-the pair before returning it, so that handover reports the accepted prefix as
-synchronized. Direct `new` construction still starts empty.
+buffers. The internal constructor starts `synced_end` absent: it does not record
+synchronization performed before construction, even when the caller obtained the
+files from `IndexedLogValidator`. The recovery owner must account for this when
+writer handover is integrated. Direct `new` construction still starts empty.
 Explicit synchronization can establish durability for that prefix without
 appending another record. The owner may independently retain a trusted recovery
 checkpoint; this writer does not overwrite or publish one.

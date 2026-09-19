@@ -7,8 +7,9 @@ The provider also opens existing logs and their repairable indexes. The sibling
 [streams module](../streams/README.md) implements indexed appends, validation from
 a supplied trusted boundary, index repair and explicit invalid-tail recovery.
 Stored clustering configuration read/write operations are also
-implemented. Checkpoint persistence, startup log recovery and management of live files remain
-future work.
+implemented, along with checkpoint read/write, recovery pair deletion and Unix
+directory synchronization. Startup integration and management of live files
+remain future work.
 
 Provider implementation, root configuration and shared errors live directly in this directory, one type per file. Logical file identities, sequence grouping, endpoints and ranges belong to [streams::location](../streams/location/README.md). The thin `mod.rs` re-exports `StorageProvider`, `StorageConfig` and `StorageError` and includes this specification in Rustdoc.
 
@@ -16,7 +17,7 @@ Provider implementation, root configuration and shared errors live directly in t
 | --- | --- |
 | `storage_error.rs` | Shared provider I/O/JSON failures and bounded-read limits, retaining paths and original causes. |
 | `storage_config.rs` | Immutable startup configuration and absolute root resolution. |
-| `storage_provider.rs` | All provider methods: configuration ownership, paths, directory initialization, file acquisition, stored clustering configuration I/O. |
+| `storage_provider.rs` | All provider methods: configuration ownership, paths, directory initialization, maximum-log discovery, file acquisition and metadata I/O. |
 
 Storage policy belongs to the application, not the public record I/O exports
 crate. `LogFileId` describes where a record belongs in a stream's sequence;
@@ -93,9 +94,36 @@ a 4 KiB inclusive limit, returning `None` only for a `NotFound` open failure
 size failures use the shared `StorageError` with the requested path.
 Deserialization validates the model; stream-identity and log/index agreement
 checks belong to recovery. Cancellation publishes no result or storage changes.
-Checkpoint writing and startup integration remain deferred. Same-file provider
+Startup integration remains deferred. Same-file provider
 tests cover literal JSON, exact/over-limit input, absent paths, malformed metadata
 and a directory in place of a checkpoint file.
+
+`write_checkpoint(&checkpoint)` is blocking startup I/O. It derives the stream
+path from the model, requires an existing stream directory and exclusive ownership,
+and serializes before touching files. It writes/truncates `.checkpoint.pending`,
+synchronizes its contents and metadata, closes it, then renames it over
+`checkpoint.json`. A stale pending file is never read as certified metadata and
+can be overwritten by the next publication. Errors before rename preserve the
+previous checkpoint; errors after rename may leave the new checkpoint visible.
+Reread after uncertain publication. Model construction and storage writing do not
+certify log/index validity, compare deployment settings or advance recovery state.
+
+Unix publication synchronizes the stream directory and its ancestors through
+the configured root. `sync_log_file_directory(id)` similarly synchronizes the
+pair directory and ancestors, so newly repaired indexes can be checkpointed after
+their file data is synced. These are blocking operations; Windows has no portable
+directory-sync implementation here, and the configured root's own parent is not
+synchronized. The deployment must provide a durably established storage root.
+Tests verify first publication, replacement, stale staging reuse and failure
+without overwriting existing metadata; they do not simulate power loss.
+
+`remove_log_and_index(id).await` removes the log first, then the index, accepting
+`NotFound` and preserving other concrete errors. It removes no directories and
+creates nothing. After actual deletion it synchronizes the directory chain on
+Unix. Errors/cancellation can leave partial deletion; exclusive recovery can
+repeat cleanup after quiescing outstanding I/O. Checkpoint publication is a
+separate operation and must wait for successful cleanup. Tests cover absent
+pairs, orphan indexes, repeated deletion and directory collisions.
 
 ## Dense index format
 
@@ -192,6 +220,40 @@ or recovery code.
 
 ## Path construction and performance
 
+### Maximum log discovery
+
+`maximum_log_file(stream_id).await` returns the highest existing canonical
+`LogFileId`, or `None` for an absent stream directory or a tree without logs.
+It searches the four range-directory levels in descending numeric order and
+backtracks through empty or index-only branches. At a leaf it selects the highest
+regular `.log` file whose fifteen-digit name, directory prefix and number domain
+match the provider's path contract. Empty logs count; indexes do not establish
+log existence. Unrelated/noncanonical entries and range/log symbolic links are
+ignored. The method performs no content validation, continuity checks, repair,
+deletion or checkpoint operations. The initializer uses this maximum to set up
+lazy enumeration from its recovery boundary.
+
+Pending siblings are retained only along the fixed-depth search, rather than
+collecting every log ID. A method-local `PendingDirectory` names each pending
+branch's path, depth and accumulated numeric prefix. Two local async helpers
+separate recognizing and sorting child range directories (`range_directories`)
+from selecting a leaf's highest canonical log (`maximum_log_in_directory`).
+The main loop controls descending traversal and backtracking.
+A populated highest branch avoids scanning older leaf directories.
+Empty high branches require backtracking and may cause a wider
+scan; directory-entry counts for unrelated contents are not capped. No discovery
+performance measurement is claimed.
+
+Callers must exclude concurrent tree changes: this is an existence snapshot,
+not a lock or durable publication marker. Only absence of the initial stream
+directory is treated as empty; enumeration, entry-type and disappearing child
+directory failures propagate as path-bearing `StorageError::Io`. Cancellation
+changes nothing. Same-file tests cover sparse/empty/index-only branches, stream
+isolation, empty logs, numeric carries and the terminal number, noncanonical
+entries, and an obstructed stream directory.
+
+### Constructed paths
+
 - `log_file_path(id: LogFileId) -> PathBuf` returns the complete absolute log path.
 - `index_file_path(id: LogFileId) -> PathBuf` returns the paired index path with
   the same directory and numeric basename.
@@ -276,8 +338,9 @@ untrusted suffix, repairs its index, supports explicitly authorized log truncati
 and hands over either a synchronized partial writer or full completion metadata.
 
 Handle caching, coordination with independent readers, historical/sealed-file
-reads, checkpoint persistence and advancement, durable checkpoint publication and
-startup-wide recovery orchestration remain unimplemented. Directory initialization
+reads, startup integration and live file rotation remain unimplemented.
+Checkpoint persistence and per-stream recovery advancement are implemented;
+the initializer still needs fresh-pair creation and final writer return. Directory initialization
 alone grants no validation, durability or read readiness.
 
 Read the [record specification](../../../transaction-log-exports/src/record/README.md)

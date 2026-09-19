@@ -2,7 +2,10 @@
 
 This streams module owns typed logical file identities and record byte locations.
 `log_file_number.rs` and its error own numeric validation and the authoritative
-`RECORDS_PER_FILE` constant; `log_file_id.rs` combines a file number with a stream.
+`RECORDS_PER_FILE` constant; `log_file_id.rs` combines a file number with a stream,
+maps file-local record positions and provides inclusive file-ID iteration.
+`log_file_record_index_error.rs` and `log_file_id_range_error.rs` own its position
+and range errors.
 `record_start_location.rs` and `record_end_location.rs` distinguish inclusive
 starts from exclusive ends. `record_range_location.rs` and its error validate
 endpoint relationships and lazily enumerate `log_file_range.rs` portions.
@@ -44,6 +47,7 @@ A file belongs to exactly one `StreamId`. Its zero-based `file_number` assigns
 file_number = sequence_number / RECORDS_PER_FILE
 first_sequence = file_number * RECORDS_PER_FILE
 last_sequence = min(first_sequence + RECORDS_PER_FILE - 1, u64::MAX)
+inclusive_count_through_record = sequence_number % RECORDS_PER_FILE + 1
 ```
 
 | File number | First sequence | Last sequence |
@@ -100,15 +104,37 @@ an exception to the completion rule or claim that this terminal file is sealed.
   valid identifiers and returns `Self`. It needs no validation or error type.
 - `LogFileId::from_record_id(record_id)` delegates grouping to `LogFileNumber` and
   preserves the validated stream ID, without another validation pass.
+- `LogFileId::record_count_through(record_id)` returns the one-based inclusive
+  count from the beginning of whichever file naturally contains the record. It
+  is infallible because it accepts no independent file ID that could disagree;
+  it performs no I/O and does not claim the record exists or has been validated.
+- `LogFileId::record_id_at(index)` performs the inverse mapping for a specific
+  file using a zero-based index. It rejects indexes at or above 100,000 before
+  sequence addition can cross an ordinary file boundary. Sequence exhaustion
+  follows the repository-wide panic policy; no terminal-file accommodation is
+  part of this API. The crate-private helper and its error currently serve
+  location and validation tests, so they permit unused production declarations
+  without widening their visibility.
 - `LogFileId::stream_id()` and `file_number()` are copy getters returning the typed
   components. Neither type has setters or unchecked public constructors.
 - `LogFileId::first_record_id()` and `last_record_id()` return inclusive assigned
   endpoints.
 - `LogFileId::next()` preserves the stream and delegates to the file number's
   checked successor. It does not duplicate the range check.
+- `LogFileId::iter_to(last)` returns `Result<impl FusedIterator<Item = LogFileId>,
+  LogFileIdRangeError>`. It validates matching streams and nondecreasing file
+  numbers before returning an inclusive, allocation-free standard-library
+  `successors` iterator. Equal endpoints yield one ID. It stops before requesting
+  the final file's successor, including at `MAX`, and remains exhausted thereafter.
+  Iteration owns its bounds and performs no I/O or existence checks. Typed errors
+  retain both endpoints and distinguish different streams from reversed files.
+  Same-file tests cover equal/multiple bounds, stream preservation, rejected
+  endpoints, large lazy ranges and repeated terminal exhaustion.
 
-IDs are `Copy`, equatable, ordered and hashable. Ordering compares stream first,
-then file number; it is not chronology across streams. The compiler-selected
+File IDs are `Copy`, equatable and hashable, with no `Ord` or `PartialOrd`.
+Cross-stream ordering has no domain meaning. Establish matching streams before
+comparing their ordered `LogFileNumber` components; `iter_to` checks this boundary
+explicitly. The compiler-selected
 native layout is not a file encoding, filename convention or persisted format.
 
 `LogFileNumber` uses `#[serde(try_from = "u64", into = "u64")]`, so it serializes

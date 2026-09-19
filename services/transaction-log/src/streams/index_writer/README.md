@@ -17,7 +17,7 @@ Read the [shared stream contracts](../README.md#shared-contracts) and
 [dense index layout](#dense-index-layout) below for the file format and the
 [storage specification](../../storage/README.md) for physical paths. The
 [indexed log writer](../indexed_log_writer/README.md) and
-[validator](../indexed_log_validator/README.md) establish valid entries. The
+[validator](../validation/indexed_log_validator/README.md) establish valid entries. The
 [record writer specification](../../../../transaction-log-exports/src/record_writer/README.md)
 explains the completion boundaries this component follows.
 
@@ -152,11 +152,11 @@ sequences end at `u64::MAX`. End positions need `u64`: 100,000 maximum-size reco
 occupy 6,553,500,000 log bytes, exceeding a `u32` offset.
 
 Index data is derived from the log and is rebuildable. `IndexedLogValidator`
-checks whole eight-byte entries, prefix plausibility and actual record boundaries
-and IDs for the newly scanned suffix. The supplied starting boundary certifies
-both earlier prefixes; structural checks on that trusted prefix do not establish
-its original validity. Structural checks
-alone cannot detect every stale or corrupt offset. The log remains authoritative;
+checks the last trusted entry and the log prefix's plausible extent, validates
+actual record boundaries and IDs for the suffix, and replaces the index suffix
+with those accepted offsets. The supplied starting boundary certifies both earlier
+prefixes; checking its final entry does not establish the earlier entries' original
+validity. The log remains authoritative;
 an index endpoint is not evidence of CRC validity, sequence continuity or durable
 storage, and cannot replace a trusted recovery checkpoint. An index may lag the
 log, so a missing entry alone does not establish that the record is absent.

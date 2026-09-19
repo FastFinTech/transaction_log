@@ -17,7 +17,7 @@ use crate::streams::RecordEndLocation;
 /// data, then its index data, before durably publishing the checkpoint. Recovery
 /// trusts the certified prefix instead of revalidating it. This model only stores
 /// the boundary: construction performs no validation, synchronization or I/O.
-/// Those guarantees belong to the future checkpoint/recovery owner.
+/// Those guarantees belong to the checkpoint/recovery owner.
 ///
 /// Use `Option<StreamCheckpoint>` when no checkpoint exists. Sequence zero is a
 /// valid record ID, not an empty-stream sentinel.
@@ -47,7 +47,7 @@ impl StreamCheckpoint {
     /// endpoint alone cannot establish agreement with storage or the prefix's
     /// validity and durability, so wrapping it performs no partial validation.
     /// Persistence and validation of loaded checkpoints are separate
-    /// responsibilities, not implemented by this scaffold.
+    /// responsibilities of storage and the recovery owner.
     pub const fn new(end: RecordEndLocation) -> Self {
         Self { end }
     }

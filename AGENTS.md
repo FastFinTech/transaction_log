@@ -37,6 +37,13 @@ or application policy. Treat those as separate steps unless explicitly included.
 If additional behavior seems necessary, explain the dependency and resolve its
 scope with the owner rather than silently expanding the implementation.
 
+Treat sequence-number exhaustion and the shortened terminal log-file range as
+operationally unreachable (roughly hundreds of thousands of years away at the
+intended write rate). Do not add branches, error variants, fallback behavior or
+tests solely to accommodate the terminal file or `SequenceNumber::MAX` unless the
+owner explicitly requests it. Existing checked successor operations may panic at
+exhaustion; that is the intended policy.
+
 Develop substantial features in small, coherent steps that the owner can read
 and criticize. Implement the agreed step without bundling speculative later
 architecture into it. Discussion and brainstorming are not instructions to
