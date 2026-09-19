@@ -17,7 +17,7 @@ Provider implementation, root configuration and shared errors live directly in t
 | --- | --- |
 | `storage_error.rs` | Shared provider I/O/JSON failures and bounded-read limits, retaining paths and original causes. |
 | `storage_config.rs` | Immutable startup configuration and absolute root resolution. |
-| `storage_provider.rs` | All provider methods: configuration ownership, paths, directory initialization, maximum-log discovery, file acquisition and metadata I/O. |
+| `storage_provider.rs` | All provider methods: configuration ownership, paths, directory initialization, maximum-log discovery, file acquisition and metadata I/O, with private JSON read/write helpers. |
 
 Storage policy belongs to the application, not the public record I/O exports
 crate. `LogFileId` describes where a record belongs in a stream's sequence;
@@ -38,7 +38,9 @@ intermediate persistence type.
 `StorageProvider::read_clustering_configuration` and
 `write_clustering_configuration` directly deserialize/serialize that type in root
 `clustering.json`. Reads are bounded to 4 KiB and validate through the domain
-types. Publication never overwrites existing metadata. See the
+types. Writes atomically replace the supplied metadata. Enforcing write-once
+establishment and retaining the permanent UUID/configuration belong to the
+clustering lifecycle caller, whose startup integration remains planned. See the
 [provider metadata contract](#provider-metadata-operations) for concrete errors, interrupted writes
 and durability limits. UUID establishment, configuration comparison and startup
 integration remain deferred and are not provider responsibilities.
@@ -48,27 +50,96 @@ integration remain deferred and are not provider responsibilities.
 The public `log_file_path` and `index_file_path` methods share the private
 `log_or_index_file_path` helper for their numeric directory layout and basename.
 Checkpoint and clustering metadata paths do not use that helper.
-All provider methods live together in `storage_provider.rs`, including blocking startup read/write
-methods for `EstablishedClusteringConfiguration`.
-Shared file-name constants precede the provider type, public operations precede
-private path helpers, and test modules follow the implementation. Metadata read
-limits are named constants scoped to their respective read methods; independent
+All provider methods live together in `storage_provider.rs`.
+Clustering configuration reads remain blocking startup I/O; both metadata writers
+use Tokio's asynchronous filesystem API.
+Public operations precede private path helpers, and test modules follow the
+implementation. Published filenames are constants local to `checkpoint_file_path` and the private
+`clustering_configuration_file_path` helper; both clustering read and write methods
+use that helper. Pending paths append `.pending` to the published path.
+Metadata read limits are named constants scoped to their respective read methods; independent
 size-limit fixtures in tests use the specified byte counts.
 `storage_error.rs` retains path and concrete I/O/JSON
 errors. `read_clustering_configuration` reads root `clustering.json`, returns
 `None` for absent metadata, rejects unpublished staging files, bounds reads to
 4 KiB and deserializes through the model's validation. It creates nothing.
-`write_clustering_configuration` publishes a supplied configuration/UUID once:
-existing files are never overwritten. It creates the root, synchronizes a
-create-new `.clustering.pending` file and publishes it using a hard link.
-Unix synchronizes the root directory before and after staging-file removal;
+`write_clustering_configuration(&configuration).await` writes the supplied
+configuration/UUID, replacing any existing document. It creates the root and uses
+the shared JSON writer to stage `clustering.json.pending` and rename it over
+`clustering.json`. Unix then synchronizes the root directory;
 Windows directory durability is not guaranteed and ancestors are not synced.
-Errors may leave pending or published metadata; callers must reread/inspect it
-and must not assume a failed write assigned nothing. Exclusive root ownership
-and hard-link support are required. UUID generation and startup integration
-are not part of these operations. Temporary filesystem tests cover both modes,
-all slots, independent JSON fixtures, malformed/oversized input, no-overwrite
-behavior and interrupted publication.
+Errors/cancellation may leave pending or published metadata; callers must quiesce
+outstanding I/O and reread/inspect storage before another attempt. A failed write
+does not imply that nothing was published. Exclusive root ownership is required.
+Write-once policy, UUID generation and startup integration are not part of these
+storage operations. Temporary filesystem tests cover both deployment modes, all
+slots, independent JSON fixtures, malformed/oversized input, replacement of
+existing metadata and stale staging.
+
+## Bounded JSON reading
+
+The private async `read_json<T: DeserializeOwned>(path, max_bytes)` helper lives
+beside the atomic writer in `storage_provider.rs`. It returns `Result<Option<T>,
+StorageError>`: only `NotFound` when opening the requested path becomes `None`,
+including an absent parent. It creates or modifies nothing and never inspects
+`.pending` siblings. Cancellation produces no value or file modifications.
+
+The caller supplies an inclusive byte limit. Tokio reads at most one byte beyond
+that limit (saturating at `u64::MAX`), then rejects oversized input before JSON
+parsing. Limits count all encoded bytes, including whitespace. Empty files,
+malformed JSON, trailing non-whitespace and model validation failures are errors.
+Deserialization returns an owned value; a valid JSON `null` for an optional target
+is `Some(None)`, distinct from an absent file. I/O and JSON failures retain the
+requested path and their concrete cause through the existing `StorageError`.
+
+The helper is implemented and directly tested; the checkpoint and clustering
+readers have not yet been migrated to it. Their existing behavior is unchanged,
+including the clustering reader's separate check for unpublished staging.
+Read limits remain caller policy, with each provider method owning its locally
+named constant. Recovery decisions do not belong in the generic helper.
+
+Same-file tests use independent JSON fixtures to cover owned values, missing
+files/parents, ignored staging, exact/over/zero limits, malformed and invalid UTF-8
+input, target-type validation and filesystem errors. Reads preserve file contents.
+These metadata operations are outside the record hot path; no throughput is claimed.
+
+## Shared atomic JSON publication
+
+The private `write_json_atomic<T: Serialize + ?Sized>(path, &value)` function lives
+beside the provider in `storage_provider.rs`. Both metadata writers delegate to
+this one operation, which always replaces the destination. It borrows the value
+and serializes once into an owned byte buffer before any filesystem I/O. It then
+opens `.pending` staging with `create(true)` and `truncate(true)`, writes and
+flushes the bytes, synchronizes the file and closes it. Publication
+renames the staged file over the destination and synchronizes the parent directory.
+Flushing before synchronization surfaces pending Tokio write errors.
+
+Truncation discards any interrupted staging contents before writing the new
+document, including leftover bytes when the replacement is shorter. Write-once
+rules belong to callers, not this helper.
+
+All helper filesystem operations use Tokio. Directory synchronization is Unix-only
+and applies only to the immediate parent obtained from the destination path.
+The helper creates no directories: clustering publication creates its root first,
+while checkpoint publication requires an existing stream directory. The provider
+supplies absolute file paths with parents. Callers must establish ancestor
+durability and exclude concurrent access to the destination and pending path.
+
+Atomic publication makes a complete document visible; it does not promise rollback
+on error or cancellation. Staging can remain, and failure after publication can
+leave the new document visible. Quiesce outstanding I/O before
+recovery or retry. `StorageError` retains the final path for serialization and
+publication failures, the pending path for staging failures, and the
+parent path for directory-sync failures. No new error layer or startup policy is
+introduced.
+
+Same-file helper tests use independent expected bytes and verify unsized borrowed
+values, unchanged files on serialization failure, first publication, shorter
+replacement without stale bytes, and missing-parent errors without directory
+creation. Provider tests retain
+model round trips, staging/rename failures and interrupted-publication coverage.
+These tests do not simulate power loss or cancellation during filesystem I/O.
+This is metadata work outside the record hot path; no throughput is claimed.
 
 ## Shared errors
 
@@ -98,32 +169,58 @@ Startup integration remains deferred. Same-file provider
 tests cover literal JSON, exact/over-limit input, absent paths, malformed metadata
 and a directory in place of a checkpoint file.
 
-`write_checkpoint(&checkpoint)` is blocking startup I/O. It derives the stream
-path from the model, requires an existing stream directory and exclusive ownership,
-and serializes before touching files. It writes/truncates `.checkpoint.pending`,
-synchronizes its contents and metadata, closes it, then renames it over
-`checkpoint.json`. A stale pending file is never read as certified metadata and
-can be overwritten by the next publication. Errors before rename preserve the
+`write_checkpoint(&checkpoint).await` uses Tokio filesystem I/O. It derives the
+stream path from the model, requires an existing, durably established stream
+directory and exclusive ownership, and serializes before touching files. It
+writes a created or truncated `checkpoint.json.pending` (the checkpoint path with
+`.pending` appended), flushes pending writes to surface their errors, synchronizes its
+contents and metadata, closes it, then renames it over
+`checkpoint.json`. A stale pending file is never read as certified metadata;
+its contents are truncated before staging a replacement. Errors before rename preserve the
 previous checkpoint; errors after rename may leave the new checkpoint visible.
-Reread after uncertain publication. Model construction and storage writing do not
-certify log/index validity, compare deployment settings or advance recovery state.
+Cancellation can leave filesystem work in flight; quiesce outstanding I/O and
+reread after uncertain publication before recovery or another write. Model
+construction and storage writing do not certify log/index validity, compare
+deployment settings or advance recovery state.
 
-Unix publication synchronizes the stream directory and its ancestors through
-the configured root. `sync_log_file_directory(id)` similarly synchronizes the
-pair directory and ancestors, so newly repaired indexes can be checkpointed after
-their file data is synced. These are blocking operations; Windows has no portable
-directory-sync implementation here, and the configured root's own parent is not
-synchronized. The deployment must provide a durably established storage root.
-Tests verify first publication, replacement, stale staging reuse and failure
-without overwriting existing metadata; they do not simulate power loss.
+Unix publication synchronizes only the checkpoint's immediate parent (the stream
+directory), derived from the checkpoint path, using Tokio after the rename.
+The existing directory hierarchy is not
+changed and its ancestors are not synchronized. Windows has no directory-durability
+guarantee here. The caller must first establish the covered log/index prefix and
+its directory-entry durability; publishing a checkpoint does not synchronize
+those separate files or their parent directories. Tests verify first publication,
+replacement, stale staging truncation, staging/rename failures and retry after a failed
+rename; they do not simulate power loss or cancellation during filesystem I/O.
 
-`remove_log_and_index(id).await` removes the log first, then the index, accepting
-`NotFound` and preserving other concrete errors. It removes no directories and
-creates nothing. After actual deletion it synchronizes the directory chain on
-Unix. Errors/cancellation can leave partial deletion; exclusive recovery can
-repeat cleanup after quiescing outstanding I/O. Checkpoint publication is a
-separate operation and must wait for successful cleanup. Tests cover absent
-pairs, orphan indexes, repeated deletion and directory collisions.
+`remove_log_and_index(first..=last).await` accepts an inclusive range of
+`LogFileId`s from one stream. It validates both endpoints through `iter_to` before
+any I/O: different streams or reversed bounds return `StorageError::Io` at the
+first log's path, with `InvalidInput` and the original `LogFileIdRangeError` as
+its cause. It enumerates lazily in ascending order, removes each log before its
+index, accepts `NotFound` and preserves other concrete filesystem errors.
+It removes no directories, creates nothing and leaves entries outside the range
+untouched.
+
+After all deletions, Unix opens and synchronizes each distinct immediate parent
+directory once using Tokio's asynchronous file API. No ancestors are synchronized:
+removing files changes their parent entries, not the existing directory hierarchy.
+Existing parents are synchronized even when their requested files were already
+absent, so repeating a range after an interrupted synchronization still establishes
+durability. Missing parents are skipped. The method retains one path per distinct
+parent, not a list of every file ID. Checkpoint publication and range removal own
+their directory synchronization; there are no separate directory-sync helpers. Tokio moves
+filesystem work off the async executor; completion still awaits synchronization.
+Windows has no directory-durability guarantee here.
+
+Cleanup requires exclusive recovery access and a durably established directory
+hierarchy; directory initialization alone does not supply that durability.
+Errors/cancellation can leave partial deletion or unsynchronized directory changes;
+repeat the original range after quiescing outstanding I/O. Checkpoint publication
+is separate and must wait for successful cleanup. Tests cover invalid bounds
+before deletion, inclusive ranges spanning directories, preserved neighbors and
+other streams, absent pairs, orphan indexes, repeated deletion and directory
+collisions. They do not simulate power loss.
 
 ## Dense index format
 
@@ -230,8 +327,10 @@ regular `.log` file whose fifteen-digit name, directory prefix and number domain
 match the provider's path contract. Empty logs count; indexes do not establish
 log existence. Unrelated/noncanonical entries and range/log symbolic links are
 ignored. The method performs no content validation, continuity checks, repair,
-deletion or checkpoint operations. The initializer uses this maximum to set up
-lazy enumeration from its recovery boundary.
+deletion or checkpoint operations. The initializer records this maximum and
+checks it against the checkpoint's file number. Its validation step enumerates
+lazily from the recovery boundary through this maximum, stopping at a partial
+pair or gap.
 
 Pending siblings are retained only along the fixed-depth search, rather than
 collecting every log ID. A method-local `PendingDirectory` names each pending
@@ -334,14 +433,18 @@ The [streams module](../streams/README.md) owns one log/index pair exclusively,
 enforces sequence continuity on append, orders output and reports separate flushed
 and synchronized endpoints. It finalizes a full, synchronized pair without
 changing paths. Its validator obtains handles through the provider, checks the
-untrusted suffix, repairs its index, supports explicitly authorized log truncation,
-and hands over either a synchronized partial writer or full completion metadata.
+untrusted suffix, removes corrupt tails, repairs its index and returns a synchronized
+endpoint, plus append-positioned file handles when partial.
 
 Handle caching, coordination with independent readers, historical/sealed-file
 reads, startup integration and live file rotation remain unimplemented.
-Checkpoint persistence and per-stream recovery advancement are implemented;
-the initializer still needs fresh-pair creation and final writer return. Directory initialization
-alone grants no validation, durability or read readiness.
+Checkpoint persistence is implemented; per-stream recovery advancement remains
+scaffolded. The initializer needs a provider operation for fresh log/index-pair
+creation, including deeper range directories. Existing log acquisition never
+creates a log, and index acquisition requires an existing parent directory.
+Fresh-pair creation must avoid overwriting an existing log and define handling
+for orphan indexes and interrupted creation. This operation is not implemented.
+Directory initialization alone grants no validation, durability or read readiness.
 
 Read the [record specification](../../../transaction-log-exports/src/record/README.md)
 before integrating record I/O. The provider does not change record framing or

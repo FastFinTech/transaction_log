@@ -9,9 +9,14 @@ crate's `RecordWriter` rather than implementing either encoding/output layer.
 partial pair. Startup orchestration and writer construction remain separate work.
 `StreamCheckpoint` represents the certified local log/index boundary as a typed,
 Serde-enabled value; it does not itself load or publish checkpoint files.
-`StreamInitializer` is a disabled scaffold for startup recovery of one stream.
-Its source is commented out and is not declared in this module. Adapting it to the
-current validator, completing writer handover and startup integration remain deferred.
+`StreamInitializer` is a compiled scaffold for startup recovery of one stream.
+Its stateless entry point creates private state, loads the optional checkpoint,
+checks its stream ID and discovers the maximum log covering its file number. It
+validates successive pairs until a partial file or gap, retaining the recovered
+endpoint and partial pair, then removes the discarded range. Fresh-pair preparation
+and checkpoint advancement remain `todo!()`. Its owned `InitializedStream` result uses read-only
+getters. Startup integration remains unimplemented; the result contains files
+rather than a writer.
 
 The owner supplies an empty or validated pair, buffers ordered records, commands
 flushing and synchronization, and explicitly finalizes a full file. Live
@@ -24,8 +29,8 @@ for validation uses the storage provider's named log/index opening methods.
 | Component | Responsibility |
 | --- | --- |
 | [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. |
-| [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write are implemented; initializer advancement is disabled. |
-| [Stream initializer](stream_initializer/README.md) | Disabled scaffold and requirements for single-stream recovery, later-file cleanup and checkpoint publication. |
+| [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write are implemented; initializer advancement is scaffolded. |
+| [Stream initializer](stream_initializer/README.md) | Checked checkpoint loading/discovery, sequential pair validation and later-file cleanup; fresh-pair preparation and publication remain `todo!()`. |
 | [Indexed log writer](indexed_log_writer/README.md) | Append ordered records to a log/index pair; control flushing, synchronization, progress and finalization. Start here for normal output. |
 | [Indexed log validator](validation/indexed_log_validator/README.md) | Recover and synchronize one existing pair from a supplied trusted boundary. Return its endpoint and append-positioned files when partial. Start here for recovery. |
 | [Index writer](index_writer/README.md) | Encode offsets into a reusable buffer and send, flush or synchronize an owned file. Shared by the pair writer and validator. |
@@ -44,7 +49,7 @@ The component `mod.rs` files contain declarations, README inclusion and re-expor
 This top-level `mod.rs` preserves the public imports, including
 `streams::IndexWriter`, `streams::IndexedLogWriter`,
 `streams::IndexedLogValidator` and `streams::StreamCheckpoint`.
-`IndexedLogValidationError` and `ValidatedFilePair`
+`IndexedLogValidationError`, `ValidatedFilePair`, `StreamInitializer` and `InitializedStream`
 are also re-exported. Location types
 are available through both `streams::location` and top-level streams re-exports;
 the writer/validator component modules remain private.
@@ -165,9 +170,9 @@ CRC, stream identity, sequence continuity and the corresponding exact record end
 offsets are established. Synchronize the covered log data, then the index data,
 before durably publishing the checkpoint. It may lag this durable pair, but must
 never lead either file. Constructing the model establishes none of those facts.
-Storage implements checkpoint reading and publication. Stream-identity checking
-and advancement belong to the currently disabled initializer; startup integration
-remains future work. `IndexedLogValidator` accepts the explicitly supplied trusted endpoint; it
+Storage implements checkpoint reading and publication. The initializer loads the
+checkpoint and checks its stream identity; advancement and startup integration
+remain future work. `IndexedLogValidator` accepts the explicitly supplied trusted endpoint; it
 does not load or choose the checkpoint itself. It checks prefix presence and the
 final certified index entry's agreement with that endpoint, without revalidating
 earlier records or index entries. It validates and repairs the suffix. A missing
@@ -195,8 +200,8 @@ assert_eq!(serde_json::from_slice::<StreamCheckpoint>(&bytes)?, checkpoint);
 at `{root}/streams/{stream_id:04}/checkpoint.json`. The path depends only on the
 stream, so advancing across log-file ranges does not change the checkpoint's
 location. Initialization creates its parent directory but no checkpoint file.
-The planned initializer must check that the decoded checkpoint's stream ID matches
-the requested stream; agreement with the actual pair requires separate validation.
+The initializer checks that the decoded checkpoint's stream ID matches the
+requested stream; agreement with the actual pair requires separate validation.
 
 ### Planned historical-read availability
 
@@ -250,7 +255,7 @@ file output, and `serde_json::from_slice::<StreamCheckpoint>(&bytes)` to decode
 them. The same traits also support `to_writer_pretty` and `from_reader` for
 synchronous `std::io` destinations/sources. These codecs do not flush, sync or
 atomically publish a checkpoint file. The storage provider implements
-publication; the initializer certifies and synchronizes the covered log/index
+publication; the planned initializer recovery steps must certify and synchronize the covered log/index
 prefix first. See the initializer and storage specifications for failure and
 platform-specific directory-durability contracts.
 

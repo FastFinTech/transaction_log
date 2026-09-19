@@ -3,13 +3,11 @@ use crate::clustering::configuration::EstablishedClusteringConfiguration;
 use crate::streams::{LogFileId, LogFileNumber, StreamCheckpoint};
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, Read},
+    ops::RangeInclusive,
     path::{Path, PathBuf},
 };
 use transaction_log_exports::StreamId;
-
-const FILE_NAME: &str = "clustering.json";
-const PENDING_FILE_NAME: &str = ".clustering.pending";
 
 /// Owns storage configuration, constructs paths, and initializes stream directories.
 ///
@@ -269,36 +267,66 @@ impl StorageProvider {
             .map_err(|source| StorageError::io(path, source))
     }
 
-    /// Removes a log and its paired index, accepting already-absent files.
+    /// Removes an inclusive range of log/index pairs from one stream.
     ///
-    /// Removes the log first, then the index; it never removes directories.
-    /// Other errors stop cleanup, so partial deletion is possible and retryable.
-    /// Requires exclusive recovery ownership. Unix synchronizes the affected
-    /// directory and its ancestors through the configured root after deletion;
-    /// portable directory durability is not provided on Windows.
-    pub async fn remove_log_and_index(&self, id: LogFileId) -> Result<(), StorageError> {
-        let mut removed = false;
-        for path in [self.log_file_path(id), self.index_file_path(id)] {
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => removed = true,
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                Err(source) => return Err(StorageError::io(path, source)),
+    /// Validates the range before I/O, then visits files in ascending order,
+    /// deleting each log before its index. Already-absent files are accepted.
+    /// Directories and entries outside the range are preserved.
+    ///
+    /// After all deletions, Unix opens and synchronizes each distinct parent
+    /// directory once through Tokio, without synchronizing ancestors. Existing
+    /// parents are synced even when the files were already absent, allowing a
+    /// repeat after interrupted deletion/synchronization. Missing parents are
+    /// skipped. Windows has no directory-durability guarantee here.
+    ///
+    /// Requires exclusive recovery access and a durably established directory
+    /// hierarchy. Errors stop the operation and preserve the failing path and
+    /// cause. Errors/cancellation can leave partial deletion or unsynchronized
+    /// changes; quiesce outstanding I/O before repeating the original range.
+    ///
+    /// # Errors
+    ///
+    /// Different streams or reversed endpoints return an `InvalidInput` I/O
+    /// error at the first log's path, containing the original range error.
+    /// Filesystem errors retain their original causes; no checkpoint is published.
+    pub async fn remove_log_and_index(
+        &self,
+        range: RangeInclusive<LogFileId>,
+    ) -> Result<(), StorageError> {
+        let (first, last) = range.into_inner();
+        let files = first.iter_to(last).map_err(|source| {
+            StorageError::io(
+                self.log_file_path(first),
+                io::Error::new(io::ErrorKind::InvalidInput, source),
+            )
+        })?;
+        #[cfg(unix)]
+        let mut directories = std::collections::BTreeSet::new();
+        for id in files {
+            let log = self.log_file_path(id);
+            #[cfg(unix)]
+            directories.insert(log.parent().unwrap().to_owned());
+            for path in [log, self.index_file_path(id)] {
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                    Err(source) => return Err(StorageError::io(path, source)),
+                }
             }
         }
-        if removed {
-            self.sync_log_file_directory(id)?;
+        #[cfg(unix)]
+        for path in directories {
+            let directory = match tokio::fs::File::open(&path).await {
+                Ok(directory) => directory,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(StorageError::io(path, source)),
+            };
+            directory
+                .sync_all()
+                .await
+                .map_err(|source| StorageError::io(path, source))?;
         }
         Ok(())
-    }
-
-    /// Synchronizes a pair's directory entries, not its log/index data.
-    ///
-    /// Blocking Unix I/O synchronizes its parent and ancestors through the
-    /// configured root. Windows has no portable directory-sync implementation.
-    /// The caller must synchronize both files separately before checkpointing.
-    pub fn sync_log_file_directory(&self, id: LogFileId) -> Result<(), StorageError> {
-        let path = self.log_file_path(id);
-        self.sync_directories_to_root(path.parent().unwrap())
     }
 
     /// Constructs the absolute `checkpoint.json` path for one stream's checkpoint.
@@ -308,7 +336,9 @@ impl StorageProvider {
     /// an owned path without creating directories or loading, writing or validating
     /// checkpoint data. The path is available before initialization.
     pub fn checkpoint_file_path(&self, stream_id: StreamId) -> PathBuf {
-        self.stream_directory(stream_id).join("checkpoint.json")
+        const FILE_NAME: &str = "checkpoint.json";
+
+        self.stream_directory(stream_id).join(FILE_NAME)
     }
 
     /// Reads one stream's checkpoint, returning `None` when its path is absent.
@@ -349,37 +379,23 @@ impl StorageProvider {
 
     /// Publishes or replaces a supplied checkpoint using synchronized staging JSON.
     ///
-    /// Blocking startup I/O requires an existing stream directory and exclusive
-    /// ownership. The caller certifies and synchronizes the covered log/index
-    /// prefix first. This operation does not compare checkpoints or validate logs.
-    /// `.checkpoint.pending` is never loaded as a checkpoint and may be overwritten
-    /// after an interrupted attempt. After syncing its contents, rename replaces
-    /// `checkpoint.json`; Unix then syncs ancestors through the configured root.
-    /// Windows directory durability and the root's own parent are not synchronized.
-    /// Errors may leave staging or an already-published checkpoint; reread before
-    /// recovery. There is no async cancellation point within this operation.
-    pub fn write_checkpoint(&self, checkpoint: &StreamCheckpoint) -> Result<(), StorageError> {
+    /// Uses Tokio filesystem I/O and requires an existing, durably established
+    /// stream directory and exclusive ownership. The caller certifies and
+    /// synchronizes the covered log/index prefix and its directory entries first.
+    /// This operation does not compare checkpoints or validate logs.
+    /// `checkpoint.json.pending` is never loaded as a checkpoint. Staging is created
+    /// or truncated before writing. After flushing and syncing it,
+    /// rename replaces `checkpoint.json`; Unix then syncs only the stream directory.
+    /// Windows has no directory-durability guarantee here.
+    /// Errors/cancellation may leave staging or an already-published checkpoint;
+    /// quiesce outstanding I/O and reread before recovery or another publication.
+    pub async fn write_checkpoint(
+        &self,
+        checkpoint: &StreamCheckpoint,
+    ) -> Result<(), StorageError> {
         let stream_id = checkpoint.end().record_id().stream_id();
         let path = self.checkpoint_file_path(stream_id);
-        let bytes = serde_json::to_vec(checkpoint).map_err(|source| StorageError::Json {
-            path: path.clone(),
-            source,
-        })?;
-        let directory = self.stream_directory(stream_id);
-        let pending = directory.join(".checkpoint.pending");
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&pending)
-            .map_err(|source| StorageError::io(pending.clone(), source))?;
-        file.write_all(&bytes)
-            .map_err(|source| StorageError::io(pending.clone(), source))?;
-        file.sync_all()
-            .map_err(|source| StorageError::io(pending.clone(), source))?;
-        drop(file);
-        fs::rename(&pending, &path).map_err(|source| StorageError::io(path, source))?;
-        self.sync_directories_to_root(&directory)
+        write_json_atomic(&path, checkpoint).await
     }
 
     /// Loads stored clustering settings, returning `None` only when the file is absent.
@@ -391,11 +407,11 @@ impl StorageProvider {
     ) -> Result<Option<EstablishedClusteringConfiguration>, StorageError> {
         const MAX_CLUSTERING_CONFIGURATION_BYTES: u64 = 4096;
 
-        let path = self.root_directory().join(FILE_NAME);
+        let path = self.clustering_configuration_file_path();
         let file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let pending = self.root_directory().join(PENDING_FILE_NAME);
+                let pending = path.with_added_extension("pending");
                 match fs::metadata(&pending) {
                     Ok(_) => {
                         return Err(StorageError::io(
@@ -427,69 +443,39 @@ impl StorageProvider {
             .map_err(|source| StorageError::Json { path, source })
     }
 
-    /// Publishes first-load configuration and UUID without replacing existing metadata.
+    /// Atomically writes the supplied clustering configuration, replacing existing metadata.
     ///
-    /// Creates the root if necessary, synchronizes a new staging file and publishes
-    /// it with a no-overwrite hard link. Requires hard-link support and exclusive
-    /// ownership of the root. Existing published or unpublished staging files cause
-    /// an error; callers must inspect interrupted writes rather than reassign UUIDs.
+    /// Creates the root if necessary, writes and synchronizes staging, then renames
+    /// it over the destination. Requires exclusive ownership of the root. The
+    /// clustering lifecycle caller is responsible for write-once establishment
+    /// and preserving the established UUID and deployment configuration.
     ///
-    /// Blocking startup I/O has no async cancellation point. Errors can leave staging
-    /// or published metadata: reread before deciding how to recover. Unix syncs the
-    /// root directory; Windows has no portable directory-durability guarantee here.
+    /// Uses Tokio filesystem I/O. Errors/cancellation can leave staging or published
+    /// metadata: quiesce outstanding I/O and reread before deciding how to recover.
+    /// Unix syncs the root directory after renaming the staging file;
+    /// Windows has no portable directory-durability guarantee here.
     /// Parent directories are not recursively synchronized. This does not generate
     /// a UUID, check peer agreement, enforce a process lock or establish readiness.
-    pub fn write_clustering_configuration(
+    pub async fn write_clustering_configuration(
         &self,
         configuration: &EstablishedClusteringConfiguration,
     ) -> Result<(), StorageError> {
         let root = self.root_directory();
-        let path = root.join(FILE_NAME);
-        let bytes = serde_json::to_vec(configuration).map_err(|source| StorageError::Json {
-            path: path.clone(),
-            source,
-        })?;
-        fs::create_dir_all(root).map_err(|source| StorageError::io(root.to_owned(), source))?;
-        let pending = root.join(PENDING_FILE_NAME);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&pending)
-            .map_err(|source| StorageError::io(pending.clone(), source))?;
-        file.write_all(&bytes)
-            .map_err(|source| StorageError::io(pending.clone(), source))?;
-        file.sync_all()
-            .map_err(|source| StorageError::io(pending.clone(), source))?;
-        drop(file);
-        fs::hard_link(&pending, &path).map_err(|source| StorageError::io(path, source))?;
-        #[cfg(unix)]
-        fs::File::open(root)
-            .and_then(|directory| directory.sync_all())
+        let path = self.clustering_configuration_file_path();
+        tokio::fs::create_dir_all(root)
+            .await
             .map_err(|source| StorageError::io(root.to_owned(), source))?;
-        fs::remove_file(&pending).map_err(|source| StorageError::io(pending, source))?;
-        #[cfg(unix)]
-        fs::File::open(root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| StorageError::io(root.to_owned(), source))?;
-        Ok(())
-    }
-    /// Synchronizes directory links inside this provider's configured root only.
-    fn sync_directories_to_root(&self, directory: &Path) -> Result<(), StorageError> {
-        #[cfg(unix)]
-        for path in directory.ancestors() {
-            fs::File::open(path)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| StorageError::io(path.to_owned(), source))?;
-            if path == self.root_directory() {
-                break;
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = directory;
-        Ok(())
+        write_json_atomic(&path, configuration).await
     }
 
-    /// Shared base layout for initialization and all file-path methods.
+    /// Constructs the stored clustering configuration path without filesystem I/O.
+    fn clustering_configuration_file_path(&self) -> PathBuf {
+        const FILE_NAME: &str = "clustering.json";
+
+        self.root_directory().join(FILE_NAME)
+    }
+
+    /// Shared base layout for initialization and stream file-path methods.
     fn stream_directory(&self, stream_id: StreamId) -> PathBuf {
         self.root_directory()
             .join("streams")
@@ -509,6 +495,323 @@ impl StorageProvider {
         }
         path.push(format!("{file_number}.{extension}"));
         path
+    }
+}
+
+/// Reads an owned JSON value using Tokio, returning `None` only for a `NotFound` open.
+///
+/// The byte limit is inclusive. Reads at most one byte beyond it to detect oversized
+/// input before deserializing. Other I/O failures and JSON/model validation failures
+/// preserve the requested path and original cause. An empty file is invalid JSON.
+/// Creates or modifies nothing and does not inspect pending files; recovery policy
+/// belongs to the caller. Cancellation produces no value or file modifications.
+#[allow(
+    dead_code,
+    reason = "Provider readers have not been migrated to this helper yet."
+)]
+async fn read_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<T>, StorageError> {
+    use tokio::io::AsyncReadExt;
+
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(StorageError::io(path.to_owned(), source)),
+    };
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|source| StorageError::io(path.to_owned(), source))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(StorageError::TooLarge {
+            path: path.to_owned(),
+            max_bytes,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|source| StorageError::Json {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+/// Serializes before I/O, then atomically replaces the destination with complete JSON.
+///
+/// The provider supplies an absolute file path with an existing parent directory
+/// and excludes concurrent access to the destination and its `.pending` sibling.
+/// This helper creates no directories. Ancestor durability belongs to the caller;
+/// Unix synchronizes only the immediate parent, and Windows skips directory sync.
+/// Creates or truncates the pending file before writing. The caller owns any
+/// write-once policy.
+///
+/// Atomic publication does not imply rollback: errors/cancellation can leave a
+/// partial staging file or a published destination. Quiesce outstanding I/O and
+/// inspect storage before another attempt. Failures preserve their path and cause.
+async fn write_json_atomic<T: serde::Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+) -> Result<(), StorageError> {
+    use tokio::io::AsyncWriteExt;
+
+    let bytes = serde_json::to_vec(value).map_err(|source| StorageError::Json {
+        path: path.to_owned(),
+        source,
+    })?;
+    let pending = path.with_added_extension("pending");
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&pending)
+        .await
+        .map_err(|source| StorageError::io(pending.clone(), source))?;
+    file.write_all(&bytes)
+        .await
+        .map_err(|source| StorageError::io(pending.clone(), source))?;
+    // Surface pending write failures before syncing or publishing the file.
+    file.flush()
+        .await
+        .map_err(|source| StorageError::io(pending.clone(), source))?;
+    file.sync_all()
+        .await
+        .map_err(|source| StorageError::io(pending.clone(), source))?;
+    drop(file);
+
+    tokio::fs::rename(&pending, path)
+        .await
+        .map_err(|source| StorageError::io(path.to_owned(), source))?;
+
+    #[cfg(unix)]
+    {
+        let directory = path.parent().unwrap();
+        tokio::fs::File::open(directory)
+            .await
+            .map_err(|source| StorageError::io(directory.to_owned(), source))?
+            .sync_all()
+            .await
+            .map_err(|source| StorageError::io(directory.to_owned(), source))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod json_read_tests {
+    use super::*;
+    use std::error::Error;
+
+    #[tokio::test]
+    async fn missing_files_return_none_without_creating_paths_or_inspecting_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("absent");
+        let path = parent.join("document.json");
+        assert_eq!(read_json::<u64>(&path, 16).await.unwrap(), None);
+        assert!(!parent.exists());
+
+        fs::create_dir(&parent).unwrap();
+        assert_eq!(read_json::<u64>(&path, 16).await.unwrap(), None);
+        assert!(!path.exists());
+
+        let pending = path.with_added_extension("pending");
+        fs::write(&pending, b"interrupted staging").unwrap();
+        assert_eq!(read_json::<u64>(&path, 16).await.unwrap(), None);
+        assert!(!path.exists());
+        assert_eq!(fs::read(&pending).unwrap(), b"interrupted staging");
+    }
+
+    #[tokio::test]
+    async fn reads_owned_values_from_independent_json() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Document {
+            name: String,
+            values: Vec<u32>,
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.json");
+        let bytes = br#"{"name":"caf\u00e9","values":[1,2,3]}"#;
+        fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            read_json::<Document>(&path, 128).await.unwrap(),
+            Some(Document {
+                name: "café".to_owned(),
+                values: vec![1, 2, 3],
+            })
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        fs::write(&path, b"null").unwrap();
+        assert_eq!(
+            read_json::<Option<u64>>(&path, 4).await.unwrap(),
+            Some(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn enforces_inclusive_byte_limit_before_deserializing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.json");
+        // Whitespace still contributes to the file's byte limit.
+        fs::write(&path, b"123 ").unwrap();
+        for limit in [4, 5, u64::MAX] {
+            assert_eq!(read_json::<u64>(&path, limit).await.unwrap(), Some(123));
+        }
+        for limit in [0, 3] {
+            let StorageError::TooLarge {
+                path: failed,
+                max_bytes,
+            } = read_json::<u64>(&path, limit).await.unwrap_err()
+            else {
+                panic!("expected the size-limit error");
+            };
+            assert_eq!(failed, path);
+            assert_eq!(max_bytes, limit);
+        }
+
+        // Oversized malformed input must report the size limit, not a JSON error.
+        fs::write(&path, b"not JSON").unwrap();
+        assert!(matches!(
+            read_json::<u64>(&path, 4).await,
+            Err(StorageError::TooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_preserves_the_path_and_serde_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.json");
+        for bytes in [
+            b"".as_slice(),
+            b" \n",
+            b"{",
+            b"true false",
+            b"\"invalid \xff\"",
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let error = read_json::<serde_json::Value>(&path, 64).await.unwrap_err();
+            assert_eq!(error.path(), path);
+            assert!(error.source().unwrap().is::<serde_json::Error>());
+            let StorageError::Json { source, .. } = error else {
+                panic!("expected the JSON error for {bytes:?}");
+            };
+            assert!(source.is_eof() || source.is_syntax());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn deserialization_enforces_the_target_types_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.json");
+        // This is valid JSON, but invalid for the requested type.
+        fs::write(&path, b"0").unwrap();
+        let StorageError::Json {
+            path: failed,
+            source,
+        } = read_json::<std::num::NonZeroU64>(&path, 1)
+            .await
+            .unwrap_err()
+        else {
+            panic!("expected model validation to fail");
+        };
+        assert_eq!(failed, path);
+        assert!(source.is_data());
+    }
+
+    #[tokio::test]
+    async fn filesystem_errors_preserve_the_path_and_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.json");
+        fs::create_dir(&path).unwrap();
+        let error = read_json::<u64>(&path, 16).await.unwrap_err();
+        assert_eq!(error.path(), path);
+        assert!(error.source().unwrap().is::<io::Error>());
+        let StorageError::Io { source, .. } = error else {
+            panic!("expected a filesystem error");
+        };
+        // Opening a directory fails on Windows; reading it fails on Unix.
+        assert_ne!(source.kind(), io::ErrorKind::NotFound);
+        assert!(source.raw_os_error().is_some());
+        assert!(path.is_dir());
+    }
+}
+
+#[cfg(test)]
+mod json_write_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn publishes_and_replaces_documents_with_or_without_stale_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.json");
+        let pending = directory.path().join("document.json.pending");
+        write_json_atomic(&path, "original document").await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#""original document""#);
+        assert!(!pending.exists());
+
+        write_json_atomic(&path, "replacement").await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#""replacement""#);
+        assert!(!pending.exists());
+
+        // Shorter JSON must leave neither the old document nor a staging suffix.
+        fs::write(&pending, b"interrupted staging contents").unwrap();
+        write_json_atomic(&path, "x").await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#""x""#);
+        assert!(!pending.exists());
+    }
+
+    #[tokio::test]
+    async fn serialization_failure_changes_no_files() {
+        // Serde supports this map, but JSON cannot encode an array as an object key.
+        let invalid_json = std::collections::BTreeMap::from([(vec![1, 2], 3)]);
+        for existing_files in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let parent = directory.path().join("metadata");
+            let path = parent.join("document.json");
+            let pending = parent.join("document.json.pending");
+            if existing_files {
+                fs::create_dir(&parent).unwrap();
+                fs::write(&path, b"original document").unwrap();
+                fs::write(&pending, b"original staging").unwrap();
+            }
+
+            let StorageError::Json {
+                path: failed,
+                source,
+            } = write_json_atomic(&path, &invalid_json).await.unwrap_err()
+            else {
+                panic!("expected the serialization error");
+            };
+            assert_eq!(failed, path);
+            assert_eq!(source.to_string(), "key must be a string");
+            if existing_files {
+                assert_eq!(fs::read(&path).unwrap(), b"original document");
+                assert_eq!(fs::read(&pending).unwrap(), b"original staging");
+            } else {
+                assert!(!parent.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writing_does_not_create_parent_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("absent");
+        let path = parent.join("document.json");
+        let StorageError::Io {
+            path: failed,
+            source,
+        } = write_json_atomic(&path, &[1, 2, 3][..]).await.unwrap_err()
+        else {
+            panic!("expected the missing parent's I/O error");
+        };
+        assert_eq!(failed, parent.join("document.json.pending"));
+        assert_eq!(source.kind(), io::ErrorKind::NotFound);
+        assert!(!parent.exists());
     }
 }
 
@@ -865,9 +1168,10 @@ mod tests {
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
+    use crate::streams::LogFileIdRangeError;
 
     #[tokio::test]
-    async fn checkpoint_publication_replaces_metadata_and_reuses_interrupted_staging() {
+    async fn checkpoint_publication_replaces_metadata_and_truncates_interrupted_staging() {
         let directory = tempfile::tempdir().unwrap();
         let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
         let path = provider.checkpoint_file_path(StreamId::MIN);
@@ -878,15 +1182,15 @@ mod checkpoint_tests {
             r#"{"end":{"record_id":{"stream_id":0,"sequence_number":1},"position":32}}"#;
         let first: StreamCheckpoint = serde_json::from_str(first_json).unwrap();
         let next: StreamCheckpoint = serde_json::from_str(next_json).unwrap();
-        provider.write_checkpoint(&first).unwrap();
+        provider.write_checkpoint(&first).await.unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), first_json);
-        let pending = path.parent().unwrap().join(".checkpoint.pending");
+        let pending = path.parent().unwrap().join("checkpoint.json.pending");
         fs::write(&pending, b"interrupted metadata").unwrap();
         assert_eq!(
             provider.read_checkpoint(StreamId::MIN).await.unwrap(),
             Some(first)
         );
-        provider.write_checkpoint(&next).unwrap();
+        provider.write_checkpoint(&next).await.unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), next_json);
         assert_eq!(
             provider.read_checkpoint(StreamId::MIN).await.unwrap(),
@@ -895,9 +1199,12 @@ mod checkpoint_tests {
         assert!(!pending.exists());
 
         fs::create_dir(&pending).unwrap();
-        let error = provider.write_checkpoint(&first).unwrap_err();
+        let collision = pending.join("preserve");
+        fs::write(&collision, b"existing contents").unwrap();
+        let error = provider.write_checkpoint(&first).await.unwrap_err();
         assert_eq!(error.path(), pending);
         assert_eq!(fs::read_to_string(path).unwrap(), next_json);
+        assert_eq!(fs::read(collision).unwrap(), b"existing contents");
     }
 
     #[tokio::test]
@@ -909,13 +1216,47 @@ mod checkpoint_tests {
             r#"{"end":{"record_id":{"stream_id":0,"sequence_number":0},"position":16}}"#,
         )
         .unwrap();
-        assert!(provider.write_checkpoint(&checkpoint).is_err());
+        assert!(provider.write_checkpoint(&checkpoint).await.is_err());
         assert!(!root.exists());
         let path = provider.checkpoint_file_path(StreamId::MIN);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let pending = path.parent().unwrap().join(".checkpoint.pending");
+        let pending = path.parent().unwrap().join("checkpoint.json.pending");
         fs::write(pending, b"never certified").unwrap();
         assert_eq!(provider.read_checkpoint(StreamId::MIN).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rename_failure_preserves_staging_and_allows_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let json = r#"{"end":{"record_id":{"stream_id":0,"sequence_number":7},"position":128}}"#;
+        let checkpoint: StreamCheckpoint = serde_json::from_str(json).unwrap();
+        let path = provider.checkpoint_file_path(StreamId::MIN);
+        let pending = path.parent().unwrap().join("checkpoint.json.pending");
+        fs::create_dir_all(&path).unwrap();
+        let collision = path.join("preserve");
+        fs::write(&collision, b"existing contents").unwrap();
+
+        let StorageError::Io {
+            path: failed,
+            source,
+        } = provider.write_checkpoint(&checkpoint).await.unwrap_err()
+        else {
+            panic!("expected the rename's I/O error");
+        };
+        assert_eq!(failed, path);
+        assert_ne!(source.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read_to_string(&pending).unwrap(), json);
+        assert_eq!(fs::read(&collision).unwrap(), b"existing contents");
+
+        fs::remove_file(collision).unwrap();
+        fs::remove_dir(&path).unwrap();
+        provider.write_checkpoint(&checkpoint).await.unwrap();
+        assert_eq!(
+            provider.read_checkpoint(StreamId::MIN).await.unwrap(),
+            Some(checkpoint)
+        );
+        assert!(!pending.exists());
     }
 
     #[tokio::test]
@@ -923,27 +1264,134 @@ mod checkpoint_tests {
         let directory = tempfile::tempdir().unwrap();
         let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
         let file = LogFileId::new(StreamId::MIN, LogFileNumber::MIN);
-        provider.remove_log_and_index(file).await.unwrap();
+        provider.remove_log_and_index(file..=file).await.unwrap();
         assert!(!directory.path().join("streams").exists());
         let log = provider.log_file_path(file);
         let index = provider.index_file_path(file);
         fs::create_dir_all(log.parent().unwrap()).unwrap();
         fs::write(&index, b"orphan").unwrap();
-        provider.remove_log_and_index(file).await.unwrap();
+        provider.remove_log_and_index(file..=file).await.unwrap();
         assert!(!index.exists());
         fs::write(&log, b"discard").unwrap();
         fs::write(&index, b"discard").unwrap();
-        provider.remove_log_and_index(file).await.unwrap();
-        provider.remove_log_and_index(file).await.unwrap();
+        provider.remove_log_and_index(file..=file).await.unwrap();
+        provider.remove_log_and_index(file..=file).await.unwrap();
         assert!(!log.exists());
         assert!(!index.exists());
         assert!(log.parent().unwrap().exists());
         fs::write(&log, b"discard").unwrap();
         fs::create_dir(&index).unwrap();
-        let error = provider.remove_log_and_index(file).await.unwrap_err();
+        let error = provider
+            .remove_log_and_index(file..=file)
+            .await
+            .unwrap_err();
         assert_eq!(error.path(), index);
         assert!(!log.exists());
         assert!(index.is_dir());
+    }
+
+    #[tokio::test]
+    async fn pair_range_removal_is_inclusive_across_directories_and_preserves_neighbors() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let file = |number| LogFileId::new(StreamId::MIN, LogFileNumber::new(number).unwrap());
+        let first = file(999);
+        let last = file(1002);
+        let discarded = [
+            provider.log_file_path(first),
+            provider.index_file_path(first),
+            provider.log_file_path(file(1000)),
+            provider.index_file_path(last),
+        ];
+        let other_stream = LogFileId::new(StreamId::new(1).unwrap(), first.file_number());
+        let preserved = [
+            provider.log_file_path(file(998)),
+            provider.index_file_path(file(998)),
+            provider.log_file_path(file(1003)),
+            provider.index_file_path(file(1003)),
+            provider.log_file_path(other_stream),
+            provider.index_file_path(other_stream),
+            provider.checkpoint_file_path(StreamId::MIN),
+        ];
+        for path in discarded.iter().chain(&preserved) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"original contents").unwrap();
+        }
+
+        // Includes a log-only pair, an absent pair and an index-only pair.
+        provider.remove_log_and_index(first..=last).await.unwrap();
+        provider.remove_log_and_index(first..=last).await.unwrap();
+
+        for number in 999..=1002 {
+            assert!(!provider.log_file_path(file(number)).exists());
+            assert!(!provider.index_file_path(file(number)).exists());
+        }
+        for path in preserved {
+            assert_eq!(fs::read(path).unwrap(), b"original contents");
+        }
+        for path in discarded {
+            assert!(path.parent().unwrap().is_dir());
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_range_removal_rejects_invalid_bounds_before_deleting_anything() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let first = LogFileId::new(StreamId::MIN, LogFileNumber::new(2).unwrap());
+        let earlier = LogFileId::new(StreamId::MIN, LogFileNumber::new(1).unwrap());
+        let other_stream = LogFileId::new(StreamId::new(1).unwrap(), first.file_number());
+        for id in [first, earlier, other_stream] {
+            let log = provider.log_file_path(id);
+            fs::create_dir_all(log.parent().unwrap()).unwrap();
+            fs::write(log, b"preserve log").unwrap();
+            fs::write(provider.index_file_path(id), b"preserve index").unwrap();
+        }
+
+        for (last, expected) in [
+            (
+                earlier,
+                LogFileIdRangeError::ReversedFiles {
+                    first,
+                    last: earlier,
+                },
+            ),
+            (
+                other_stream,
+                LogFileIdRangeError::DifferentStreams {
+                    first,
+                    last: other_stream,
+                },
+            ),
+        ] {
+            let StorageError::Io { path, source } = provider
+                .remove_log_and_index(first..=last)
+                .await
+                .unwrap_err()
+            else {
+                panic!("expected a path-bearing I/O error");
+            };
+            assert_eq!(path, provider.log_file_path(first));
+            assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                source
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<LogFileIdRangeError>(),
+                Some(&expected)
+            );
+        }
+
+        for id in [first, earlier, other_stream] {
+            assert_eq!(
+                fs::read(provider.log_file_path(id)).unwrap(),
+                b"preserve log"
+            );
+            assert_eq!(
+                fs::read(provider.index_file_path(id)).unwrap(),
+                b"preserve index"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1011,8 +1459,8 @@ mod clustering_configuration_tests {
     };
     use uuid::Uuid;
 
-    #[test]
-    fn absent_read_has_no_side_effects_and_both_modes_round_trip() {
+    #[tokio::test]
+    async fn absent_read_has_no_side_effects_and_both_modes_round_trip() {
         for node in [
             None,
             Some(NodeName::Master),
@@ -1032,20 +1480,23 @@ mod clustering_configuration_tests {
                 )),
             };
             let stored = EstablishedClusteringConfiguration::new(Uuid::from_u128(1), config);
-            provider.write_clustering_configuration(&stored).unwrap();
+            provider
+                .write_clustering_configuration(&stored)
+                .await
+                .unwrap();
             assert_eq!(
                 provider.read_clustering_configuration().unwrap(),
                 Some(stored)
             );
-            assert!(!root.join(PENDING_FILE_NAME).exists());
+            assert!(!root.join("clustering.json.pending").exists());
         }
     }
 
-    #[test]
-    fn reads_independent_fixture_and_refuses_overwrite() {
+    #[tokio::test]
+    async fn reads_independent_fixture_and_replaces_it_when_requested() {
         let temp = tempfile::tempdir().unwrap();
         let provider = StorageProvider::new(StorageConfig::new(temp.path().to_owned()).unwrap());
-        let path = temp.path().join(FILE_NAME);
+        let path = temp.path().join("clustering.json");
         let fixture = br#"{"cluster_id":"00000000-0000-0000-0000-000000000001","clustering_configuration":"single"}"#;
         fs::write(&path, fixture).unwrap();
         let loaded = provider.read_clustering_configuration().unwrap().unwrap();
@@ -1060,19 +1511,25 @@ mod clustering_configuration_tests {
             Uuid::from_u128(2),
             ClusteringConfiguration::Single,
         );
-        assert!(
-            provider
-                .write_clustering_configuration(&replacement)
-                .is_err()
+        provider
+            .write_clustering_configuration(&replacement)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            br#"{"cluster_id":"00000000-0000-0000-0000-000000000002","clustering_configuration":"single"}"#
         );
-        assert_eq!(fs::read(&path).unwrap(), fixture);
+        assert_eq!(
+            provider.read_clustering_configuration().unwrap(),
+            Some(replacement)
+        );
     }
 
-    #[test]
-    fn malformed_oversized_and_interrupted_metadata_fail_closed() {
+    #[tokio::test]
+    async fn reads_reject_invalid_metadata_and_writes_replace_stale_staging() {
         let temp = tempfile::tempdir().unwrap();
         let provider = StorageProvider::new(StorageConfig::new(temp.path().to_owned()).unwrap());
-        let path = temp.path().join(FILE_NAME);
+        let path = temp.path().join("clustering.json");
         for fixture in [
             b"".as_slice(),
             b"{}",
@@ -1098,22 +1555,23 @@ mod clustering_configuration_tests {
             error => panic!("expected size-limit error, got {error:?}"),
         }
         fs::remove_file(path).unwrap();
-        fs::write(temp.path().join(PENDING_FILE_NAME), b"partial").unwrap();
+        fs::write(temp.path().join("clustering.json.pending"), b"partial").unwrap();
         assert!(matches!(
             provider.read_clustering_configuration(),
             Err(StorageError::Io { .. })
         ));
-        assert!(
-            provider
-                .write_clustering_configuration(&EstablishedClusteringConfiguration::new(
-                    Uuid::from_u128(1),
-                    ClusteringConfiguration::Single
-                ))
-                .is_err()
+        let stored = EstablishedClusteringConfiguration::new(
+            Uuid::from_u128(1),
+            ClusteringConfiguration::Single,
         );
+        provider
+            .write_clustering_configuration(&stored)
+            .await
+            .unwrap();
+        assert!(!temp.path().join("clustering.json.pending").exists());
         assert_eq!(
-            fs::read(temp.path().join(PENDING_FILE_NAME)).unwrap(),
-            b"partial"
+            provider.read_clustering_configuration().unwrap(),
+            Some(stored)
         );
     }
 }

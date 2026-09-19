@@ -14,8 +14,10 @@ certifies prior validation and synchronization of the covered log and index.
 [`IndexedLogValidator`](indexed_log_validator/README.md) passes the
 accepted suffix offsets to `IndexFileValidator::validate`, returning a synchronized
 pair's endpoint and, for partial files, handles positioned for appending. It opens
-one existing log/index pair through a borrowed `StorageProvider`. Checkpoint
-publication and stream/startup orchestration remain separate work.
+one existing log/index pair through a borrowed `StorageProvider`. The
+[stream initializer](../stream_initializer/README.md) orchestrates sequential pair
+validation and later-file cleanup; its checkpoint advancement and startup
+integration remain separate work.
 
 The focused log/index validators receive already-open files and domain values;
 the combined validator acquires those files through `StorageProvider`. Storage path

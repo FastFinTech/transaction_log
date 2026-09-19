@@ -86,6 +86,11 @@ UUID during first establishment and shares it with both replicas; subsequent
 loads retain the UUID. It is not a user-supplied deployment setting. No particular
 UUID version is required by this value model.
 
+Storage directly reads and writes this model, and its atomic write operation can
+replace existing metadata. The clustering lifecycle caller owns write-once
+establishment and preservation of the permanent identity; storage does not enforce
+that application policy. Lifecycle enforcement remains planned.
+
 Peers must agree on UUID and domain while occupying different local slots.
 Whole-value equality includes the slot, so it is not the cluster handshake's
 agreement check. Fresh storage has no established configuration; deciding whether

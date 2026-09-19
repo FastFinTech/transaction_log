@@ -1,214 +1,279 @@
 # Stream initializer
 
-`StreamInitializer` is the planned startup recovery coordinator for **one stream**.
-Its source and tests are currently commented out, and `streams` does not declare
-or re-export the module. The disabled scaffold uses a removed validator API; it
-must be adapted to the current [pair validator](../validation/indexed_log_validator/README.md)
-before being re-enabled. No initializer or startup integration is currently running.
-The requirements below describe the intended recovery lifecycle, not a callable API.
+This module scaffolds startup recovery for **one stream**. `StreamInitializer` is
+an empty public type with one associated async method. It will own a private
+`InitializationState` for the duration of initialization and return an
+`InitializedStream` containing the active log/index files and their file-local end.
+Both public types are re-exported from `streams`.
 
-## Planned recovery phases
+**Current status:** `initialize` creates private state and delegates to the steps
+in the order below, propagating errors before proceeding. The private constructor
+stores the stream ID and provider reference and sets all optional fields to `None`
+without I/O. Checkpoint loading reads the optional metadata and checks its stream ID.
+Discovery records the highest existing log and rejects a maximum below the
+checkpoint's file, including absent logs when a checkpoint exists. Validation
+recovers successive pairs, retaining the first partial pair or marking a gap for
+later cleanup. Cleanup removes the marked range through the discovered maximum.
+Fresh-pair preparation, checkpoint advancement and the final handover still have
+`todo!()` bodies. The result uses `getset` getters without a manual impl. Polling
+`initialize` returns loading/discovery/validation/cleanup errors, or reaches the
+unimplemented pair-preparation step and panics after successful cleanup.
+Application startup does not call it. The previous
+implementation and its obsolete tests have been removed.
 
-Construction selects one stream and borrows its provider without I/O. The planned
-`initialize(&mut self)` runs these private operations in order, propagating errors.
-Its eventual return is `Result<IndexedLogWriter<File>>`:
+## Source map
 
-1. `load_checkpoint`: load the stream's last checkpoint or establish absence.
-2. `discover_log_files`: find the maximum log and set up inclusive file enumeration.
-3. `validate_and_repair`: validate logs, remove corrupt tails and repair indexes.
-4. `remove_later_files`: delete pairs beyond the recovered contiguous prefix.
-5. `advance_checkpoint`: synchronize covered data and publish the checkpoint.
-6. `prepare_active_writer`: return the retained writer or create a fresh pair.
+- `stream_initializer.rs`: the empty public entry point and private working state.
+  The private state stays beside its entry point so its fields and step methods
+  can remain private to that implementation file.
+- `initialized_stream.rs`: the owned result and derived read-only getters.
+  Its fields are accessible only within this component.
+- `mod.rs`: declarations, re-exports and this README's Rustdoc inclusion.
 
-Recovery state, concrete error contracts and writer handover will be settled when
-the scaffold is adapted. Incremental checkpoint publication after each completed
-file is not implemented.
+The following distinguishes implemented loading, discovery, validation and cleanup from
+the agreed contracts for later recovery steps.
 
-### Checkpoint loading
+## Public API and result
 
-`load_checkpoint` calls the provider's async `read_checkpoint`. A missing path
-means no checkpoint and creates nothing. Malformed JSON, oversized metadata and
-other I/O failures propagate with their concrete `StorageError` and path intact.
-The initializer rejects a checkpoint belonging to another stream, reporting the
-path and both stream IDs. It replaces its retained checkpoint only after a
-successful read and identity check; failure preserves previous state and aborts
-`initialize` before file discovery. Cancellation likewise cannot accept a partial
-result. Loading does not inspect log/index contents or certify readiness.
+```no_run
+use transaction_log::{
+    storage::StorageProvider,
+    streams::{InitializedStream, StreamInitializer},
+};
+use transaction_log_exports::StreamId;
 
-### File discovery and enumeration
+async fn initialize_one(
+    stream_id: StreamId,
+    storage_provider: &StorageProvider,
+) -> anyhow::Result<InitializedStream> {
+    let initialized = StreamInitializer::initialize(stream_id, storage_provider).await?;
+    let _file_id = initialized.file_id();
+    let _file_end = initialized.end();
+    let _log = initialized.log();
+    let _index = initialized.index();
+    Ok(initialized)
+}
+```
 
-After checkpoint loading, discovery asks the provider for the maximum existing
-log. It rejects a maximum below the checkpoint's file, or absent despite an
-existing checkpoint. Otherwise it retains private first/maximum file IDs:
-the checkpoint's own file (not its successor), or file zero without a
-checkpoint, through the maximum inclusive. Consumers use `first.iter_to(maximum)`
-to enumerate lazily through the shared `LogFileId` API; there is no custom
-initializer iterator type. With no checkpoint and no logs, both bounds are absent.
-Successful discovery replaces the previous bounds;
-errors or cancellation do not accept partially discovered bounds.
+`initialize(stream_id, storage_provider)` returns `anyhow::Result<InitializedStream>`.
+This application-level result keeps the scaffold's error surface small while
+allowing concrete provider/validator errors to propagate during implementation.
+The public initializer has no constructor, fields, lifetime parameter or reusable
+operation state. The provider is borrowed only during initialization.
 
-The shared iterator uses constant state and performs no I/O. IDs between the bounds may
-name missing files; validation will detect those gaps later. The iterator stops
-before asking the final ID for a successor, including at `LogFileNumber::MAX`,
-and remains exhausted on subsequent calls. Empty maximum logs count. Discovery
-does not inspect checkpoint/file agreement, repair indexes or delete later files.
+The result owns `file_id: LogFileId`, `log: tokio::fs::File`,
+`index: tokio::fs::File` and `end: Option<RecordEndLocation>`. `getset` supplies:
 
-### Single-file validation and repair
+- `file_id(&self) -> LogFileId` identifies the pair even when it is empty.
+- `end(&self) -> Option<RecordEndLocation>` identifies its last accepted record.
+- `log(&self) -> &File` borrows the owned log handle.
+- `index(&self) -> &File` borrows the owned index handle.
 
-Single-file recovery delegates to `IndexedLogValidator::validate`, which returns
-`Result<ValidatedFilePair, IndexedLogValidationError>`. The caller supplies an ID
-from this stream. It supplies the checkpoint's
-trusted endpoint only when the requested file is the checkpoint's own file;
-other files are validated from the beginning, with concrete errors preserved.
+Successful initialization will establish synchronized files positioned for
+appending, with no invalid log bytes or index entries after their accepted ends.
+The pair has room for another record: a completed final file requires preparing
+its successor. No writer is constructed here.
 
-The validator scans and truncates the log, synchronizes it, then replaces and
-synchronizes the index suffix. Complete results contain an endpoint; partial
-results also contain both files positioned for appending. No separate report or
-repair call is required. It does not advance checkpoints or construct a writer.
-Missing files and operational failures propagate as errors; the range loop
-distinguishes a missing authoritative log from other failures.
+The returned endpoint belongs **only to the returned file**. If file 7 is complete
+and file 8 is empty, the result identifies file 8 with `end == None`, while the
+stream checkpoint still covers the final record in file 7. The private
+`recovered_end` preserves that stream-wide progress. `None` is never a sentinel
+record ID; sequence zero remains a valid first record.
 
-The validator's exclusive-ownership and incomplete-I/O contracts apply. Recovery
-failure or cancellation may leave a repaired index or truncated tail, but never
-returns a successful pair; these changes are not an atomic pair operation.
-Dropping/reopening alone does not quiesce outstanding
-Tokio file operations; the future coordinator must respect that lifecycle.
+## Private state and step signatures
 
-### Recovery range loop
+`InitializationState<'a>` owns the selected stream ID, the borrowed provider,
+original checkpoint, discovered maximum file, latest recovered stream endpoint,
+optional active pair and first file to discard. The original checkpoint remains
+available throughout recovery. The first file to inspect is derived from it, or
+from file zero without a checkpoint. No file list or completed-file collection is
+retained. The optional active pair holds at most one set of open files.
 
-The loop consumes `first.iter_to(maximum)` and calls single-file recovery for
-each ID. `ValidatedFilePair::Complete` supplies a synchronized endpoint with both
-handles already closed. `Partial` results, including empty or truncated pairs,
-stop the loop and retain their synchronized handles for writer handover. A partial
-pair's accepted endpoint extends `validated_end`; an empty pair preserves the
-previous file's endpoint. This endpoint is synchronized validation progress, not a
-published checkpoint.
+The public operation creates state, calls these steps in order, then consumes it.
+Construction, checkpoint loading, discovery, validation and cleanup are implemented;
+the remaining private methods are `todo!()` placeholders:
 
-Only `IndexedLogValidationError::Storage(StorageError::Io)` with `NotFound` at the requested
-log path is a gap. A gap in the checkpoint's own file propagates as an error;
-other gaps stop recovery. Index acquisition failures, inconsistent trusted
-prefixes, read failures and completion/sync failures propagate without authorizing
-discard. No files means no recovery I/O or endpoint.
+| Private method | Return type | Intended responsibility |
+| --- | --- | --- |
+| `new(stream_id: StreamId, storage_provider: &'a StorageProvider)` | `Self` | Implemented: store the inputs and initialize optional state to `None`, without I/O. |
+| `async load_checkpoint(&mut self)` | `Result<()>` | Implemented: load the optional checkpoint and verify its stream ID. |
+| `async discover_log_files(&mut self)` | `Result<()>` | Implemented: find the maximum log and reject absence or a maximum below a checkpointed file. |
+| `async validate_files(&mut self)` | `Result<()>` | Implemented: recover successive pairs; continue through complete files and stop at a partial pair or missing uncheckpointed log. |
+| `async remove_later_files(&mut self)` | `Result<()>` | Implemented: remove discarded pairs through the discovered maximum. |
+| `async prepare_active_pair(&mut self)` | `Result<()>` | Retain a partial pair or create a synchronized empty pair. |
+| `async advance_checkpoint(&mut self)` | `Result<()>` | Complete required directory synchronization and publish the recovered stream endpoint. |
+| `finish(self)` | `InitializedStream` | Transfer the prepared pair without more I/O. |
 
-Successful recovery records `first_file_to_remove`: the missing file itself
-(allowing removal of an orphan index), or the successor of a partial file when
-later files exist. The cleanup range ends at the original discovered maximum.
-No successor is requested for a partial maximum file. The subsequent cleanup
-operation removes that range before checkpoint advancement; the loop itself
-does not delete future pairs or publish service readiness.
+Here `Result<T>` means `anyhow::Result<T>`. Checkpoint advancement is asynchronous
+to await `StorageProvider::write_checkpoint`, which owns checkpoint publication
+and synchronization of its immediate parent directory through Tokio. Its body
+remains a scaffold. Pair preparation precedes publication so
+fresh-file creation cannot fail after that final publication step. A successful
+step sequence must establish the state needed by the infallible `finish`.
 
-Only the accepted endpoint, retained partial files and cleanup boundary are
-published to the initializer after a successful loop. Failure/cancellation may
-leave earlier repairs or synchronized full pairs on disk, but do not publish new
-loop state or a checkpoint. This is not a rollback guarantee. The caller must
-quiesce outstanding file operations before retrying; no automatic retry or startup
-integration is implemented. No per-file validator collection is retained.
+## Checkpoint loading (implemented)
 
-### Later-file cleanup and checkpoint publication
+`load_checkpoint` delegates reading and metadata deserialization to
+`StorageProvider::read_checkpoint`. A missing checkpoint, including a missing
+storage root, sets `checkpoint` to `None`. A present checkpoint must identify the
+requested stream; a mismatch reports the checkpoint path and both stream IDs.
+Provider failures retain their concrete `StorageError` and path through `anyhow`.
 
-Cleanup enumerates the marked range inclusively and removes each log before its
-index. Missing files are accepted, including a gap with only an orphan index.
-It does not remove directories. The marker is cleared only after complete
-success; failure or cancellation may leave partial deletion and prevents the
-normal initialization sequence from advancing its checkpoint.
+State is assigned only after reading and the stream check succeed, so an error
+leaves the previous checkpoint untouched. This step creates or modifies no files,
+does not require logs or indexes to exist, and does not advance `recovered_end`.
+Agreement with actual log/index contents belongs to the later validation step;
+loading the checkpoint alone does not establish stream readiness.
 
-Advancement rejects an uncleared cleanup marker. The retained partial files are
-already synchronized and positioned; constructing and retaining their writer is a
-separate handover step. Full pairs were synchronized and closed in the range loop.
-The provider
-also synchronizes pair-directory entries and their ancestors through its root on
-Unix before publication, covering newly created repair indexes.
+## Log-file discovery (implemented)
 
-A nonempty `validated_end` becomes the supplied `StreamCheckpoint` for provider
-publication. Only successful publication updates the initializer's checkpoint.
-An empty stream writes no checkpoint; an empty pair after a full file preserves
-the full file's checkpoint boundary. Provider publication uses synchronized
-staging JSON and rename replacement, with Unix ancestor-directory synchronization.
-Windows directory durability and durability of the configured root's own parent
-are outside that guarantee. See [storage](../../storage/README.md#stream-checkpoints).
+After checkpoint loading succeeds, `discover_log_files` delegates to
+`StorageProvider::maximum_log_file` for the selected stream. It records only the
+optional maximum ID, without collecting a file list. Empty logs count; orphan
+indexes do not establish log existence. Without a checkpoint, absent logs are valid
+and store `None`. With a checkpoint, the maximum must exist and its file number
+must be at least the checkpoint's file number. Both IDs belong to the selected
+stream, established by checkpoint loading and the provider's search scope.
 
-Synchronization/publication failures return errors, possibly with a synchronized
-writer retained or metadata already renamed. They do not certify app readiness.
-The caller must reread metadata after an uncertain publication; no rollback,
-automatic retry or cluster coordination is implemented.
+Discovery changes no files and assigns `maximum_log_file` only on success.
+Provider errors retain their concrete `StorageError` and path. A failed search
+or checkpoint comparison leaves the previous maximum untouched. This check
+establishes an upper bound, not continuity or checkpoint-file presence: a higher
+log can exist despite a missing checkpointed log. Opening the checkpointed file,
+checking its length and trusted index entry, and detecting gaps belong to the
+later validation step. Discovery does not advance `recovered_end` or prepare files.
 
-## Intended responsibility
+## Sequential pair validation (implemented)
 
-The initializer will load the stream's last checkpoint, validate subsequent log
-contents, repair indexes, advance the checkpoint and hand ownership of the active
-pair to an `IndexedLogWriter`. It does not initialize all streams or schedule
-normal appends, flushes, replication or file rotation during service operation.
-An eventual caller will coordinate initializers for multiple streams.
+After loading and discovery, `validate_files` uses `LogFileId::iter_to` for lazy
+enumeration from the checkpoint's file, or file zero, through the discovered
+maximum. No maximum means an empty stream and no file operations. The original
+trusted endpoint is supplied only to its own file; later files start without a
+trusted prefix. Every pair is delegated to
+[`IndexedLogValidator`](../validation/indexed_log_validator/README.md).
 
-Reuse the [validator](../validation/indexed_log_validator/README.md) for pair recovery and
-the [writer](../indexed_log_writer/README.md) for append ownership. The
-[stream specification](../README.md#stream-checkpoint-model) owns checkpoint
-certification; [storage](../../storage/README.md) owns physical paths and file
-operations. No alternative codec or path layout belongs here.
+Complete results advance the stream endpoint and release their handles. A partial
+result stops scanning and retains the pair in `active_pair`, with synchronized
+files positioned for appending. Its file-local endpoint remains `None` when empty,
+while `recovered_end` preserves the preceding complete file's endpoint. Corrupt log
+tails are already removed by the validator. If the partial file precedes the
+discovered maximum, its successor becomes `first_file_to_remove`; otherwise no
+cleanup is needed. When every discovered file is complete, `active_pair` stays
+absent and `recovered_end` identifies the final record of the maximum file.
 
-## Requirements for the implementation step
+A missing log in the checkpoint's own file is an error. A missing uncheckpointed
+log stops recovery and becomes `first_file_to_remove`, including file zero when
+no checkpoint exists. Only a provider `NotFound` at that exact log path establishes
+a gap. Index-open failures, invalid trusted boundaries and other operational
+errors propagate as the original `IndexedLogValidationError` through `anyhow`,
+without marking cleanup. A missing untrusted index is rebuilt by the pair validator.
 
-Recovery must preserve a contiguous stream prefix and exclude concurrent writes.
-A loaded checkpoint must belong to the requested stream. It certifies both log
-records and their matching index entries; advancement requires synchronization
-of log data, then index data, before checkpoint publication. Absence of records
-is represented by an absent checkpoint, rather than a sequence-zero sentinel.
-Operational failures must not authorize truncation or publish readiness.
+This step neither deletes later files nor creates an active log nor publishes a
+checkpoint. Earlier files before the checkpoint's file and files beyond the first
+partial pair or gap are untouched. Call it once per initialization: failures or
+cancellation can leave completed pair repairs and earlier `recovered_end` updates.
+There is no rollback or retry on the same working state.
 
-### Agreed local recovery policy
+## Later-file cleanup (implemented)
 
-Keep only the contiguous valid log prefix:
+After successful validation, `remove_later_files` returns without I/O when no
+cleanup boundary was recorded. Otherwise it passes the inclusive range
+`first_file_to_remove..=maximum_log_file` to `StorageProvider::remove_log_and_index`
+in one call. The provider owns enumeration and directory synchronization.
+Validation only records a
+cleanup boundary when a maximum exists; a missing maximum here is an internal
+invariant violation, not an empty range.
 
-- On a reported corrupt log tail, truncate the current file at the last accepted
-  record boundary, preserving every valid preceding record. The validator handles
-  truncation and log synchronization before rebuilding and synchronizing the index.
-- On a missing log file, delete any later log files beyond that gap.
-- On an incomplete log file, including one made incomplete by tail truncation,
-  preserve its valid prefix and delete any later log files.
+The range includes a missing log's orphan index after a gap, or starts immediately
+after a retained partial pair. Discarded pairs cannot describe a contiguous
+prefix; cluster coordination will later recover required data. The provider
+tolerates missing logs/indexes, deletes the log before the index, and synchronizes
+each distinct immediate parent directory once on Unix using Tokio's async API.
+It leaves directories and unrelated entries in place.
+No files outside the selected stream and inclusive range are removed.
 
-Discarded future log files' paired indexes must also be removed; their offsets
-cannot describe retained records. A missing derived index is repairable and is
-not itself a log gap. An operational I/O failure is not evidence that a file is
-missing or its contents are corrupt.
+Cleanup stops at the first error, preserving the concrete `StorageError` and path
+through `anyhow`. Earlier removals, including just one half of a pair, can already
+have completed. It retains the original bounds, active pair and recovered endpoint
+on success or failure, and never publishes a checkpoint. After outstanding I/O
+is quiescent and an obstruction is resolved, the same cleanup range can be
+repeated; already-absent files are accepted. There is no automatic retry or rollback.
 
-This deliberately discards disconnected local suffixes rather than attempting
-to salvage records across a gap. Cluster coordination will subsequently reload
-the required data. Local initialization does not perform that synchronization
-or establish cluster readiness; those remain separate lifecycle responsibilities.
+## Remaining recovery steps (planned)
 
-Adapting the disabled scaffold, fresh-pair creation and returning the retained
-active writer remain to be implemented. Automatic retry after incomplete I/O and cluster synchronization
-remain separate lifecycle work. No workers, locks or concurrency policy have
-been selected.
+Cleanup must complete before checkpoint publication. An empty stream publishes
+no checkpoint, while an empty active file after complete files preserves their
+recovered endpoint. Loading metadata alone never certifies stream readiness.
 
-This is startup work rather than a per-record hot path. There are no initializer
-performance measurements or optimization claims.
+The recovery owner excludes concurrent access and finishes earlier I/O before
+starting. File synchronization, directory-entry durability and checkpoint
+publication are separate guarantees. Synchronize covered pairs and required
+directories before publishing. The provider synchronizes Unix directories changed
+by checkpoint publication and range deletion, without traversing ancestors.
+It has no separate directory-sync helper; recovery must establish directory-entry
+durability for new or repaired pairs before checkpoint advancement.
+Platform limitations remain as described by
+[storage](../../storage/README.md#stream-checkpoints).
 
-## Source and validation
+Errors or cancellation may follow partial repair or cleanup; the remaining steps
+can also fail after partial pair preparation or publication.
+Do not claim rollback or safe automatic replay; quiesce outstanding I/O and reread
+metadata after uncertain publication. No workers, locks, timers, startup wiring,
+cluster coordination or live rotation are part of this scaffold.
 
-`stream_initializer.rs` contains the commented-out scaffold and its tests;
-`mod.rs` is also outside the compiled module tree. Iterator tests live with
-`LogFileId` in the [location module](../location/README.md), and active pair recovery
-tests live with `IndexedLogValidator`.
-When re-enabling the initializer, adapt and run its same-file tests for empty discovery, inclusive checkpoint/file-zero
-starts, missing intermediate IDs, contradictory maxima, large lazy ranges and
-provider failures, as well as absence without side effects, a literal
-checkpoint boundary, wrong-stream rejection and concrete storage errors.
-Single-file tests cover independent expected index bytes, missing/bad/extra index
-suffixes, corrupt tails with zero or more valid preceding records, trusted-prefix
-preservation, later-file boundary selection, missing logs and an unavailable
-trusted index. They verify retained log bytes and no checkpoint publication.
-Range-loop tests cover full-to-partial recovery, empty partial pairs, corrupt-tail
-truncation, gap-at-zero and gap-after-full handling, a full final file, missing
-checkpoint-covered logs, operational failures and retention of later files for
-the subsequent cleanup step. Cleanup/publication tests cover orphan indexes,
-preservation of the recovered pair, cleanup failures blocking advancement, empty
-streams, sequence zero, checkpoint replacement failure and restart-visible
-metadata. Provider tests cover replacement, interrupted staging reuse, partial
-pair deletion and concrete filesystem collisions.
-Provider tests cover bounded reads, malformed JSON and filesystem failures.
-Check with service tests, formatting, Clippy and Rustdoc. The disabled initializer
-tests do not run as part of today's service suite. When recovery is added,
-keep tests beside its implementation and cover checkpoints, file boundaries,
-index repair, gaps, corrupt input and interrupted recovery using independent
-fixtures and observable filesystem results.
+## Storage provider readiness
+
+Existing operations cover checkpoint read/write, maximum-log discovery, log/index
+opening for recovery and pair removal. Checkpoint publication and range removal
+own their directory synchronization. File data synchronization is available on
+the returned Tokio files.
+
+One operation is still missing: **creating a fresh log/index pair and its deeper
+range directories**. `open_log_for_validation` only opens an existing log;
+`open_index_for_repair` may create an index but requires its parent directory to
+exist. `StorageProvider::initialize` creates stream bases, not range directories
+or log files. Add a purpose-specific provider operation when implementing
+`prepare_active_pair`; it must avoid overwriting an existing log and define how
+an existing orphan index or interrupted creation is handled. Range-based pair
+removal with asynchronous directory synchronization is implemented; fresh-pair
+creation remains deferred.
+
+## Validation and performance
+
+Build and lint the declared signatures and compile the README example; do not
+execute the placeholder methods or add tests that merely assert `todo!()` panics.
+Same-file checkpoint-loading tests cover absent storage, independent literal
+metadata (including sequence zero and a later file), wrong-stream metadata, JSON
+and I/O failures, retained state on errors, and unchanged storage. Discovery tests
+cover absent/index-only storage, stream isolation, empty maximum logs, maxima
+equal to/after/before the checkpointed file, absent logs with a checkpoint, deferred
+pair checks, and preserved state and concrete errors on failure. Provider tests
+cover the read-size limit, metadata parsing and directory-search details.
+Validation tests cover multiple complete files, partial/empty/corrupt tails,
+checkpoint-file starting points and trust handoff, missing logs with and without
+checkpoints, index-open and trusted-boundary errors, append positions, and retained
+earlier progress after failure. Independent record/index fixtures and expected
+endpoints check the handoff; lower validator suites cover detailed I/O failures,
+cancellation and synchronization. Tests also verify that cleanup, fresh-log
+creation and checkpoint publication have not occurred during validation.
+Cleanup tests cover absent storage, no-op cleanup with a retained pair, inclusive
+removal across range directories, gaps/orphan indexes, absent pairs, preservation
+of retained/earlier/other-stream files and checkpoints, and repeatable cleanup.
+Log and index deletion failures verify partial progress, stopping before later
+pairs and preserved concrete errors. These tests do not simulate power loss or
+cancel in-flight filesystem deletion.
+As each later step gains an implementation, add tests for fresh-pair preparation,
+publication ordering and operational failure. Preserve independent fixtures and
+observable file/checkpoint results. Recovery throughput has not been measured;
+this is startup work rather than a per-record hot path.
+
+```powershell
+cargo build -p transaction-log --locked
+cargo test -p transaction-log --locked
+cargo clippy -p transaction-log --all-targets --locked -- -D warnings
+cargo doc -p transaction-log --no-deps --locked
+```
+
+Follow the [streams validation guidance](../README.md#verification-and-performance)
+to compile documentation examples for this binary crate. The scaffold's narrowly
+scoped unused-code allowances can be removed as its state and methods gain bodies.

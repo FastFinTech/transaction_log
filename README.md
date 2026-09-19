@@ -231,7 +231,7 @@ failure handling, comparison rules and integration commands.
 - [x] Storage provider with owned startup configuration, deterministic log/index/checkpoint paths and stream-directory initialization.
 - [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
 - [x] Typed record start/end locations and a range model with lazy enumeration of bounded, postfix, whole-file and prefix reads.
-- [x] Stream-owned file identities, record endpoints/ranges and checkpoint model, with validated Serde metadata and checkpoint persistence; the stream initializer is disabled pending adaptation to the current validators.
+- [x] Stream-owned file identities, record endpoints/ranges and checkpoint model, with validated Serde metadata and checkpoint persistence; stream initialization implements step orchestration, checkpoint loading with stream-ID checking, and maximum-log discovery checked against the checkpoint's file number.
 - [x] Indexed log writer with stream/sequence checks, log-before-index flushing, separate flushed/durable progress and full-file finalization.
 - [x] File-only index writer with reusable buffering and separate buffer output, file flushing and data synchronization.
 - [x] Provider-based recovery file acquisition, supplied-boundary validation, unified index/log repair and synchronized partial/full handover.
@@ -241,7 +241,7 @@ failure handling, comparison rules and integration commands.
 - [ ] Stream routing, ingestion queues, admission control and periodic progress/status messages.
 - [ ] Client ingestion rejection/disconnection.
 - [ ] Multi-file lifecycle coordination and stream-specific index queries.
-- [ ] Per-stream recovery coordination through checkpoints, pair validation, later-file cleanup and checkpoint advancement; the initializer scaffold is currently disabled.
+- [ ] Complete per-stream recovery: checkpoint loading, discovery, sequential pair validation and later-file cleanup are implemented; fresh-pair preparation and checkpoint advancement remain `todo!()`.
 - [ ] Active-writer preparation, durable flush scheduling and startup-wide recovery orchestration.
 - [ ] Replication and cluster coordination.
 - [x] Raw and validated single/cluster configuration with fixed node slots and derived DNS hostnames; storage supports configuration read/write, while startup integration remains deferred.
@@ -252,7 +252,9 @@ The checklist distinguishes implemented I/O components from service behavior.
 The indexed log writer coordinates an individual pair; the service's persistence
 schedule, live file rotation and startup integration remain to be implemented.
 Pair recovery and storage-level checkpoint publication are implemented. The
-stream initializer remains disabled; its adaptation and writer preparation are deferred.
+stream initializer loads checkpoint metadata, checks discovery bounds and validates
+successive pairs through the first partial file or gap, then removes the discarded
+range. Fresh-pair preparation and checkpoint advancement remain unimplemented.
 
 ## Workspace and development
 
@@ -302,7 +304,7 @@ design decisions, safety invariants and optimization evidence.
 | [Writer specification](services/transaction-log-exports/src/record_writer/README.md) | Constructor modes, buffering, completion, cancellation and hot-path rationale. |
 | [Storage](services/transaction-log/src/storage/README.md) | Root configuration, physical paths, file acquisition, directory initialization and configuration persistence. |
 | [Stream locations](services/transaction-log/src/streams/location/README.md) | Logical file identities, sequence grouping, record boundaries and lazy range enumeration. |
-| [Stream checkpoint](services/transaction-log/src/streams/README.md#stream-checkpoint-model) | Stream-owned checkpoint model, Serde representation and certification/publication contract; storage read/write are implemented, while initializer advancement is disabled. |
+| [Stream checkpoint](services/transaction-log/src/streams/README.md#stream-checkpoint-model) | Stream-owned checkpoint model, Serde representation and certification/publication contract; storage read/write are implemented, while initializer advancement is scaffolded. |
 | [Stream operations](services/transaction-log/src/streams/README.md) | Indexed appends, validation, repair, partial/full handover and failure handling. |
 | [Object pool](lib/object-pool/README.md) | Ownership, reclamation policy and usage. |
 | [Message I/O](lib/message-io/README.md) | Framing, Serde extension APIs, size limits, ownership and partial-I/O/cancellation contracts. |

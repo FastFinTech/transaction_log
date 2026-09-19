@@ -5,6 +5,7 @@ mod index_writer;
 mod indexed_log_writer;
 pub mod location;
 mod stream_checkpoint;
+mod stream_initializer;
 pub mod validation;
 
 pub use index_writer::{IndexWriteError, IndexWriter};
@@ -15,6 +16,7 @@ pub use location::{
     RecordStartLocation,
 };
 pub use stream_checkpoint::StreamCheckpoint;
+pub use stream_initializer::{InitializedStream, StreamInitializer};
 pub use validation::{
     IndexFileValidationError, IndexFileValidator, IndexedLogValidationError, IndexedLogValidator,
     LogFileValidationError, LogFileValidator, LogTailError, ValidatedFilePair, ValidatedLogFile,

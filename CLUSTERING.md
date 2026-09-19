@@ -12,8 +12,11 @@ The [main README](README.md) tracks overall progress.
 A database is initialized as either single or cluster. Its persisted mode is
 permanent: standalone storage cannot later become clustered, and clustered storage
 cannot be opened standalone. Configuration changes and process restarts do not
-change initialized state. Local mode/node/domain metadata and no-overwrite
+change initialized state. Local mode/node/domain metadata and atomic JSON
 publication are implemented in the [storage module](services/transaction-log/src/storage/README.md#clustering-configuration-persistence).
+Storage writes replace existing metadata; the clustering lifecycle caller owns
+write-once establishment and preservation of permanent identity. That enforcement
+is not yet wired into startup.
 Cluster enrollment and complete cross-platform durable publication remain to be specified.
 The same permanence applies to `--cluster-mode`; future startup must reject disagreement with stored configuration.
 
