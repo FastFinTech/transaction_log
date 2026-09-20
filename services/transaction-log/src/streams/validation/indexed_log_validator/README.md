@@ -113,7 +113,19 @@ An unpolled future performs no file opening or mutation.
 
 ## Testing and cost
 
-Same-file tests use the real storage provider and temporary files. Independent
+Same-file tests use [shared test storage](../../../storage/README.md#shared-test-storage).
+The real provider is constructed and cleared once per process. Each independent
+case, including parameter-loop cases, claims a distinct stream ID from the same
+atomic allocator used by initializer and provider tests. An owned fixture guard
+keeps each stream alive and removes its contents when the case's scope ends;
+declare it before file handles and await all I/O before leaving the scope.
+`store_pair` populates only that case's log/index files; it does not construct a
+provider. Cases run concurrently without a stream mutex. Additional streams need
+additional guards, and tests leave other streams and root-level metadata alone.
+Cleanup works with ordinary `cargo test`, including panic unwinding, and preserves
+the empty directory skeleton for reuse.
+Literal record templates are adapted to the allocated stream before corruption
+is introduced; full-file fixtures are encoded for their case's own ID. Independent
 record fixtures and expected little-endian index bytes verify the handoff, with
 tests for every trusted boundary in a sample pair, empty/corrupt logs, stale or
 missing indexes, append positions, repeated recovery, full-file completion and

@@ -85,7 +85,8 @@ The combined validator's tests use real storage paths and files to exercise the
 handoff, complete/partial results, cursor positions and error propagation. It does
 not introduce a storage abstraction or test-specific execution path.
 
-Run all validation suites with:
+Run all validation suites with ordinary Cargo commands. Owned storage fixtures
+clean each case's files when its scope ends, retaining the empty stream directories:
 
 ```powershell
 cargo test -p transaction-log streams::validation --locked

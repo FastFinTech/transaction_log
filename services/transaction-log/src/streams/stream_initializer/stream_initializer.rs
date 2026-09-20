@@ -236,7 +236,10 @@ mod tests {
 
     use super::InitializationState;
     use crate::{
-        storage::{StorageConfig, StorageError, StorageProvider},
+        storage::{
+            StorageConfig, StorageError, StorageProvider,
+            test_support::{record_fixture, storage_fixture},
+        },
         streams::{
             IndexFileValidationError, IndexedLogValidationError, LogFileId, LogFileNumber,
             LogFileValidationError, RecordEndLocation, StreamCheckpoint,
@@ -249,11 +252,8 @@ mod tests {
         19, 0, 7, 0, 1, 0, 0, 0, 0, 0, 0, 0, 97, 98, 99, 18, 247, 123, 204,
     ];
 
-    fn file_id(number: u64) -> LogFileId {
-        LogFileId::new(
-            StreamId::new(7).unwrap(),
-            LogFileNumber::new(number).unwrap(),
-        )
+    fn file_id(stream_id: StreamId, number: u64) -> LogFileId {
+        LogFileId::new(stream_id, LogFileNumber::new(number).unwrap())
     }
 
     fn store_pair(storage: &StorageProvider, id: LogFileId, log: &[u8], index: Option<&[u8]>) {
@@ -276,8 +276,11 @@ mod tests {
         writer.into_inner()
     }
 
-    async fn validation_state(storage: &StorageProvider) -> InitializationState<'_> {
-        let mut state = InitializationState::new(StreamId::new(7).unwrap(), storage);
+    async fn validation_state(
+        stream_id: StreamId,
+        storage: &StorageProvider,
+    ) -> InitializationState<'_> {
+        let mut state = InitializationState::new(stream_id, storage);
         state.load_checkpoint().await.unwrap();
         state.discover_log_files().await.unwrap();
         state
@@ -292,40 +295,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_checkpoint_accepts_absence_without_creating_storage() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("absent");
-        let provider = StorageProvider::new(StorageConfig::new(root.clone()).unwrap());
-        let mut state = InitializationState::new(StreamId::MIN, &provider);
+    async fn load_checkpoint_accepts_absence_without_creating_files() {
+        let test_stream = storage_fixture().await;
+        let provider = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let mut state = InitializationState::new(stream_id, provider);
 
         state.load_checkpoint().await.unwrap();
 
         assert_eq!(state.checkpoint, None);
-        assert!(!root.exists());
+        assert_eq!(
+            provider
+                .root_directory()
+                .join(format!("streams/{stream_id:04}"))
+                .read_dir()
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn load_checkpoint_loads_literal_metadata_without_requiring_log_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        let stream_id = StreamId::new(7).unwrap();
-        let path = provider.checkpoint_file_path(stream_id);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-        for (json, sequence, position) in [
-            (
-                r#"{"end":{"record_id":{"stream_id":7,"sequence_number":0},"position":16}}"#,
-                0,
-                16,
-            ),
-            (
-                r#"{"end":{"record_id":{"stream_id":7,"sequence_number":100001},"position":35}}"#,
-                100_001,
-                35,
-            ),
-        ] {
-            fs::write(&path, json).unwrap();
-            let mut state = InitializationState::new(stream_id, &provider);
+        for (sequence, position) in [(0, 16), (100_001, 35)] {
+            let test_stream = storage_fixture().await;
+            let provider = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let path = provider.checkpoint_file_path(stream_id);
+            let json = format!(
+                r#"{{"end":{{"record_id":{{"stream_id":{stream_id},"sequence_number":{sequence}}},"position":{position}}}}}"#
+            );
+            fs::write(&path, &json).unwrap();
+            let mut state = InitializationState::new(stream_id, provider);
 
             state.load_checkpoint().await.unwrap();
 
@@ -343,14 +344,18 @@ mod tests {
 
     #[tokio::test]
     async fn load_checkpoint_rejects_another_stream_without_changing_state_or_storage() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        let stream_id = StreamId::new(7).unwrap();
+        let test_stream = storage_fixture().await;
+        let other_test_stream = storage_fixture().await;
+        let provider = test_stream.provider();
+        let stream_id = test_stream.stream_id();
         let path = provider.checkpoint_file_path(stream_id);
-        let json = r#"{"end":{"record_id":{"stream_id":8,"sequence_number":0},"position":16}}"#;
+        let other_stream_id = other_test_stream.stream_id();
+        let json = format!(
+            r#"{{"end":{{"record_id":{{"stream_id":{other_stream_id},"sequence_number":0}},"position":16}}}}"#
+        );
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, json).unwrap();
-        let mut state = InitializationState::new(stream_id, &provider);
+        fs::write(&path, &json).unwrap();
+        let mut state = InitializationState::new(stream_id, provider);
         let previous = Some(StreamCheckpoint::new(RecordEndLocation::new(
             RecordId::new(stream_id, SequenceNumber::new(0)),
             16,
@@ -362,7 +367,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "checkpoint at {} belongs to stream 8, expected 7",
+                "checkpoint at {} belongs to stream {other_stream_id}, expected {stream_id}",
                 path.display(),
             ),
         );
@@ -372,14 +377,15 @@ mod tests {
 
     #[tokio::test]
     async fn load_checkpoint_preserves_json_errors_and_previous_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        let path = provider.checkpoint_file_path(StreamId::MIN);
+        let test_stream = storage_fixture().await;
+        let provider = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let path = provider.checkpoint_file_path(stream_id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"{invalid").unwrap();
-        let mut state = InitializationState::new(StreamId::MIN, &provider);
+        let mut state = InitializationState::new(stream_id, provider);
         let previous = Some(StreamCheckpoint::new(RecordEndLocation::new(
-            RecordId::new(StreamId::MIN, SequenceNumber::new(0)),
+            RecordId::new(stream_id, SequenceNumber::new(0)),
             16,
         )));
         state.checkpoint = previous;
@@ -396,13 +402,14 @@ mod tests {
 
     #[tokio::test]
     async fn load_checkpoint_preserves_io_errors_and_previous_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        let path = provider.checkpoint_file_path(StreamId::MIN);
+        let test_stream = storage_fixture().await;
+        let provider = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let path = provider.checkpoint_file_path(stream_id);
         fs::create_dir_all(&path).unwrap();
-        let mut state = InitializationState::new(StreamId::MIN, &provider);
+        let mut state = InitializationState::new(stream_id, provider);
         let previous = Some(StreamCheckpoint::new(RecordEndLocation::new(
-            RecordId::new(StreamId::MIN, SequenceNumber::new(0)),
+            RecordId::new(stream_id, SequenceNumber::new(0)),
             16,
         )));
         state.checkpoint = previous;
@@ -419,17 +426,25 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_accepts_absent_logs_without_a_checkpoint() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("absent");
-        let provider = StorageProvider::new(StorageConfig::new(root.clone()).unwrap());
-        let mut state = InitializationState::new(StreamId::MIN, &provider);
+        let test_stream = storage_fixture().await;
+        let provider = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let mut state = InitializationState::new(stream_id, provider);
 
         state.discover_log_files().await.unwrap();
 
         assert_eq!(state.maximum_log_file, None);
-        assert!(!root.exists());
+        assert_eq!(
+            provider
+                .root_directory()
+                .join(format!("streams/{stream_id:04}"))
+                .read_dir()
+                .unwrap()
+                .count(),
+            0
+        );
 
-        let index = provider.index_file_path(LogFileId::new(StreamId::MIN, LogFileNumber::MIN));
+        let index = provider.index_file_path(LogFileId::new(stream_id, LogFileNumber::MIN));
         fs::create_dir_all(index.parent().unwrap()).unwrap();
         fs::write(&index, b"orphan index").unwrap();
 
@@ -442,23 +457,21 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_records_the_maximum_for_this_stream_including_an_empty_log() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        let stream_id = StreamId::new(7).unwrap();
+        let test_stream = storage_fixture().await;
+        let other_test_stream = storage_fixture().await;
+        let provider = test_stream.provider();
+        let stream_id = test_stream.stream_id();
         for (stream, number, bytes) in [
-            (7, 0, &b"unvalidated"[..]),
-            (7, 4, &b""[..]),
-            (8, 10, &b"other stream"[..]),
+            (stream_id, 0, &b"unvalidated"[..]),
+            (stream_id, 4, &b""[..]),
+            (other_test_stream.stream_id(), 10, &b"other stream"[..]),
         ] {
-            let file_id = LogFileId::new(
-                StreamId::new(stream).unwrap(),
-                LogFileNumber::new(number).unwrap(),
-            );
+            let file_id = file_id(stream, number);
             let path = provider.log_file_path(file_id);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, bytes).unwrap();
         }
-        let mut state = InitializationState::new(stream_id, &provider);
+        let mut state = InitializationState::new(stream_id, provider);
 
         state.discover_log_files().await.unwrap();
 
@@ -479,10 +492,9 @@ mod tests {
     #[tokio::test]
     async fn discovery_accepts_a_maximum_at_or_after_the_checkpoint_file() {
         for maximum_number in [2, 4] {
-            let directory = tempfile::tempdir().unwrap();
-            let provider =
-                StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-            let stream_id = StreamId::new(7).unwrap();
+            let test_stream = storage_fixture().await;
+            let provider = test_stream.provider();
+            let stream_id = test_stream.stream_id();
             let maximum = LogFileId::new(stream_id, LogFileNumber::new(maximum_number).unwrap());
             let path = provider.log_file_path(maximum);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -491,7 +503,7 @@ mod tests {
                 RecordId::new(stream_id, SequenceNumber::new(200_000)),
                 16,
             ));
-            let mut state = InitializationState::new(stream_id, &provider);
+            let mut state = InitializationState::new(stream_id, provider);
             state.checkpoint = Some(checkpoint);
 
             state.discover_log_files().await.unwrap();
@@ -510,10 +522,9 @@ mod tests {
         for (checkpoint_number, maximum_number) in
             [(0, None), (2, None), (2, Some(0)), (2, Some(1))]
         {
-            let directory = tempfile::tempdir().unwrap();
-            let provider =
-                StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-            let stream_id = StreamId::new(7).unwrap();
+            let test_stream = storage_fixture().await;
+            let provider = test_stream.provider();
+            let stream_id = test_stream.stream_id();
             let checkpoint_file =
                 LogFileId::new(stream_id, LogFileNumber::new(checkpoint_number).unwrap());
             let checkpoint = StreamCheckpoint::new(RecordEndLocation::new(
@@ -528,7 +539,7 @@ mod tests {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, b"preserve").unwrap();
             }
-            let mut state = InitializationState::new(stream_id, &provider);
+            let mut state = InitializationState::new(stream_id, provider);
             state.checkpoint = Some(checkpoint);
             state.maximum_log_file = Some(checkpoint_file);
 
@@ -536,10 +547,12 @@ mod tests {
 
             let expected_message = match maximum_number {
                 None => {
-                    format!("stream 7 has checkpointed file {checkpoint_number} but no log files")
+                    format!(
+                        "stream {stream_id} has checkpointed file {checkpoint_number} but no log files"
+                    )
                 }
                 Some(number) => format!(
-                    "maximum log file {number} for stream 7 is below checkpointed file {checkpoint_number}"
+                    "maximum log file {number} for stream {stream_id} is below checkpointed file {checkpoint_number}"
                 ),
             };
             assert_eq!(error.to_string(), expected_message);
@@ -557,11 +570,13 @@ mod tests {
     #[tokio::test]
     async fn discovery_preserves_io_errors_and_previous_state() {
         let directory = tempfile::tempdir().unwrap();
-        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let provider = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap())
+            .await
+            .unwrap();
         let stream_id = StreamId::new(7).unwrap();
         let checkpoint_path = provider.checkpoint_file_path(stream_id);
         let stream_path = checkpoint_path.parent().unwrap();
-        fs::create_dir_all(stream_path.parent().unwrap()).unwrap();
+        fs::remove_dir(stream_path).unwrap();
         fs::write(stream_path, b"not a directory").unwrap();
         let mut state = InitializationState::new(stream_id, &provider);
         let previous = Some(LogFileId::new(stream_id, LogFileNumber::MIN));
@@ -579,37 +594,57 @@ mod tests {
 
     #[tokio::test]
     async fn validation_with_no_logs_creates_nothing() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("absent");
-        let storage = StorageProvider::new(StorageConfig::new(root.clone()).unwrap());
-        let mut state = validation_state(&storage).await;
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let mut state = validation_state(stream_id, storage).await;
 
         state.validate_files().await.unwrap();
 
         assert_eq!(state.recovered_end, None);
         assert!(state.active_pair.is_none());
         assert_eq!(state.first_file_to_remove, None);
-        assert!(!root.exists());
+        assert_eq!(
+            storage
+                .root_directory()
+                .join(format!("streams/{stream_id:04}"))
+                .read_dir()
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn validation_stops_at_the_first_partial_pair_and_only_marks_future_cleanup() {
-        for log in [Vec::new(), FIRST.to_vec(), [FIRST, &[0xff; 3]].concat()] {
-            let directory = tempfile::tempdir().unwrap();
-            let storage =
-                StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-            store_pair(&storage, file_id(0), &log, Some(&[0xff; 19]));
-            store_pair(&storage, file_id(2), b"future log", Some(b"future index"));
-            let mut state = validation_state(&storage).await;
+        for (include_record, suffix) in [(false, &[][..]), (true, &[][..]), (true, &[0xff; 3][..])]
+        {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first = record_fixture(stream_id, FIRST);
+            let log = if include_record {
+                [first.as_slice(), suffix].concat()
+            } else {
+                Vec::new()
+            };
+            store_pair(storage, file_id(stream_id, 0), &log, Some(&[0xff; 19]));
+            store_pair(
+                storage,
+                file_id(stream_id, 2),
+                b"future log",
+                Some(b"future index"),
+            );
+            let mut state = validation_state(stream_id, storage).await;
 
             state.validate_files().await.unwrap();
 
-            let end =
-                (!log.is_empty()).then(|| RecordEndLocation::new(file_id(0).first_record_id(), 16));
+            let end = (!log.is_empty())
+                .then(|| RecordEndLocation::new(file_id(stream_id, 0).first_record_id(), 16));
             assert_eq!(state.recovered_end, end);
-            assert_eq!(state.first_file_to_remove, Some(file_id(1)));
+            assert_eq!(state.first_file_to_remove, Some(file_id(stream_id, 1)));
             let mut pair = state.active_pair.take().unwrap();
-            assert_eq!(pair.file_id(), file_id(0));
+            assert_eq!(pair.file_id(), file_id(stream_id, 0));
             assert_eq!(pair.end(), end);
             assert_eq!(
                 pair.log.stream_position().await.unwrap(),
@@ -620,11 +655,11 @@ mod tests {
                 if end.is_some() { 8 } else { 0 }
             );
             assert_eq!(
-                fs::read(storage.log_file_path(file_id(0))).unwrap(),
-                if end.is_some() { FIRST } else { &[] }
+                fs::read(storage.log_file_path(file_id(stream_id, 0))).unwrap(),
+                if end.is_some() { first.as_slice() } else { &[] }
             );
             assert_eq!(
-                fs::read(storage.index_file_path(file_id(0))).unwrap(),
+                fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap(),
                 if end.is_some() {
                     &[16, 0, 0, 0, 0, 0, 0, 0][..]
                 } else {
@@ -632,11 +667,11 @@ mod tests {
                 }
             );
             assert_eq!(
-                fs::read(storage.log_file_path(file_id(2))).unwrap(),
+                fs::read(storage.log_file_path(file_id(stream_id, 2))).unwrap(),
                 b"future log"
             );
             assert_eq!(
-                fs::read(storage.index_file_path(file_id(2))).unwrap(),
+                fs::read(storage.index_file_path(file_id(stream_id, 2))).unwrap(),
                 b"future index"
             );
             assert!(!storage.checkpoint_file_path(state.stream_id).exists());
@@ -645,43 +680,46 @@ mod tests {
 
     #[tokio::test]
     async fn validation_walks_complete_files_and_preserves_progress_at_an_empty_active_pair() {
-        let first_log = encoded_records(file_id(0), 0..100_000).await;
-        let second_log = encoded_records(file_id(1), 0..100_000).await;
-        let partial_log = encoded_records(file_id(2), 0..1).await;
         let full_index: Vec<u8> = (1..=100_000_u64)
             .flat_map(|n| (n * 16).to_le_bytes())
             .collect();
-        for tail in [None, Some(&[][..]), Some(partial_log.as_slice())] {
-            let directory = tempfile::tempdir().unwrap();
-            let storage =
-                StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-            store_pair(&storage, file_id(0), &first_log, None);
-            store_pair(&storage, file_id(1), &second_log, None);
-            if let Some(tail) = tail {
-                store_pair(&storage, file_id(2), tail, None);
+        for tail_record_count in [None, Some(0), Some(1)] {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first_log = encoded_records(file_id(stream_id, 0), 0..100_000).await;
+            let second_log = encoded_records(file_id(stream_id, 1), 0..100_000).await;
+            let tail = match tail_record_count {
+                None => None,
+                Some(count) => Some(encoded_records(file_id(stream_id, 2), 0..count).await),
+            };
+            store_pair(storage, file_id(stream_id, 0), &first_log, None);
+            store_pair(storage, file_id(stream_id, 1), &second_log, None);
+            if let Some(tail) = tail.as_deref() {
+                store_pair(storage, file_id(stream_id, 2), tail, None);
             }
-            let mut state = validation_state(&storage).await;
+            let mut state = validation_state(stream_id, storage).await;
 
             state.validate_files().await.unwrap();
 
-            let expected_end = if tail.is_some_and(|bytes| !bytes.is_empty()) {
-                RecordEndLocation::new(file_id(2).first_record_id(), 16)
+            let expected_end = if tail.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+                RecordEndLocation::new(file_id(stream_id, 2).first_record_id(), 16)
             } else {
-                RecordEndLocation::new(file_id(1).last_record_id(), 1_600_000)
+                RecordEndLocation::new(file_id(stream_id, 1).last_record_id(), 1_600_000)
             };
             assert_eq!(state.recovered_end, Some(expected_end));
             assert_eq!(state.first_file_to_remove, None);
             assert_eq!(
-                fs::read(storage.index_file_path(file_id(0))).unwrap(),
+                fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap(),
                 full_index
             );
             assert_eq!(
-                fs::read(storage.index_file_path(file_id(1))).unwrap(),
+                fs::read(storage.index_file_path(file_id(stream_id, 1))).unwrap(),
                 full_index
             );
-            if let Some(tail) = tail {
+            if let Some(tail) = tail.as_deref() {
                 let mut pair = state.active_pair.take().unwrap();
-                assert_eq!(pair.file_id(), file_id(2));
+                assert_eq!(pair.file_id(), file_id(stream_id, 2));
                 assert_eq!(pair.end(), (!tail.is_empty()).then_some(expected_end));
                 assert_eq!(pair.log.stream_position().await.unwrap(), tail.len() as u64);
                 assert_eq!(
@@ -690,8 +728,8 @@ mod tests {
                 );
             } else {
                 assert!(state.active_pair.is_none());
-                assert!(!storage.log_file_path(file_id(2)).exists());
-                assert!(!storage.index_file_path(file_id(2)).exists());
+                assert!(!storage.log_file_path(file_id(stream_id, 2)).exists());
+                assert!(!storage.index_file_path(file_id(stream_id, 2)).exists());
             }
             assert!(!storage.checkpoint_file_path(state.stream_id).exists());
         }
@@ -699,17 +737,20 @@ mod tests {
 
     #[tokio::test]
     async fn validation_uses_the_original_checkpoint_for_the_index_and_does_not_publish() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let first = record_fixture(stream_id, FIRST);
+        let second = record_fixture(stream_id, SECOND);
         store_pair(
-            &storage,
-            file_id(0),
-            &[FIRST, SECOND].concat(),
+            storage,
+            file_id(stream_id, 0),
+            &[first, second].concat(),
             Some(&16_u64.to_le_bytes()),
         );
-        let trusted = RecordEndLocation::new(file_id(0).first_record_id(), 16);
-        let checkpoint_bytes = store_checkpoint(&storage, trusted);
-        let mut state = validation_state(&storage).await;
+        let trusted = RecordEndLocation::new(file_id(stream_id, 0).first_record_id(), 16);
+        let checkpoint_bytes = store_checkpoint(storage, trusted);
+        let mut state = validation_state(stream_id, storage).await;
 
         state.validate_files().await.unwrap();
 
@@ -719,7 +760,7 @@ mod tests {
         assert_eq!(state.checkpoint.unwrap().end(), trusted);
         assert_eq!(state.first_file_to_remove, None);
         assert_eq!(
-            fs::read(storage.index_file_path(file_id(0))).unwrap(),
+            fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap(),
             [16_u64.to_le_bytes(), 35_u64.to_le_bytes()].concat()
         );
         assert_eq!(
@@ -730,45 +771,62 @@ mod tests {
 
     #[tokio::test]
     async fn validation_starts_in_the_checkpoint_file_and_clears_trust_for_following_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        store_pair(&storage, file_id(0), b"earlier log", Some(b"earlier index"));
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        store_pair(
+            storage,
+            file_id(stream_id, 0),
+            b"earlier log",
+            Some(b"earlier index"),
+        );
         // Deliberately unparseable certified bytes prove that the prefix is not rescanned.
         let trusted_log = vec![0xff; 1_600_000];
         let mut trusted_index = vec![0xff; 800_000];
         trusted_index[799_992..].copy_from_slice(&1_600_000_u64.to_le_bytes());
-        store_pair(&storage, file_id(1), &trusted_log, Some(&trusted_index));
-        let trusted = RecordEndLocation::new(file_id(1).last_record_id(), 1_600_000);
-        let checkpoint_bytes = store_checkpoint(&storage, trusted);
-        let next_log = encoded_records(file_id(2), 0..1).await;
-        store_pair(&storage, file_id(2), &next_log, None);
-        let mut state = validation_state(&storage).await;
+        store_pair(
+            storage,
+            file_id(stream_id, 1),
+            &trusted_log,
+            Some(&trusted_index),
+        );
+        let trusted = RecordEndLocation::new(file_id(stream_id, 1).last_record_id(), 1_600_000);
+        let checkpoint_bytes = store_checkpoint(storage, trusted);
+        let next_log = encoded_records(file_id(stream_id, 2), 0..1).await;
+        store_pair(storage, file_id(stream_id, 2), &next_log, None);
+        let mut state = validation_state(stream_id, storage).await;
 
         state.validate_files().await.unwrap();
 
         assert_eq!(
             state.recovered_end,
-            Some(RecordEndLocation::new(file_id(2).first_record_id(), 16))
+            Some(RecordEndLocation::new(
+                file_id(stream_id, 2).first_record_id(),
+                16
+            ))
         );
-        assert_eq!(state.active_pair.as_ref().unwrap().file_id(), file_id(2));
         assert_eq!(
-            fs::read(storage.log_file_path(file_id(0))).unwrap(),
+            state.active_pair.as_ref().unwrap().file_id(),
+            file_id(stream_id, 2)
+        );
+        assert_eq!(
+            fs::read(storage.log_file_path(file_id(stream_id, 0))).unwrap(),
             b"earlier log"
         );
         assert_eq!(
-            fs::read(storage.index_file_path(file_id(0))).unwrap(),
+            fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap(),
             b"earlier index"
         );
         assert_eq!(
-            fs::read(storage.log_file_path(file_id(1))).unwrap(),
+            fs::read(storage.log_file_path(file_id(stream_id, 1))).unwrap(),
             trusted_log
         );
         assert_eq!(
-            fs::read(storage.index_file_path(file_id(1))).unwrap(),
+            fs::read(storage.index_file_path(file_id(stream_id, 1))).unwrap(),
             trusted_index
         );
         assert_eq!(
-            fs::read(storage.index_file_path(file_id(2))).unwrap(),
+            fs::read(storage.index_file_path(file_id(stream_id, 2))).unwrap(),
             16_u64.to_le_bytes()
         );
         assert_eq!(
@@ -779,17 +837,23 @@ mod tests {
 
     #[tokio::test]
     async fn validation_marks_an_uncheckpointed_gap_including_its_orphan_index() {
-        let full_log = encoded_records(file_id(0), 0..100_000).await;
-        for gap in [file_id(0), file_id(1)] {
-            let directory = tempfile::tempdir().unwrap();
-            let storage =
-                StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-            if gap == file_id(1) {
-                store_pair(&storage, file_id(0), &full_log, None);
+        for gap_number in [0, 1] {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let gap = file_id(stream_id, gap_number);
+            if gap == file_id(stream_id, 1) {
+                let full_log = encoded_records(file_id(stream_id, 0), 0..100_000).await;
+                store_pair(storage, file_id(stream_id, 0), &full_log, None);
             }
-            store_pair(&storage, file_id(2), b"future log", Some(b"future index"));
+            store_pair(
+                storage,
+                file_id(stream_id, 2),
+                b"future log",
+                Some(b"future index"),
+            );
             fs::write(storage.index_file_path(gap), b"orphan index").unwrap();
-            let mut state = validation_state(&storage).await;
+            let mut state = validation_state(stream_id, storage).await;
 
             state.validate_files().await.unwrap();
 
@@ -797,8 +861,10 @@ mod tests {
             assert!(state.active_pair.is_none());
             assert_eq!(
                 state.recovered_end,
-                (gap == file_id(1))
-                    .then(|| RecordEndLocation::new(file_id(0).last_record_id(), 1_600_000))
+                (gap == file_id(stream_id, 1)).then(|| RecordEndLocation::new(
+                    file_id(stream_id, 0).last_record_id(),
+                    1_600_000
+                ))
             );
             assert!(!storage.log_file_path(gap).exists());
             assert_eq!(
@@ -806,11 +872,11 @@ mod tests {
                 b"orphan index"
             );
             assert_eq!(
-                fs::read(storage.log_file_path(file_id(2))).unwrap(),
+                fs::read(storage.log_file_path(file_id(stream_id, 2))).unwrap(),
                 b"future log"
             );
             assert_eq!(
-                fs::read(storage.index_file_path(file_id(2))).unwrap(),
+                fs::read(storage.index_file_path(file_id(stream_id, 2))).unwrap(),
                 b"future index"
             );
         }
@@ -818,28 +884,33 @@ mod tests {
 
     #[tokio::test]
     async fn validation_rejects_a_missing_checkpointed_log_without_marking_cleanup() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        store_pair(&storage, file_id(2), b"future log", None);
-        fs::write(storage.index_file_path(file_id(1)), b"orphan index").unwrap();
-        let trusted = RecordEndLocation::new(file_id(1).first_record_id(), 16);
-        let checkpoint_bytes = store_checkpoint(&storage, trusted);
-        let mut state = validation_state(&storage).await;
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        store_pair(storage, file_id(stream_id, 2), b"future log", None);
+        fs::write(
+            storage.index_file_path(file_id(stream_id, 1)),
+            b"orphan index",
+        )
+        .unwrap();
+        let trusted = RecordEndLocation::new(file_id(stream_id, 1).first_record_id(), 16);
+        let checkpoint_bytes = store_checkpoint(storage, trusted);
+        let mut state = validation_state(stream_id, storage).await;
 
         let error = state.validate_files().await.unwrap_err();
 
         assert!(matches!(error.downcast_ref::<IndexedLogValidationError>(),
             Some(IndexedLogValidationError::Storage(StorageError::Io { path, source }))
-                if path == &storage.log_file_path(file_id(1)) && source.kind() == io::ErrorKind::NotFound));
+                if path == &storage.log_file_path(file_id(stream_id, 1)) && source.kind() == io::ErrorKind::NotFound));
         assert_eq!(state.first_file_to_remove, None);
         assert_eq!(state.recovered_end, None);
         assert!(state.active_pair.is_none());
         assert_eq!(
-            fs::read(storage.index_file_path(file_id(1))).unwrap(),
+            fs::read(storage.index_file_path(file_id(stream_id, 1))).unwrap(),
             b"orphan index"
         );
         assert_eq!(
-            fs::read(storage.log_file_path(file_id(2))).unwrap(),
+            fs::read(storage.log_file_path(file_id(stream_id, 2))).unwrap(),
             b"future log"
         );
         assert_eq!(
@@ -851,17 +922,18 @@ mod tests {
     #[tokio::test]
     async fn validation_propagates_invalid_trusted_log_and_index_boundaries() {
         for invalid_log in [true, false] {
-            let directory = tempfile::tempdir().unwrap();
-            let storage =
-                StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-            store_pair(&storage, file_id(0), FIRST, None);
-            store_pair(&storage, file_id(1), b"future log", None);
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first = record_fixture(stream_id, FIRST);
+            store_pair(storage, file_id(stream_id, 0), &first, None);
+            store_pair(storage, file_id(stream_id, 1), b"future log", None);
             let trusted = RecordEndLocation::new(
-                file_id(0).first_record_id(),
+                file_id(stream_id, 0).first_record_id(),
                 if invalid_log { 17 } else { 16 },
             );
-            let checkpoint_bytes = store_checkpoint(&storage, trusted);
-            let mut state = validation_state(&storage).await;
+            let checkpoint_bytes = store_checkpoint(storage, trusted);
+            let mut state = validation_state(stream_id, storage).await;
 
             let error = state.validate_files().await.unwrap_err();
 
@@ -877,9 +949,12 @@ mod tests {
             assert_eq!(state.first_file_to_remove, None);
             assert_eq!(state.recovered_end, None);
             assert!(state.active_pair.is_none());
-            assert_eq!(fs::read(storage.log_file_path(file_id(0))).unwrap(), FIRST);
             assert_eq!(
-                fs::read(storage.log_file_path(file_id(1))).unwrap(),
+                fs::read(storage.log_file_path(file_id(stream_id, 0))).unwrap(),
+                first
+            );
+            assert_eq!(
+                fs::read(storage.log_file_path(file_id(stream_id, 1))).unwrap(),
                 b"future log"
             );
             assert_eq!(
@@ -891,14 +966,15 @@ mod tests {
 
     #[tokio::test]
     async fn validation_preserves_prior_progress_when_a_later_index_open_fails() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        let full_log = encoded_records(file_id(0), 0..100_000).await;
-        store_pair(&storage, file_id(0), &full_log, None);
-        store_pair(&storage, file_id(1), b"unvalidated", None);
-        let index_path = storage.index_file_path(file_id(1));
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let full_log = encoded_records(file_id(stream_id, 0), 0..100_000).await;
+        store_pair(storage, file_id(stream_id, 0), &full_log, None);
+        store_pair(storage, file_id(stream_id, 1), b"unvalidated", None);
+        let index_path = storage.index_file_path(file_id(stream_id, 1));
         fs::create_dir(&index_path).unwrap();
-        let mut state = validation_state(&storage).await;
+        let mut state = validation_state(stream_id, storage).await;
 
         let error = state.validate_files().await.unwrap_err();
 
@@ -907,14 +983,14 @@ mod tests {
         assert_eq!(
             state.recovered_end,
             Some(RecordEndLocation::new(
-                file_id(0).last_record_id(),
+                file_id(stream_id, 0).last_record_id(),
                 1_600_000
             ))
         );
         assert_eq!(state.first_file_to_remove, None);
         assert!(state.active_pair.is_none());
         assert_eq!(
-            fs::read(storage.log_file_path(file_id(1))).unwrap(),
+            fs::read(storage.log_file_path(file_id(stream_id, 1))).unwrap(),
             b"unvalidated"
         );
         assert!(!storage.checkpoint_file_path(state.stream_id).exists());
@@ -922,84 +998,113 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_without_logs_creates_nothing() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("absent");
-        let storage = StorageProvider::new(StorageConfig::new(root.clone()).unwrap());
-        let mut state = validation_state(&storage).await;
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let mut state = validation_state(stream_id, storage).await;
         state.validate_files().await.unwrap();
 
         state.remove_later_files().await.unwrap();
 
-        assert!(!root.exists());
+        assert_eq!(
+            storage
+                .root_directory()
+                .join(format!("streams/{stream_id:04}"))
+                .read_dir()
+                .unwrap()
+                .count(),
+            0
+        );
         assert_eq!(state.recovered_end, None);
         assert!(state.active_pair.is_none());
     }
 
     #[tokio::test]
     async fn cleanup_without_a_boundary_keeps_the_final_partial_pair() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        store_pair(&storage, file_id(0), FIRST, None);
-        let mut state = validation_state(&storage).await;
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let first = record_fixture(stream_id, FIRST);
+        store_pair(storage, file_id(stream_id, 0), &first, None);
+        let mut state = validation_state(stream_id, storage).await;
         state.validate_files().await.unwrap();
 
         state.remove_later_files().await.unwrap();
 
-        assert_eq!(fs::read(storage.log_file_path(file_id(0))).unwrap(), FIRST);
         assert_eq!(
-            fs::read(storage.index_file_path(file_id(0))).unwrap(),
+            fs::read(storage.log_file_path(file_id(stream_id, 0))).unwrap(),
+            first
+        );
+        assert_eq!(
+            fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap(),
             16_u64.to_le_bytes()
         );
-        assert_eq!(state.active_pair.as_ref().unwrap().file_id(), file_id(0));
+        assert_eq!(
+            state.active_pair.as_ref().unwrap().file_id(),
+            file_id(stream_id, 0)
+        );
         assert_eq!(
             state.recovered_end,
-            Some(RecordEndLocation::new(file_id(0).first_record_id(), 16))
+            Some(RecordEndLocation::new(
+                file_id(stream_id, 0).first_record_id(),
+                16
+            ))
         );
         assert!(!storage.checkpoint_file_path(state.stream_id).exists());
     }
 
     #[tokio::test]
     async fn cleanup_after_a_partial_pair_removes_only_later_pairs_through_the_maximum() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        store_pair(&storage, file_id(0), b"earlier log", Some(b"earlier index"));
-        let active = file_id(999);
-        let active_log = encoded_records(active, 0..1).await;
-        store_pair(&storage, active, &active_log, Some(&16_u64.to_le_bytes()));
-        let trusted = RecordEndLocation::new(active.first_record_id(), 16);
-        let checkpoint_bytes = store_checkpoint(&storage, trusted);
-        // Cross a range-directory boundary; include log-only, index-only and absent pairs.
-        store_pair(&storage, file_id(1000), b"log only", None);
-        fs::write(storage.index_file_path(file_id(1001)), b"index only").unwrap();
+        let test_stream = storage_fixture().await;
+        let other_test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
         store_pair(
-            &storage,
-            file_id(1003),
+            storage,
+            file_id(stream_id, 0),
+            b"earlier log",
+            Some(b"earlier index"),
+        );
+        let active = file_id(stream_id, 999);
+        let active_log = encoded_records(active, 0..1).await;
+        store_pair(storage, active, &active_log, Some(&16_u64.to_le_bytes()));
+        let trusted = RecordEndLocation::new(active.first_record_id(), 16);
+        let checkpoint_bytes = store_checkpoint(storage, trusted);
+        // Cross a range-directory boundary; include log-only, index-only and absent pairs.
+        store_pair(storage, file_id(stream_id, 1000), b"log only", None);
+        fs::write(
+            storage.index_file_path(file_id(stream_id, 1001)),
+            b"index only",
+        )
+        .unwrap();
+        store_pair(
+            storage,
+            file_id(stream_id, 1003),
             b"maximum log",
             Some(b"maximum index"),
         );
-        let beyond_maximum_index = storage.index_file_path(file_id(1005));
+        let beyond_maximum_index = storage.index_file_path(file_id(stream_id, 1005));
         fs::write(&beyond_maximum_index, b"outside cleanup range").unwrap();
-        let other_stream =
-            LogFileId::new(StreamId::new(8).unwrap(), LogFileNumber::new(1000).unwrap());
-        store_pair(&storage, other_stream, b"other log", Some(b"other index"));
+        let other_stream = file_id(other_test_stream.stream_id(), 1000);
+        store_pair(storage, other_stream, b"other log", Some(b"other index"));
         let range_directory = storage
-            .log_file_path(file_id(1000))
+            .log_file_path(file_id(stream_id, 1000))
             .parent()
             .unwrap()
             .to_owned();
         let notes = range_directory.join("notes.txt");
         fs::write(&notes, b"unrelated").unwrap();
-        let mut state = validation_state(&storage).await;
+        let mut state = validation_state(stream_id, storage).await;
         state.validate_files().await.unwrap();
-        assert_eq!(state.first_file_to_remove, Some(file_id(1000)));
+        assert_eq!(state.first_file_to_remove, Some(file_id(stream_id, 1000)));
 
         state.remove_later_files().await.unwrap();
         // Repeating successful cleanup tolerates the now-absent pairs.
         state.remove_later_files().await.unwrap();
 
         for number in 1000..=1003 {
-            assert!(!storage.log_file_path(file_id(number)).exists());
-            assert!(!storage.index_file_path(file_id(number)).exists());
+            assert!(!storage.log_file_path(file_id(stream_id, number)).exists());
+            assert!(!storage.index_file_path(file_id(stream_id, number)).exists());
         }
         assert!(range_directory.is_dir());
         assert_eq!(fs::read(notes).unwrap(), b"unrelated");
@@ -1008,11 +1113,11 @@ mod tests {
             b"outside cleanup range"
         );
         assert_eq!(
-            fs::read(storage.log_file_path(file_id(0))).unwrap(),
+            fs::read(storage.log_file_path(file_id(stream_id, 0))).unwrap(),
             b"earlier log"
         );
         assert_eq!(
-            fs::read(storage.index_file_path(file_id(0))).unwrap(),
+            fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap(),
             b"earlier index"
         );
         assert_eq!(
@@ -1043,35 +1148,45 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_after_a_gap_removes_its_orphan_index_and_later_pairs() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-        let full_log = encoded_records(file_id(0), 0..100_000).await;
-        store_pair(&storage, file_id(0), &full_log, None);
-        fs::write(storage.index_file_path(file_id(1)), b"orphan index").unwrap();
-        store_pair(&storage, file_id(3), b"future log", Some(b"future index"));
-        let mut state = validation_state(&storage).await;
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let full_log = encoded_records(file_id(stream_id, 0), 0..100_000).await;
+        store_pair(storage, file_id(stream_id, 0), &full_log, None);
+        fs::write(
+            storage.index_file_path(file_id(stream_id, 1)),
+            b"orphan index",
+        )
+        .unwrap();
+        store_pair(
+            storage,
+            file_id(stream_id, 3),
+            b"future log",
+            Some(b"future index"),
+        );
+        let mut state = validation_state(stream_id, storage).await;
         state.validate_files().await.unwrap();
-        assert_eq!(state.first_file_to_remove, Some(file_id(1)));
-        let full_index = fs::read(storage.index_file_path(file_id(0))).unwrap();
+        assert_eq!(state.first_file_to_remove, Some(file_id(stream_id, 1)));
+        let full_index = fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap();
 
         state.remove_later_files().await.unwrap();
 
         for number in 1..=3 {
-            assert!(!storage.log_file_path(file_id(number)).exists());
-            assert!(!storage.index_file_path(file_id(number)).exists());
+            assert!(!storage.log_file_path(file_id(stream_id, number)).exists());
+            assert!(!storage.index_file_path(file_id(stream_id, number)).exists());
         }
         assert_eq!(
-            fs::read(storage.log_file_path(file_id(0))).unwrap(),
+            fs::read(storage.log_file_path(file_id(stream_id, 0))).unwrap(),
             full_log
         );
         assert_eq!(
-            fs::read(storage.index_file_path(file_id(0))).unwrap(),
+            fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap(),
             full_index
         );
         assert_eq!(
             state.recovered_end,
             Some(RecordEndLocation::new(
-                file_id(0).last_record_id(),
+                file_id(stream_id, 0).last_record_id(),
                 1_600_000
             ))
         );
@@ -1082,56 +1197,65 @@ mod tests {
     #[tokio::test]
     async fn cleanup_stops_on_deletion_errors_and_can_repeat_after_partial_progress() {
         for block_log in [true, false] {
-            let directory = tempfile::tempdir().unwrap();
-            let storage =
-                StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
-            store_pair(&storage, file_id(0), FIRST, Some(&16_u64.to_le_bytes()));
-            let trusted = RecordEndLocation::new(file_id(0).first_record_id(), 16);
-            let checkpoint_bytes = store_checkpoint(&storage, trusted);
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first = record_fixture(stream_id, FIRST);
+            store_pair(
+                storage,
+                file_id(stream_id, 0),
+                &first,
+                Some(&16_u64.to_le_bytes()),
+            );
+            let trusted = RecordEndLocation::new(file_id(stream_id, 0).first_record_id(), 16);
+            let checkpoint_bytes = store_checkpoint(storage, trusted);
             for number in 1..=3 {
                 store_pair(
-                    &storage,
-                    file_id(number),
+                    storage,
+                    file_id(stream_id, number),
                     b"discard log",
                     Some(b"discard index"),
                 );
             }
             let blocked_path = if block_log {
-                storage.log_file_path(file_id(2))
+                storage.log_file_path(file_id(stream_id, 2))
             } else {
-                storage.index_file_path(file_id(2))
+                storage.index_file_path(file_id(stream_id, 2))
             };
             fs::remove_file(&blocked_path).unwrap();
             fs::create_dir(&blocked_path).unwrap();
-            let mut state = validation_state(&storage).await;
+            let mut state = validation_state(stream_id, storage).await;
             state.validate_files().await.unwrap();
 
             let error = state.remove_later_files().await.unwrap_err();
 
             assert!(matches!(error.downcast_ref::<StorageError>(),
                 Some(StorageError::Io { path, .. }) if path == &blocked_path));
-            assert!(!storage.log_file_path(file_id(1)).exists());
-            assert!(!storage.index_file_path(file_id(1)).exists());
+            assert!(!storage.log_file_path(file_id(stream_id, 1)).exists());
+            assert!(!storage.index_file_path(file_id(stream_id, 1)).exists());
             assert!(blocked_path.is_dir());
             if block_log {
                 assert_eq!(
-                    fs::read(storage.index_file_path(file_id(2))).unwrap(),
+                    fs::read(storage.index_file_path(file_id(stream_id, 2))).unwrap(),
                     b"discard index"
                 );
             } else {
-                assert!(!storage.log_file_path(file_id(2)).exists());
+                assert!(!storage.log_file_path(file_id(stream_id, 2)).exists());
             }
             assert_eq!(
-                fs::read(storage.log_file_path(file_id(3))).unwrap(),
+                fs::read(storage.log_file_path(file_id(stream_id, 3))).unwrap(),
                 b"discard log"
             );
             assert_eq!(
-                fs::read(storage.index_file_path(file_id(3))).unwrap(),
+                fs::read(storage.index_file_path(file_id(stream_id, 3))).unwrap(),
                 b"discard index"
             );
-            assert_eq!(state.first_file_to_remove, Some(file_id(1)));
+            assert_eq!(state.first_file_to_remove, Some(file_id(stream_id, 1)));
             assert_eq!(state.recovered_end, Some(trusted));
-            assert_eq!(state.active_pair.as_ref().unwrap().file_id(), file_id(0));
+            assert_eq!(
+                state.active_pair.as_ref().unwrap().file_id(),
+                file_id(stream_id, 0)
+            );
             assert_eq!(
                 fs::read(storage.checkpoint_file_path(state.stream_id)).unwrap(),
                 checkpoint_bytes
@@ -1142,12 +1266,15 @@ mod tests {
             state.remove_later_files().await.unwrap();
 
             for number in 1..=3 {
-                assert!(!storage.log_file_path(file_id(number)).exists());
-                assert!(!storage.index_file_path(file_id(number)).exists());
+                assert!(!storage.log_file_path(file_id(stream_id, number)).exists());
+                assert!(!storage.index_file_path(file_id(stream_id, number)).exists());
             }
-            assert_eq!(fs::read(storage.log_file_path(file_id(0))).unwrap(), FIRST);
             assert_eq!(
-                fs::read(storage.index_file_path(file_id(0))).unwrap(),
+                fs::read(storage.log_file_path(file_id(stream_id, 0))).unwrap(),
+                first
+            );
+            assert_eq!(
+                fs::read(storage.index_file_path(file_id(stream_id, 0))).unwrap(),
                 16_u64.to_le_bytes()
             );
             assert_eq!(

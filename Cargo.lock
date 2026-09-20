@@ -539,6 +539,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "conf",
+ "crc32c",
  "getset",
  "serde",
  "serde_json",

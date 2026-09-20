@@ -78,12 +78,17 @@ impl IndexedLogValidator {
 mod tests {
     use std::io;
 
-    use tempfile::TempDir;
     use tokio::{fs::File, io::AsyncWriteExt};
     use transaction_log_exports::{RecordId, RecordWriter, SequenceNumber, StreamId};
 
     use super::*;
-    use crate::storage::{StorageConfig, StorageError};
+    use crate::{
+        storage::{
+            StorageError,
+            test_support::{record_fixture, storage_fixture},
+        },
+        streams::LogFileNumber,
+    };
 
     // Independent protocol fixtures: stream 7, sequences 0/1/2, payloads empty/abc/x.
     const FIRST: &[u8] = &[16, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 215, 226, 50, 73];
@@ -92,28 +97,27 @@ mod tests {
     ];
     const THIRD: &[u8] = &[17, 0, 7, 0, 2, 0, 0, 0, 0, 0, 0, 0, 120, 53, 10, 47, 115];
 
-    fn end(sequence: u64, position: u64) -> RecordEndLocation {
+    fn end(stream_id: StreamId, sequence: u64, position: u64) -> RecordEndLocation {
         RecordEndLocation::new(
-            RecordId::new(StreamId::new(7).unwrap(), SequenceNumber::new(sequence)),
+            RecordId::new(stream_id, SequenceNumber::new(sequence)),
             position,
         )
     }
 
-    fn file_id() -> LogFileId {
-        end(0, 0).log_file_id()
+    fn file_id(stream_id: StreamId) -> LogFileId {
+        end(stream_id, 0, 0).log_file_id()
     }
 
     fn encoded_index(ends: &[u64]) -> Vec<u8> {
         ends.iter().flat_map(|end| end.to_le_bytes()).collect()
     }
 
-    async fn stored_pair(
+    async fn store_pair(
+        storage: &StorageProvider,
         file_id: LogFileId,
         log: &[u8],
         index: Option<&[u8]>,
-    ) -> (TempDir, StorageProvider) {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = StorageProvider::new(StorageConfig::new(directory.path().into()).unwrap());
+    ) {
         let log_path = storage.log_file_path(file_id);
         tokio::fs::create_dir_all(log_path.parent().unwrap())
             .await
@@ -124,7 +128,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        (directory, storage)
     }
 
     async fn assert_bytes(storage: &StorageProvider, file_id: LogFileId, log: &[u8], index: &[u8]) {
@@ -168,46 +171,72 @@ mod tests {
     async fn empty_and_entirely_corrupt_logs_return_empty_appendable_pairs() {
         for log_bytes in [&[][..], &[1, 0, 3][..]] {
             for index_bytes in [None, Some(&[0xff; 19][..])] {
-                let (_directory, storage) = stored_pair(file_id(), log_bytes, index_bytes).await;
-                let result = IndexedLogValidator::validate(&storage, file_id(), None)
+                let test_stream = storage_fixture().await;
+                let storage = test_stream.provider();
+                let stream_id = test_stream.stream_id();
+                store_pair(storage, file_id(stream_id), log_bytes, index_bytes).await;
+                let result = IndexedLogValidator::validate(storage, file_id(stream_id), None)
                     .await
                     .unwrap();
                 assert_partial(result, None, 0, 0).await;
-                assert_bytes(&storage, file_id(), &[], &[]).await;
-                assert!(!storage.checkpoint_file_path(file_id().stream_id()).exists());
+                assert_bytes(storage, file_id(stream_id), &[], &[]).await;
+                assert!(
+                    !storage
+                        .checkpoint_file_path(file_id(stream_id).stream_id())
+                        .exists()
+                );
             }
         }
     }
 
     #[tokio::test]
     async fn hands_off_only_new_offsets_with_the_original_trusted_endpoint() {
-        let log_bytes = [FIRST, SECOND, THIRD].concat();
         let index_bytes = encoded_index(&[16, 35, 52]);
-        for (trusted, prefix_length) in [
+        for (boundary, prefix_length) in [
             (None, 0),
-            (Some(end(0, 16)), 8),
-            (Some(end(1, 35)), 16),
-            (Some(end(2, 52)), 24),
+            (Some((0, 16)), 8),
+            (Some((1, 35)), 16),
+            (Some((2, 52)), 24),
         ] {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first = record_fixture(stream_id, FIRST);
+            let second = record_fixture(stream_id, SECOND);
+            let third = record_fixture(stream_id, THIRD);
+            let log_bytes = [first.as_slice(), second.as_slice(), third.as_slice()].concat();
+            let trusted = boundary.map(|(sequence, position)| end(stream_id, sequence, position));
             let stale_index = [&index_bytes[..prefix_length], &[0xff; 11]].concat();
-            let (_directory, storage) =
-                stored_pair(file_id(), &log_bytes, Some(&stale_index)).await;
-            let result = IndexedLogValidator::validate(&storage, file_id(), trusted)
+            store_pair(storage, file_id(stream_id), &log_bytes, Some(&stale_index)).await;
+            let result = IndexedLogValidator::validate(storage, file_id(stream_id), trusted)
                 .await
                 .unwrap();
-            assert_partial(result, Some(end(2, 52)), 52, 24).await;
-            assert_bytes(&storage, file_id(), &log_bytes, &index_bytes).await;
+            assert_partial(result, Some(end(stream_id, 2, 52)), 52, 24).await;
+            assert_bytes(storage, file_id(stream_id), &log_bytes, &index_bytes).await;
         }
     }
 
     #[tokio::test]
     async fn missing_index_is_rebuilt_and_returned_handles_can_append_without_seeking() {
-        let (_directory, storage) = stored_pair(file_id(), &[FIRST, SECOND].concat(), None).await;
-        let result = IndexedLogValidator::validate(&storage, file_id(), None)
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let first = record_fixture(stream_id, FIRST);
+        let second = record_fixture(stream_id, SECOND);
+        let third = record_fixture(stream_id, THIRD);
+        store_pair(
+            storage,
+            file_id(stream_id),
+            &[first.as_slice(), second.as_slice()].concat(),
+            None,
+        )
+        .await;
+        let result = IndexedLogValidator::validate(storage, file_id(stream_id), None)
             .await
             .unwrap();
-        let (mut log, mut index) = assert_partial(result, Some(end(1, 35)), 35, 16).await;
-        log.write_all(THIRD).await.unwrap();
+        let (mut log, mut index) =
+            assert_partial(result, Some(end(stream_id, 1, 35)), 35, 16).await;
+        log.write_all(third.as_slice()).await.unwrap();
         log.flush().await.unwrap();
         log.sync_data().await.unwrap();
         index.write_all(&52u64.to_le_bytes()).await.unwrap();
@@ -216,22 +245,26 @@ mod tests {
         drop((log, index));
 
         assert_bytes(
-            &storage,
-            file_id(),
-            &[FIRST, SECOND, THIRD].concat(),
+            storage,
+            file_id(stream_id),
+            &[first.as_slice(), second.as_slice(), third.as_slice()].concat(),
             &encoded_index(&[16, 35, 52]),
         )
         .await;
         // Reopen using the original boundary; repeated recovery must preserve the pair.
         for _ in 0..2 {
-            let result = IndexedLogValidator::validate(&storage, file_id(), Some(end(1, 35)))
-                .await
-                .unwrap();
-            assert_partial(result, Some(end(2, 52)), 52, 24).await;
+            let result = IndexedLogValidator::validate(
+                storage,
+                file_id(stream_id),
+                Some(end(stream_id, 1, 35)),
+            )
+            .await
+            .unwrap();
+            assert_partial(result, Some(end(stream_id, 2, 52)), 52, 24).await;
             assert_bytes(
-                &storage,
-                file_id(),
-                &[FIRST, SECOND, THIRD].concat(),
+                storage,
+                file_id(stream_id),
+                &[first.as_slice(), second.as_slice(), third.as_slice()].concat(),
                 &encoded_index(&[16, 35, 52]),
             )
             .await;
@@ -240,29 +273,45 @@ mod tests {
 
     #[tokio::test]
     async fn corruption_removes_its_index_and_all_following_records_and_entries() {
-        let mut corrupt = SECOND.to_vec();
-        *corrupt.last_mut().unwrap() ^= 1;
-        let log_bytes = [FIRST, &corrupt, THIRD].concat();
         let index_bytes = [encoded_index(&[16, 35, 52]), vec![0xff; 3]].concat();
-        for trusted in [None, Some(end(0, 16))] {
-            let (_directory, storage) =
-                stored_pair(file_id(), &log_bytes, Some(&index_bytes)).await;
-            let result = IndexedLogValidator::validate(&storage, file_id(), trusted)
+        for trust_first in [false, true] {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first = record_fixture(stream_id, FIRST);
+            let second = record_fixture(stream_id, SECOND);
+            let third = record_fixture(stream_id, THIRD);
+            let mut corrupt = second.as_slice().to_vec();
+            *corrupt.last_mut().unwrap() ^= 1;
+            let log_bytes = [first.as_slice(), &corrupt, third.as_slice()].concat();
+            let trusted = trust_first.then(|| end(stream_id, 0, 16));
+            store_pair(storage, file_id(stream_id), &log_bytes, Some(&index_bytes)).await;
+            let result = IndexedLogValidator::validate(storage, file_id(stream_id), trusted)
                 .await
                 .unwrap();
-            assert_partial(result, Some(end(0, 16)), 16, 8).await;
-            assert_bytes(&storage, file_id(), FIRST, &encoded_index(&[16])).await;
+            assert_partial(result, Some(end(stream_id, 0, 16)), 16, 8).await;
+            assert_bytes(
+                storage,
+                file_id(stream_id),
+                first.as_slice(),
+                &encoded_index(&[16]),
+            )
+            .await;
         }
     }
 
     #[tokio::test]
     async fn full_files_return_complete_after_index_rebuilding_and_extra_log_removal() {
-        for (file, trusted_count, extra) in [
-            (file_id(), 0, false),
-            (file_id().next(), 0, true),
-            (file_id().next(), RECORDS_PER_FILE - 1, false),
-            (file_id().next(), RECORDS_PER_FILE, true),
+        for (file_number, trusted_count, extra) in [
+            (0, 0, false),
+            (1, 0, true),
+            (1, RECORDS_PER_FILE - 1, false),
+            (1, RECORDS_PER_FILE, true),
         ] {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let file = LogFileId::new(stream_id, LogFileNumber::new(file_number).unwrap());
             let mut writer = RecordWriter::for_serialization(Vec::new());
             for position in 0..RECORDS_PER_FILE {
                 writer
@@ -285,8 +334,8 @@ mod tests {
                     trusted_count * 16,
                 )
             });
-            let (_directory, storage) = stored_pair(file, &on_disk_log, Some(&stale_index)).await;
-            let result = IndexedLogValidator::validate(&storage, file, trusted)
+            store_pair(storage, file, &on_disk_log, Some(&stale_index)).await;
+            let result = IndexedLogValidator::validate(storage, file, trusted)
                 .await
                 .unwrap();
             let ValidatedFilePair::Complete { end } = result else {
@@ -296,13 +345,13 @@ mod tests {
                 end,
                 RecordEndLocation::new(file.last_record_id(), RECORDS_PER_FILE * 16)
             );
-            assert_bytes(&storage, file, &log_bytes, &index_bytes).await;
+            assert_bytes(storage, file, &log_bytes, &index_bytes).await;
 
             // The next file has no file-local endpoint. The preceding result stays usable.
             tokio::fs::write(storage.log_file_path(file.next()), [])
                 .await
                 .unwrap();
-            let result = IndexedLogValidator::validate(&storage, file.next(), None)
+            let result = IndexedLogValidator::validate(storage, file.next(), None)
                 .await
                 .unwrap();
             assert_partial(result, None, 0, 0).await;
@@ -312,37 +361,44 @@ mod tests {
 
     #[tokio::test]
     async fn nearly_full_file_stays_partial_and_uses_file_local_index_positions() {
-        let file = file_id().next();
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let file = file_id(stream_id).next();
         let count = RECORDS_PER_FILE - 1;
         // This prefix is caller-certified; recovery must not rescan it.
         let log_bytes = vec![0xff; count as usize * 16];
         let mut index_bytes = vec![0xff; count as usize * 8];
         index_bytes[count as usize * 8 - 8..].copy_from_slice(&(count * 16).to_le_bytes());
         let trusted = RecordEndLocation::new(file.record_id_at(count - 1).unwrap(), count * 16);
-        let (_directory, storage) = stored_pair(file, &log_bytes, Some(&index_bytes)).await;
-        let result = IndexedLogValidator::validate(&storage, file, Some(trusted))
+        store_pair(storage, file, &log_bytes, Some(&index_bytes)).await;
+        let result = IndexedLogValidator::validate(storage, file, Some(trusted))
             .await
             .unwrap();
         assert_partial(result, Some(trusted), count * 16, count * 8).await;
-        assert_bytes(&storage, file, &log_bytes, &index_bytes).await;
+        assert_bytes(storage, file, &log_bytes, &index_bytes).await;
     }
 
     #[tokio::test]
     async fn missing_log_preserves_not_found_and_does_not_create_or_change_an_index() {
         for index_bytes in [None, Some(&[0xff; 11][..])] {
-            let (_directory, storage) = stored_pair(file_id(), FIRST, index_bytes).await;
-            tokio::fs::remove_file(storage.log_file_path(file_id()))
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first = record_fixture(stream_id, FIRST);
+            store_pair(storage, file_id(stream_id), first.as_slice(), index_bytes).await;
+            tokio::fs::remove_file(storage.log_file_path(file_id(stream_id)))
                 .await
                 .unwrap();
-            let error = IndexedLogValidator::validate(&storage, file_id(), None)
+            let error = IndexedLogValidator::validate(storage, file_id(stream_id), None)
                 .await
                 .unwrap_err();
             let Error::Storage(StorageError::Io { path, source }) = error else {
                 panic!("expected a storage I/O error");
             };
-            assert_eq!(path, storage.log_file_path(file_id()));
+            assert_eq!(path, storage.log_file_path(file_id(stream_id)));
             assert_eq!(source.kind(), io::ErrorKind::NotFound);
-            let index_path = storage.index_file_path(file_id());
+            let index_path = storage.index_file_path(file_id(stream_id));
             if let Some(bytes) = index_bytes {
                 assert_eq!(tokio::fs::read(index_path).await.unwrap(), bytes);
             } else {
@@ -353,11 +409,15 @@ mod tests {
 
     #[tokio::test]
     async fn index_open_failure_keeps_its_path_and_precedes_log_repair() {
-        let log_bytes = [FIRST, &[0xff; 13]].concat();
-        let (_directory, storage) = stored_pair(file_id(), &log_bytes, None).await;
-        let index_path = storage.index_file_path(file_id());
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let first = record_fixture(stream_id, FIRST);
+        let log_bytes = [first.as_slice(), &[0xff; 13]].concat();
+        store_pair(storage, file_id(stream_id), &log_bytes, None).await;
+        let index_path = storage.index_file_path(file_id(stream_id));
         tokio::fs::create_dir(&index_path).await.unwrap();
-        let error = IndexedLogValidator::validate(&storage, file_id(), None)
+        let error = IndexedLogValidator::validate(storage, file_id(stream_id), None)
             .await
             .unwrap_err();
         let Error::Storage(StorageError::Io { path, source }) = error else {
@@ -366,7 +426,7 @@ mod tests {
         assert_eq!(path, index_path);
         assert!(source.raw_os_error().is_some());
         assert_eq!(
-            tokio::fs::read(storage.log_file_path(file_id()))
+            tokio::fs::read(storage.log_file_path(file_id(stream_id)))
                 .await
                 .unwrap(),
             log_bytes
@@ -376,36 +436,61 @@ mod tests {
     #[tokio::test]
     async fn invalid_log_boundary_returns_the_log_error_without_rewriting_the_index() {
         let index_bytes = encoded_index(&[16, 35, 52]);
-        let other_stream = RecordEndLocation::new(
-            RecordId::new(StreamId::new(8).unwrap(), SequenceNumber::new(0)),
-            16,
-        );
-        for trusted in [
-            other_stream,
-            end(RECORDS_PER_FILE, 16),
-            end(0, 17),
-            end(0, 0),
+        for (wrong_stream, sequence, position) in [
+            (true, 0, 16),
+            (false, RECORDS_PER_FILE, 16),
+            (false, 0, 17),
+            (false, 0, 0),
         ] {
-            let (_directory, storage) = stored_pair(file_id(), FIRST, Some(&index_bytes)).await;
-            let error = IndexedLogValidator::validate(&storage, file_id(), Some(trusted))
+            let test_stream = storage_fixture().await;
+            let other_test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first = record_fixture(stream_id, FIRST);
+            let trusted = end(
+                if wrong_stream {
+                    other_test_stream.stream_id()
+                } else {
+                    stream_id
+                },
+                sequence,
+                position,
+            );
+            store_pair(
+                storage,
+                file_id(stream_id),
+                first.as_slice(),
+                Some(&index_bytes),
+            )
+            .await;
+            let error = IndexedLogValidator::validate(storage, file_id(stream_id), Some(trusted))
                 .await
                 .unwrap_err();
             assert!(matches!(
                 error,
                 Error::Log(LogFileValidationError::InvalidStart(_))
             ));
-            assert_bytes(&storage, file_id(), FIRST, &index_bytes).await;
+            assert_bytes(storage, file_id(stream_id), first.as_slice(), &index_bytes).await;
         }
     }
 
     #[tokio::test]
     async fn missing_or_wrong_trusted_index_is_an_error_even_after_successful_log_repair() {
-        let log_bytes = [FIRST, SECOND, &[0xff; 3]].concat();
         for index_bytes in [None, Some(&[16, 0, 0][..]), Some(&[0xff; 24][..])] {
-            let (_directory, storage) = stored_pair(file_id(), &log_bytes, index_bytes).await;
-            let error = IndexedLogValidator::validate(&storage, file_id(), Some(end(0, 16)))
-                .await
-                .unwrap_err();
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let first = record_fixture(stream_id, FIRST);
+            let second = record_fixture(stream_id, SECOND);
+            let log_bytes = [first.as_slice(), second.as_slice(), &[0xff; 3]].concat();
+            store_pair(storage, file_id(stream_id), &log_bytes, index_bytes).await;
+            let error = IndexedLogValidator::validate(
+                storage,
+                file_id(stream_id),
+                Some(end(stream_id, 0, 16)),
+            )
+            .await
+            .unwrap_err();
             let Error::Index(IndexFileValidationError::TrustedIndexMismatch {
                 entry_index,
                 expected_position,
@@ -423,25 +508,38 @@ mod tests {
                     .map(|_| u64::MAX)
             );
             assert_bytes(
-                &storage,
-                file_id(),
-                &[FIRST, SECOND].concat(),
+                storage,
+                file_id(stream_id),
+                &[first.as_slice(), second.as_slice()].concat(),
                 index_bytes.unwrap_or_default(),
             )
             .await;
-            assert!(!storage.checkpoint_file_path(file_id().stream_id()).exists());
+            assert!(
+                !storage
+                    .checkpoint_file_path(file_id(stream_id).stream_id())
+                    .exists()
+            );
         }
     }
 
     #[tokio::test]
     async fn recovery_leaves_checkpoints_and_other_file_pairs_untouched() {
-        let (_directory, storage) =
-            stored_pair(file_id(), &[FIRST, &[0xff; 3]].concat(), None).await;
-        let checkpoint_path = storage.checkpoint_file_path(file_id().stream_id());
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let first = record_fixture(stream_id, FIRST);
+        store_pair(
+            storage,
+            file_id(stream_id),
+            &[first.as_slice(), &[0xff; 3]].concat(),
+            None,
+        )
+        .await;
+        let checkpoint_path = storage.checkpoint_file_path(file_id(stream_id).stream_id());
         tokio::fs::write(&checkpoint_path, b"checkpoint remains caller-owned")
             .await
             .unwrap();
-        let later = file_id().next();
+        let later = file_id(stream_id).next();
         tokio::fs::write(storage.log_file_path(later), b"future log")
             .await
             .unwrap();
@@ -449,15 +547,21 @@ mod tests {
             .await
             .unwrap();
 
-        let result = IndexedLogValidator::validate(&storage, file_id(), None)
+        let result = IndexedLogValidator::validate(storage, file_id(stream_id), None)
             .await
             .unwrap();
-        assert_partial(result, Some(end(0, 16)), 16, 8).await;
+        assert_partial(result, Some(end(stream_id, 0, 16)), 16, 8).await;
         assert_eq!(
             tokio::fs::read(checkpoint_path).await.unwrap(),
             b"checkpoint remains caller-owned"
         );
-        assert_bytes(&storage, later, b"future log", b"future index").await;
-        assert_bytes(&storage, file_id(), FIRST, &encoded_index(&[16])).await;
+        assert_bytes(storage, later, b"future log", b"future index").await;
+        assert_bytes(
+            storage,
+            file_id(stream_id),
+            first.as_slice(),
+            &encoded_index(&[16]),
+        )
+        .await;
     }
 }

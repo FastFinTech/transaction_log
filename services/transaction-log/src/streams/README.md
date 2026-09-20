@@ -117,8 +117,11 @@ failure/cancellation coverage and the compile-fail constructor example.
 Each component README is included in its module's Rustdoc so its examples remain
 documentation tests.
 
-Run `cargo test -p transaction-log --locked`, the release tests, workspace Clippy,
-formatting and Rustdoc checks. The application is currently a binary crate:
+Run `cargo test -p transaction-log --locked`, the release tests,
+workspace Clippy, formatting and Rustdoc checks. Owned
+[test-storage guards](../storage/README.md#shared-test-storage) clean each test's
+files when its scope ends, keeping the empty stream directories for reuse.
+The application is currently a binary crate:
 ordinary Cargo tests do not run its documentation examples. Check those with
 `rustdoc --test` against a temporary library build of `src/main.rs`, including
 the application's dependency artifacts, until a library target is introduced.
@@ -199,7 +202,8 @@ assert_eq!(serde_json::from_slice::<StreamCheckpoint>(&bytes)?, checkpoint);
 `StorageProvider::checkpoint_file_path(stream_id)` names this stream's checkpoint
 at `{root}/streams/{stream_id:04}/checkpoint.json`. The path depends only on the
 stream, so advancing across log-file ranges does not change the checkpoint's
-location. Initialization creates its parent directory but no checkpoint file.
+location. Asynchronous storage-provider construction creates its parent directory
+but no checkpoint file.
 The initializer checks that the decoded checkpoint's stream ID matches the
 requested stream; agreement with the actual pair requires separate validation.
 

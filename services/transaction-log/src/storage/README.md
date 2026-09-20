@@ -1,8 +1,8 @@
 # Storage
 
 This application module groups storage types for log, index and other file types.
-It implements immutable startup configuration,
-deterministic log/index/checkpoint paths and stream-directory initialization.
+It implements immutable startup configuration, asynchronous construction of the
+root and stream directories, and deterministic log/index/checkpoint paths.
 The provider also opens existing logs and their repairable indexes. The sibling
 [streams module](../streams/README.md) implements indexed appends, validation from
 a supplied trusted boundary, index repair and explicit invalid-tail recovery.
@@ -18,6 +18,7 @@ Provider implementation, root configuration and shared errors live directly in t
 | `storage_error.rs` | Shared provider I/O/JSON failures and bounded-read limits, retaining paths and original causes. |
 | `storage_config.rs` | Immutable startup configuration and absolute root resolution. |
 | `storage_provider.rs` | All provider methods: configuration ownership, paths, directory initialization, maximum-log discovery, file acquisition and metadata I/O, with private JSON read/write helpers. |
+| `test_support.rs` | Compiled only under `cfg(test)`: one shared initialized provider, a stream-ID allocator, and literal-record adaptation for filesystem tests. Its contracts and tests are covered by this README. |
 
 Storage policy belongs to the application, not the public record I/O exports
 crate. `LogFileId` describes where a record belongs in a stream's sequence;
@@ -51,21 +52,29 @@ The public `log_file_path` and `index_file_path` methods share the private
 `log_or_index_file_path` helper for their numeric directory layout and basename.
 Checkpoint and clustering metadata paths do not use that helper.
 All provider methods live together in `storage_provider.rs`.
-Clustering configuration reads remain blocking startup I/O; both metadata writers
-use Tokio's asynchronous filesystem API.
-Public operations precede private path helpers, and test modules follow the
-implementation. Published filenames are constants local to `checkpoint_file_path` and the private
+Both metadata readers and writers use Tokio's asynchronous filesystem API,
+delegating bounded reads to `read_json` and publication to `write_json_atomic`.
+The provider implementation is ordered by purpose: construction and root access,
+public path queries, clustering metadata, checkpoint metadata, log/index discovery
+and file operations, then private path helpers. Shared JSON read/write helpers
+follow the implementation. Test modules come last, grouped into provider operations,
+clustering metadata, checkpoints, JSON reads and JSON writes. Pair-deletion tests
+live with the other log/index operations rather than checkpoint tests.
+Published filenames are constants local to `checkpoint_file_path` and the private
 `clustering_configuration_file_path` helper; both clustering read and write methods
 use that helper. Pending paths append `.pending` to the published path.
 Metadata read limits are named constants scoped to their respective read methods; independent
 size-limit fixtures in tests use the specified byte counts.
 `storage_error.rs` retains path and concrete I/O/JSON
-errors. `read_clustering_configuration` reads root `clustering.json`, returns
-`None` for absent metadata, rejects unpublished staging files, bounds reads to
-4 KiB and deserializes through the model's validation. It creates nothing.
+errors. `read_clustering_configuration().await` reads root `clustering.json`,
+bounds reads to 4 KiB and deserializes through the model's validation. Only the
+published file is read: an absent file returns `None` even when
+`clustering.json.pending` exists. Pending files are neither inspected nor recovered;
+other I/O and JSON errors propagate. It creates or modifies nothing.
 `write_clustering_configuration(&configuration).await` writes the supplied
-configuration/UUID, replacing any existing document. It creates the root and uses
-the shared JSON writer to stage `clustering.json.pending` and rename it over
+configuration/UUID, replacing any existing document. It uses the root established
+by provider construction and the shared JSON writer to stage
+`clustering.json.pending` and rename it over
 `clustering.json`. Unix then synchronizes the root directory;
 Windows directory durability is not guaranteed and ancestors are not synced.
 Errors/cancellation may leave pending or published metadata; callers must quiesce
@@ -92,9 +101,7 @@ Deserialization returns an owned value; a valid JSON `null` for an optional targ
 is `Some(None)`, distinct from an absent file. I/O and JSON failures retain the
 requested path and their concrete cause through the existing `StorageError`.
 
-The helper is implemented and directly tested; the checkpoint and clustering
-readers have not yet been migrated to it. Their existing behavior is unchanged,
-including the clustering reader's separate check for unpublished staging.
+Both checkpoint and clustering readers use this helper and ignore pending staging.
 Read limits remain caller policy, with each provider method owning its locally
 named constant. Recovery decisions do not belong in the generic helper.
 
@@ -120,9 +127,9 @@ rules belong to callers, not this helper.
 
 All helper filesystem operations use Tokio. Directory synchronization is Unix-only
 and applies only to the immediate parent obtained from the destination path.
-The helper creates no directories: clustering publication creates its root first,
-while checkpoint publication requires an existing stream directory. The provider
-supplies absolute file paths with parents. Callers must establish ancestor
+The helper creates no directories. Provider construction establishes the root
+and stream bases; both publication methods require their parent to still exist.
+The provider supplies absolute file paths with parents. Callers must establish ancestor
 durability and exclude concurrent access to the destination and pending path.
 
 Atomic publication makes a complete document visible; it does not promise rollback
@@ -242,18 +249,20 @@ filesystem canonicalization. Empty or otherwise rejected paths and failures to
 obtain the working directory return the underlying `io::Error`. Root paths remain
 native `PathBuf` values, including spaces, Unicode and OS-specific non-UTF-8 data.
 
-`StorageProvider::new(config: StorageConfig) -> StorageProvider` takes ownership
-without filesystem I/O. `root_directory()` borrows the absolute configured root.
+`StorageProvider::new(config: StorageConfig)` is async and returns
+`Result<StorageProvider, StorageError>`. It takes ownership and creates the root
+and all stream base directories before returning a provider.
+`root_directory()` borrows the absolute configured root.
 The provider is immutable, has no interior mutability or background tasks, and
 can be shared through `Arc<StorageProvider>` when multiple components need it.
 The configuration does not need its own `Arc` inside the provider.
 
-Callers construct configuration and the provider before using its methods.
-`initialize()` creates stream base directories when explicitly requested; it is
-not called by the current startup scaffold. No storage-worker architecture or
-startup recovery coordinator is implemented. There is no
-initialization flag or per-call readiness check. Calculating a path is valid
-before initialization; actual file operations must handle their own I/O errors.
+Callers construct configuration and await provider construction before using its
+methods. There is no separate initialization method or partially initialized
+provider exposed to callers. The current startup scaffold does not construct a
+provider. No storage-worker architecture or startup recovery coordinator is
+implemented. There is no initialization flag or per-call readiness check;
+actual file operations must still handle their own I/O errors.
 
 ## Fixed path layout
 
@@ -398,7 +407,7 @@ a file does not durably synchronize its parent directory or publish stream state
 
 ## Stream-directory initialization and failures
 
-`initialize(&self) -> Result<(), StorageError>` is asynchronous. It uses
+`StorageProvider::new(config).await` performs directory initialization. It uses
 `StreamId::all()` to visit every supported, typed stream ID in ascending order,
 calling Tokio's `create_dir_all` for each stream base. This ensures the root,
 `streams`, and `0000` through `4095` exist.
@@ -406,21 +415,21 @@ There is no preceding existence check: creation itself accepts existing
 directories and reports failures, avoiding a redundant filesystem lookup and
 check-then-create race.
 
-Initialization is safe to repeat. Existing files and directory contents are left
-intact; initialization does not scan, validate, truncate, overwrite or clean them
-up. The four deeper range directories and actual log/index/checkpoint files are
+Construction is safe to repeat for an existing root. Existing files and directory
+contents are left intact; construction does not scan, validate, truncate, overwrite
+or clean them up. The four deeper range directories and actual log/index/checkpoint files are
 not created. Future file creation will ensure those parents only as needed.
 
-The first creation failure stops initialization. `StorageError::path()`
-identifies the full stream-directory path requested; the actual obstacle may be
+The first creation failure stops construction without returning a provider.
+`StorageError::path()` identifies the full stream-directory path requested; the actual obstacle may be
 one of its parents. Its standard error source preserves the original `io::Error`,
 and its display includes both path and cause. For example, a regular file at
 `streams/0007` prevents that directory from being created and is left untouched.
 
 Failure or cancellation may leave earlier directories created. There is no
-rollback, and retrying after the cause is resolved accepts that partial progress.
-The provider stores no success/failure state, so a failed attempt does not poison
-the object. Tests cover a failure after several successful stream creations.
+rollback, and constructing again after the cause is resolved accepts that partial
+progress. An unpolled constructor future performs no I/O. Tests cover this lazy
+behavior and a failure after several successful stream creations followed by retry.
 
 Success establishes directory existence during the operation. It does not grant
 exclusive ownership, guarantee future writes, validate existing records, or sync
@@ -461,15 +470,96 @@ root resolution, nonexistent roots and empty input. Provider tests use independe
 path fixtures at every three-digit carry boundary and the numeric maximum, along
 with stream limits, Unicode/space-containing roots, and no filesystem side effects
 from path construction. Checkpoint fixtures cover stream limits, the stable base
-directory and filename, and paths before initialization. Relative-root and
+directory and filename, and paths before any files exist. Relative-root and
 Unix-only non-UTF-8-root checks cover checkpoint paths as well.
 
-Filesystem tests use isolated temporary directories and verify all 4,096 stream
-bases, absence of eagerly created range directories, repeated initialization,
-preservation of existing log/index/checkpoint contents, collisions at the
-root/parent/stream levels, retained error causes, and retry after partial initialization. They do not
-change the process-wide working directory. Temporary test data is cleaned up by
-the test directory owner.
+Construction, layout-damage and special-root tests use isolated temporary
+directories. They verify all 4,096 stream bases, absence of eagerly created range
+directories, repeated construction, preservation of existing contents, collisions
+at the root/parent/stream levels, retained causes and retry after partial
+initialization. Their temporary directory owners clean up after handles close.
+Tests do not change the process-wide working directory. Routine filesystem tests
+use the shared fixture below instead of repeatedly creating/removing all bases.
+
+`StorageProvider::clear_all(&mut self)` is available only under `cfg(test)` for
+reusing initialized test storage. It removes all contents except the root,
+`streams`, and the canonical 4,096 stream bases. This includes metadata, staging,
+range directories and unrelated entries. It does not delete/recreate the retained
+directories, sync disposable data or repair a damaged base layout. Callers must
+keep that layout intact, close file handles and exclude other access throughout
+cleanup and use. Errors preserve the affected path and can follow partial removal.
+Directory links are not traversed. The scan runs as one Tokio blocking task to
+avoid thousands of async dispatches for empty bases; callers must await completion
+before releasing their fixture. Same-file tests check repeated clearing, reuse,
+all stream bases and unrelated content; Unix tests also protect an outside sentinel
+behind symlinks.
+
+### Shared test storage
+
+The crate-private, test-only `test_support` module serves provider, initializer and
+indexed-log validator tests. `storage_fixture().await` returns an owned
+`StorageFixture` guard with read-only `provider()` and `stream_id()` getters.
+A Tokio `OnceCell` constructs the real provider and awaits `clear_all` exactly
+once before publishing it. Construction is not bypassed. An atomic counter
+assigns distinct IDs across all three suites; claim another fixture when a case
+needs another stream. Independent parameter-loop cases claim separate guards.
+Allocation order and numeric IDs are not assumptions tests may rely on.
+
+Each guard owns only its stream's contents. Its `Drop` removes files and nested
+range directories, preserving the stream base. Declare the guard before the
+file handles and state that use it, retain it for their entire lifetime, and
+await all filesystem work before leaving its scope. Copying its provider
+reference or stream ID does not extend the guard's lifetime. Drop performs small,
+synchronous filesystem cleanup on the test thread; it does not spawn async work
+or depend on a Tokio runtime remaining alive. A damaged or missing stream base
+is an error, and cleanup never follows directory links into another tree.
+
+No per-test mutex is held for streams, so independent Tokio test runtimes can
+use the provider concurrently. Path-only tests may query fixed boundary IDs
+without inspecting or changing those streams' contents; filesystem assertions
+use an owned fixture's ID. Tests that alter base directories, exercise
+construction/reset itself, or require a particular root retain isolated providers.
+
+Clustering configuration is root-wide, so stream IDs cannot isolate it. The
+provider's clustering tests borrow the shared provider and own a metadata guard
+holding the existing async mutex. It removes `clustering.json` and its pending
+sibling before releasing that mutex, including during panic unwinding. Only these
+guarded tests may modify clustering metadata; stream tests proceed independently.
+
+Cleanup runs through normal Rust scope exit under `cargo test` and IDE test runs,
+including assertion failures that unwind. A removal failure panics during normal
+exit, failing the test. During an existing panic it reports the path and cause to
+stderr without a second panic, preserving the original test failure. Removal can
+be partial on I/O failure. Startup clearing remains the fallback for leftover data
+after such errors, aborted processes, forced termination or machine restarts;
+`Drop` cannot guarantee cleanup when a process does not unwind.
+
+The cache lives below `test-storage/log data 東京/replica` beside the test executable
+in Cargo's build output, exercising spaces and Unicode as part of ordinary tests.
+Successful guard cleanup leaves only the empty directory skeleton. Later runs
+reuse that layout; `cargo clean` removes it. An OS file lock held for the process
+lifetime excludes competing test processes using the cache. The small lock file
+remains beside it so another process cannot bypass exclusion by replacing the
+lock file. Lock acquisition runs on a blocking worker. Await shared fixture
+initialization to completion: cancellation does not stop spawned filesystem work.
+The static provider is intentionally retained; file cleanup belongs to the owned
+guards, and needs no runner script or suite-teardown hook.
+
+Same-file guard tests check distinct IDs, cleanup of nested contents, preservation
+of another live stream and the base directory, and cleanup during panic unwinding.
+Windows tests deny deletion to check error reporting and preservation of an
+existing panic; Unix tests check that a linked outside sentinel is untouched.
+The metadata tests check published/staging cleanup on success and panic before
+another case acquires the lock.
+
+`record_fixture` adapts independent literal records to an allocated stream by
+changing only the ID and CRC-32C trailer, without invoking the production encoder.
+Known complete byte fixtures, including a stream ID with a nonzero high byte,
+check that adaptation. A same-file fixture test verifies a second claim gets a
+different ID in the same root and preserves the first case's files. The consuming
+suites keep explicit expected endpoints/index bytes and run in parallel to expose
+accidental shared IDs or resets. This support changes test setup only; it makes no
+production recovery-throughput claim.
 
 From the workspace root:
 

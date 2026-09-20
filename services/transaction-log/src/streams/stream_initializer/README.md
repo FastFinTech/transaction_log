@@ -114,9 +114,10 @@ step sequence must establish the state needed by the infallible `finish`.
 ## Checkpoint loading (implemented)
 
 `load_checkpoint` delegates reading and metadata deserialization to
-`StorageProvider::read_checkpoint`. A missing checkpoint, including a missing
-storage root, sets `checkpoint` to `None`. A present checkpoint must identify the
-requested stream; a mismatch reports the checkpoint path and both stream IDs.
+`StorageProvider::read_checkpoint`. A missing checkpoint sets `checkpoint` to
+`None`; provider construction has already created the stream base. A present
+checkpoint must identify the requested stream; a mismatch reports the checkpoint
+path and both stream IDs.
 Provider failures retain their concrete `StorageError` and path through `anyhow`.
 
 State is assigned only after reading and the stream check succeed, so an error
@@ -231,7 +232,7 @@ the returned Tokio files.
 One operation is still missing: **creating a fresh log/index pair and its deeper
 range directories**. `open_log_for_validation` only opens an existing log;
 `open_index_for_repair` may create an index but requires its parent directory to
-exist. `StorageProvider::initialize` creates stream bases, not range directories
+exist. `StorageProvider::new(config).await` creates stream bases, not range directories
 or log files. Add a purpose-specific provider operation when implementing
 `prepare_active_pair`; it must avoid overwriting an existing log and define how
 an existing orphan index or interrupted creation is handled. Range-based pair
@@ -240,12 +241,33 @@ creation remains deferred.
 
 ## Validation and performance
 
+Same-file tests use [shared test storage](../../storage/README.md#shared-test-storage)
+alongside the provider and indexed-log validator tests. All three suites share
+one initialized provider and one atomic stream-ID allocator. Each independent
+test case and parameter-loop iteration owns a fixture guard for its stream;
+additional streams need additional guards from the same allocator. Guards are
+declared before file handles and state, and clean only their stream's contents
+when the scope ends. No stream mutex is held during execution. The storage specification owns
+the fixture's initialization, caching, isolation and cancellation contracts.
+Cleanup works with ordinary `cargo test`, including panic unwinding, preserving
+the empty stream bases for reuse.
+
+Literal record templates retain their fixed framing, sequences and payloads.
+The fixture helper replaces only the stream ID and CRC-32C trailer, independently
+of the production encoder. Known byte fixtures check that adaptation, while
+expected record ends and index bytes remain explicit. Full-file fixtures are
+encoded for each case's own stream.
+
+The test that deliberately replaces a stream base with a file retains an isolated
+temporary provider because it damages the base layout. The other cases rely on
+the shared fixture. Production initialization and provider behavior are unchanged.
+
 Build and lint the declared signatures and compile the README example; do not
 execute the placeholder methods or add tests that merely assert `todo!()` panics.
-Same-file checkpoint-loading tests cover absent storage, independent literal
+Same-file checkpoint-loading tests cover absent metadata, independent literal
 metadata (including sequence zero and a later file), wrong-stream metadata, JSON
 and I/O failures, retained state on errors, and unchanged storage. Discovery tests
-cover absent/index-only storage, stream isolation, empty maximum logs, maxima
+cover empty/index-only storage, stream isolation, empty maximum logs, maxima
 equal to/after/before the checkpointed file, absent logs with a checkpoint, deferred
 pair checks, and preserved state and concrete errors on failure. Provider tests
 cover the read-size limit, metadata parsing and directory-search details.
@@ -256,7 +278,7 @@ earlier progress after failure. Independent record/index fixtures and expected
 endpoints check the handoff; lower validator suites cover detailed I/O failures,
 cancellation and synchronization. Tests also verify that cleanup, fresh-log
 creation and checkpoint publication have not occurred during validation.
-Cleanup tests cover absent storage, no-op cleanup with a retained pair, inclusive
+Cleanup tests cover empty storage, no-op cleanup with a retained pair, inclusive
 removal across range directories, gaps/orphan indexes, absent pairs, preservation
 of retained/earlier/other-stream files and checkpoints, and repeatable cleanup.
 Log and index deletion failures verify partial progress, stopping before later

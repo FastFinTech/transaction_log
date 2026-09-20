@@ -15,4 +15,6 @@ transaction-log-exports = { path = "../transaction-log-exports" }
 uuid.workspace = true
 
 [dev-dependencies]
+crc32c.workspace = true
 tempfile = "3"
+tokio = { workspace = true, features = ["sync"] }

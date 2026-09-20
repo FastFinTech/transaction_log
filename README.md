@@ -228,7 +228,7 @@ failure handling, comparison rules and integration commands.
 - [x] Explicit async buffer output, destination flushing and optional file data synchronization.
 - [x] Single-threaded object-pool utility with unused-object reclamation.
 - [x] Reusable async Serde message I/O with bounded, length-prefixed Postcard frames; application messages and connection integration remain pending.
-- [x] Storage provider with owned startup configuration, deterministic log/index/checkpoint paths and stream-directory initialization.
+- [x] Storage provider with owned startup configuration, async construction that creates the root and stream directories, and deterministic log/index/checkpoint paths.
 - [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
 - [x] Typed record start/end locations and a range model with lazy enumeration of bounded, postfix, whole-file and prefix reads.
 - [x] Stream-owned file identities, record endpoints/ranges and checkpoint model, with validated Serde metadata and checkpoint persistence; stream initialization implements step orchestration, checkpoint loading with stream-ID checking, and maximum-log discovery checked against the checkpoint's file number.
@@ -278,6 +278,9 @@ cargo run -- --help
 ```
 
 The application validates configuration, prints its embedded version and exits. Storage startup integration remains deferred.
+Owned [test-storage guards](services/transaction-log/src/storage/README.md#shared-test-storage)
+clean each case's files during normal completion or panic unwinding, preserving
+the empty stream directories for fast reuse under ordinary `cargo test`.
 For VS Code or Devin, install the extensions recommended in
 [.vscode/extensions.json](.vscode/extensions.json), including rust-analyzer,
 CodeLLDB and Dependi. The **Debug Transaction Log** launch configuration builds
