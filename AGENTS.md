@@ -67,9 +67,13 @@ Collapsing is presentation only; the requirements remain authoritative. Folder
 boundaries do not limit a shared contract: a reader or writer must follow the
 specification for its record format.
 
-The current [record specification](services/transaction-log-exports/src/record/README.md)
-covers record values, the protocol, and reader/writer integration. Read it when
-changing any of those areas, including the sibling `record_reader.rs` file.
+The [record specification](services/transaction-log-exports/src/record/README.md)
+owns record values and the shared wire/file format. Read it when changing records
+or either I/O direction. The sibling
+[reader specification](services/transaction-log-exports/src/record_reader/README.md)
+owns input, batching, cancellation and failure behavior; the
+[writer specification](services/transaction-log-exports/src/record_writer/README.md)
+owns construction and output completion.
 
 ## Code organization and readability
 

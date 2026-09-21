@@ -1,66 +1,91 @@
-# Record requirements and design
+# Records
 
-This is the maintained specification for record values, their encoded format,
-and the boundaries between records, readers, and writers. It is for both
-people and coding agents. `mod.rs` includes this file in the module's generated
-Rust documentation; edit this source rather than creating another design summary.
+A record carries a stream-local identity and an opaque payload between transaction
+log producers, byte streams and files. Records own validated, immutable bytes and
+remain usable after their reader advances or is dropped.
 
-The requirements below describe the agreed behavior. The performance observations
-describe one compiler and target, and must be rechecked when relevant code changes.
-Planned components are explicitly identified. An implementation change alone does
-not revise a requirement: keep this document, API contracts, and tests consistent
-with intentional design changes.
+## Types and modules
 
-## Purpose and scope
-
-A record carries a stream-local identity and an opaque binary payload between
-event producers, sockets, and transaction log files. Returned records must remain
-usable after the next read, after the receive buffer changes, and after the reader
-is dropped. Reading header fields and producing records are hot paths. The design
-discussion used 100 million records per minute as a throughput target, not a
-benchmark result or a guarantee made by this crate.
-
-| Component | Responsibility and status |
+| Type or module | Responsibility |
 | --- | --- |
-| `Record` | Implemented: immutable ownership of exactly one validated encoded record and inexpensive accessors. |
-| `RecordHeader` | Implemented: an independently owned, read-only snapshot of a `RecordLength` and record identity. |
-| `RecordId` | Implemented: a read-only `StreamId` and `SequenceNumber` pair with a checked successor operation. |
-| `RecordLength` / `RecordLengthError` | Implemented in `record_length.rs` / `record_length_error.rs`: validated total encoded byte length, protocol-derived bounds, checked raw construction and a restricted unchecked constructor for `Record::length()`. |
-| `StreamId` / `StreamIdError` | Implemented: a validated logical stream identifier, enumeration of its supported domain, and its construction error. |
-| `SequenceNumber` | Implemented: a typed integer with no raw-value validation. |
-| `record_protocol` | Implemented: encoded sizes, offsets, raw header/CRC initialization, field decoding, and CRC calculation shared by consumers. |
-| `RecordReader` in the sibling `record_reader.rs` | Implemented: asynchronous input, complete wire validation, and batch preparation. |
-| `RecordBuilder` in the sibling `record_writer` module | Implemented: concrete callback destination with bounded body serialization; construction and finalization remain module-private. |
-| `RecordWriter` | Implemented: constructor-selected modes for synchronous serialization or existing-record copies, one reusable buffer and owned async destination, explicit buffer output, separate destination flushing and optional data synchronization, and terminal handling of failed/cancelled I/O. Scheduling and durability policy belong to higher layers. |
-| `AsyncSyncData` in the sibling `record_writer` module | Implemented: optional destination capability that makes data synchronization available on a suitably bounded `RecordWriter`. Tokio files have an implementation; arbitrary `AsyncWrite` destinations do not. |
-| Application indexed log writer/validator | Enforce each file's stream and sequence on append/recovery; the validator repairs indexes and supports explicit invalid-tail removal. Client ingestion/disconnection remains future integration work. |
+| [`Record`] | Own one validated encoding and expose its identity, payload and checksum. |
+| [`RecordHeader`] | Retain the decoded length and identity independently of the record's bytes. |
+| [`RecordId`] | Pair a stream ID with a sequence number and derive the next ID in that stream. |
+| [`StreamId`] / [`StreamIdError`] | Identify a logical stream in `0..=4095` and report rejected raw IDs. |
+| [`SequenceNumber`] | Represent a stream-local sequence as a `u64`. |
+| [`RecordLength`] / [`RecordLengthError`] | Represent a total encoded length in `16..=65_535` and report rejected lengths. |
+| [`record_protocol`] | Define the shared encoding, limits and field/CRC operations. |
 
-Keep `mod.rs` thin and keep each record type in its own file. The reader is a
-separate module. Tests belong in the same source file as the behavior they test.
+The sibling [`record_reader`](crate::record_reader) module validates incoming
+bytes and returns records. [`record_writer`](crate::record_writer) creates
+compatible encodings. Their specifications cover input and output lifecycles.
 
-`record_protocol.rs` groups operations into inline `read` and `write` modules.
-This README covers both groups, their shared layout, and test support. Keeping
-them inline makes the groups collapsible in the editor while their common format
-definitions remain nearby. They can move to separate files later without changing
-call paths. The grouping introduces no runtime dispatch, allocation, or new types.
+## Usage
 
-| Protocol group | Responsibility |
+Create an encoding with the writer, then read it as a validated record. The
+returned record retains its payload after the reader is dropped:
+
+```rust
+use std::io::Write;
+use transaction_log_exports::{RecordId, RecordReader, RecordWriter, SequenceNumber, StreamId};
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let id = RecordId::new(StreamId::new(42)?, SequenceNumber::new(123));
+let mut writer = RecordWriter::for_serialization(Vec::<u8>::new());
+writer.write(id, |body| body.write_all(b"payload"))?;
+writer.flush_buffer().await?;
+
+let encoded = writer.into_inner();
+let mut reader = RecordReader::new(encoded.as_slice());
+assert!(reader.wait_to_read().await?);
+let record = reader.try_read_next()?.unwrap();
+drop(reader);
+
+assert_eq!(record.id(), id);
+assert_eq!(record.body(), b"payload");
+# Ok(())
+# }
+```
+
+The [`reader specification`](crate::record_reader) explains consuming a complete
+stream, including batching, EOF and error handling.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Retaining the right data.** A `Record` owns an immutable `bytes::Bytes` handle.
+Moving it transfers the handle, and cloning it shares the encoded bytes. A small
+record may keep a larger batch allocation alive; that is the tradeoff for retaining
+records without copying each payload.
+
+| Need | Operation and ownership |
 | --- | --- |
-| Root | One set of field offsets, field sizes, and record limits shared by both directions. Public constants keep paths such as `record_protocol::MAX_RECORD_LEN`. |
-| `read` | Crate-private field decoding, header borrowing, stored-CRC reading, and CRC calculation used by both `Record` and `RecordReader`. `read_field` is private to this group; validation decisions remain in `RecordReader`. |
-| `write` | Crate-private header and CRC initialization into exclusively held storage. Capacity and publication of the completed buffer remain the builder's responsibility. |
-| Root test support | Same-file tests and independent fixtures outside both groups, shared with record, reader, and builder tests. |
+| Inspect the payload | `body()` borrows bytes excluding the header and CRC. |
+| Pass the full encoding to a byte-slice API | `AsRef<[u8]>` borrows the complete record. |
+| Retain or slice the encoded storage | Clone or slice the handle borrowed by `as_bytes()`. |
+| Transfer the encoded storage | `into_bytes()` moves the handle without cloning it. |
+| Retain only decoded header fields | `get_header()` returns an owned snapshot without retaining byte storage. |
 
-Use directional paths such as `protocol::read::stream_id(header)` and
-`protocol::write::header(pointer, length, id)`. Do not add flat aliases that obscure
-the split or duplicate shared layout definitions inside either group.
+Borrowed views remain tied to their record. A header snapshot can outlive it, and
+individual getters let callers decode only the fields they need.
 
-## Wire and file contract
+**Copying a record to another destination.** The writer's existing-record mode
+copies an already-validated encoding into its own batch. The borrow ends when
+`write_record(&record)` returns, so the original can be dropped before output.
+That intentional copy preserves synchronous appends and record order without
+revalidating fields or recomputing CRC. Sending the batch remains an explicit
+operation; details are in [`record_writer`](crate::record_writer).
 
-All encoded integers are little-endian. There is no padding between fields or
-between consecutive records, on the wire, on disk, or in the retained byte buffer.
-The length field describes the entire record, including itself, the payload,
-and the CRC trailer.
+</details>
+
+## Behavior and guarantees
+
+### Wire and file contract
+
+All encoded integers are little-endian. Records have no padding between fields
+or between consecutive encodings, on the wire or in files. The length includes
+the header, payload and CRC trailer.
 
 | Byte offset | Size | Field |
 | --- | --- | --- |
@@ -70,316 +95,201 @@ and the CRC trailer.
 | 12 | Variable | Opaque payload |
 | length minus 4 | 4 | CRC-32C trailer, `u32` |
 
-The encoded header is 12 bytes and the CRC trailer is 4 bytes. An empty payload
-is valid, giving a minimum record size of 16 bytes. The maximum record size is
-65,535 bytes, giving a maximum payload of 65,519 bytes. The limit is fixed by
-the protocol; the reader has no configurable maximum. Buffer lengths and batch
-cursors use `usize`, and a batch can exceed the maximum size of one record.
+The 12-byte header and four-byte trailer give a minimum encoded size of 16 bytes
+and a maximum of 65,535 bytes. Payloads may be empty and contain at most 65,519
+bytes. These fixed limits apply to each record; a buffer or batch can be larger.
+The reader has no configurable maximum.
 
-Production code gets these sizes from `record_protocol::HEADER_LEN`, `CRC_LEN`,
-`MIN_RECORD_LEN`, `MAX_RECORD_LEN`, and `MAX_PAYLOAD_LEN`. Keep byte offsets and
-field encoding and decoding in that module, rather than duplicating them in
-readers, records, or writers. `StreamId::COUNT` is a domain limit and belongs to
-the identifier type, independently of its encoded width.
+CRC-32C covers the finalized header and payload, excluding the trailer itself.
+[`Record::crc()`](Record::crc) reads the stored checksum; the reader has already
+verified it. The payload remains opaque to the record I/O layer.
 
-CRC-32C covers every byte of the header and payload, including the finalized
-length and ID. It excludes the last four bytes. Store its result little-endian
-in that trailer. Do not place the CRC in the header or include a zeroed
-checksum field in the calculation. Trailer placement lets the checksum be
-computed over one contiguous prefix. `Record::crc()` reads the stored checksum;
-it does not calculate or verify it.
+<details>
+<summary>Design and maintenance notes</summary>
 
-The protocol keeps three CRC operations with distinct contracts. `read::crc(frame)`
-locates and decodes the stored trailer without a repeated length check; its caller
-must prove the trailer extent. `read::compute_crc(frame)` recalculates the checksum of
-a fully initialized input frame, excluding its trailer, for reader validation.
-`write::crc(record, record_len)` calculates and initializes the trailer through a
-raw pointer whose header and payload are already initialized. Both calculations
-use the same `crc32c` implementation. Writers must not create a full frame slice
-while the trailer is uninitialized. Separate content-only calculation, CRC-offset,
-and trailer-borrow helpers are unnecessary.
+**Shared encoding.** The [`record_protocol`] constants define production sizes
+independently of native Rust layout. Its internal read and write operations share
+field offsets and limits, so both directions use the same representation.
+Grouping the operations by direction separates their initialization requirements
+without introducing dispatch or duplicate codecs. `StreamId::COUNT` is a domain
+limit, independent of the field's encoded width.
 
-## Encoded record length type
+**CRC placement and initialization.** A trailer permits CRC calculation over one
+contiguous header-and-payload prefix. It is not a zeroed field included in the
+checksum. The protocol distinguishes three operations:
 
-`RecordLength` wraps a private `u64` containing the complete encoded length,
-including header, payload and CRC. It is distinct from a payload size, stream/file
-offset or batch length. `RecordLength::MIN` and `MAX` are typed constants derived
-from `record_protocol::MIN_RECORD_LEN` and `MAX_RECORD_LEN`; the protocol remains
-the source of truth for the bounds. The current range is `16..=65_535`.
+- `read::crc` decodes the stored trailer after its caller establishes the extent.
+- `read::compute_crc` calculates CRC over a fully initialized frame, excluding
+  its trailer, for input validation.
+- `write::crc` calculates and initializes a writable trailer after the header
+  and payload have been initialized.
 
-The native `u64` matches file-position arithmetic, including the positions in
-`RecordEndLocation`. The wire length remains `u16`; the native representation does
-not change the encoded format or increase the maximum record size. Buffer APIs
-use `usize`, so conversion is still explicit even on targets where both integers
-are 64 bits wide. `Record` computes this value rather than storing another field.
+Both calculations use the same `crc32c` implementation. The writing operation
+accepts a raw pointer because creating a full-frame slice would expose an
+uninitialized trailer. A separate content-only CRC or trailer-borrow layer would
+add no needed capability.
 
-`new(u64)` and `TryFrom<u64>` validate both bounds, returning `RecordLengthError`
-with the full rejected input through its read-only `value()` getter. Validation
-does not narrow or truncate oversized inputs before checking them.
-`get()` returns the underlying `u64` without validation. Checked construction
-establishes a numeric bound, not framing, byte availability, identity or checksum
-validity. Both types are exported from `record` and the crate root.
+The raw header writer initializes all 12 header bytes with unaligned
+little-endian stores without first creating a reference to uninitialized storage.
+CRC finalization requires an initialized, finalized header and payload plus
+writable trailer storage in the same allocation. The caller establishes byte
+extents and exclusive access; these protocol operations neither validate framing
+nor grow storage. The [`writer specification`](crate::record_writer) explains
+how its builder establishes those properties before publishing the encoding.
 
-The unsafe `new_unchecked(u64)` constructor is restricted to the record module
-and may be called only by `Record::length()`. That getter reads the immutable byte
-handle's already-validated length, converts it losslessly to `u64` and wraps it without
-repeating the range check. Reader validation established exact extent, supported
-length and equality with the encoded field before exposing the record. Tests of
-invalid raw values use the checked constructor, never the unchecked constructor.
-The raw protocol decoder and reader continue using raw lengths while inspecting
-unvalidated bytes.
+**Native layout and alignment.** `RecordHeader` and `RecordId` use Rust's default,
+compiler-selected layout. The integer wrappers use `repr(transparent)`, but their
+native sizes and padding do not define serialization. The explicit wire offsets
+remain independent of `size_of` and struct memory layout.
 
-`Record::length()` and `RecordHeader::length()` return `RecordLength`. Header
-construction, record tests and builder tests use the typed length; benchmark byte
-counters use its `get()` accessor. The application's log-file validator and
-indexed log writer use `RecordStartLocation::to_end(RecordLength)` to derive each
-accepted record's exclusive end. Numeric extraction remains explicit; the wrapper
-does not implicitly convert to integers.
+Records can begin at arbitrary byte addresses. A borrowed native header view
+would require alignment that byte buffers and packed record boundaries do not
+provide. Padding records would cost up to seven bytes on both wire and disk;
+adding padding during reads would require data movement. Fixed-width
+little-endian decoding avoids those costs without a packed native header or a
+dynamically sized native record.
 
-## Identity and domain rules
+</details>
 
-`StreamId` wraps `u16` but accepts only `0..=4095`: 4,096 logical streams. Zero is
-a valid stream ID. `StreamId::new` and `TryFrom<u16>` validate external values and
-return `StreamIdError` containing the rejected integer. Replicas use the same ID.
+### Identity and encoded length
 
-`StreamId::all()` returns a fresh, lazy iterator over every supported ID, from
-`MIN` through `MAX` inclusive and in ascending order. It allocates no collection
-and constructs valid wrappers directly from the bounded range without repeated
-validation or unsafe code. Consumers such as storage initialization can remain
-typed throughout instead of rebuilding raw integer ranges. This enumerates the
-supported domain, not streams discovered on disk or assigned to a particular host.
+`StreamId` identifies one of 4,096 logical virtual shards. Zero is valid, and
+replicas share the same stream ID. `new` and `TryFrom<u16>` check the domain;
+`StreamIdError::value()` retains the rejected integer. `StreamId::all()` lazily
+enumerates every supported ID in ascending order, rather than discovering which
+streams exist in storage.
 
-Streams represent virtual shards, rather than individual users or accounts.
-A user or another chosen domain boundary stays on its original logical shard;
-the machine hosting a shard can change. A stream ID therefore does not identify
-a particular machine or execution context. The broader design distributes many
-virtual shards over execution contexts associated with CPU cores. None of that
-routing or scheduling is implemented by these value types.
+Every `u64` is a valid raw `SequenceNumber`, including zero. `RecordId` combines
+an already-typed stream and sequence. Its ordering compares stream ID first,
+then sequence; it does not define chronology across streams. `next()` preserves
+the stream and performs a checked increment, panicking on exhaustion in both
+debug and release builds. It neither reserves an ID nor establishes continuity.
 
-`SequenceNumber` wraps `u64`. Every raw value, including zero and `u64::MAX`, is
-representable. Construction is infallible. The command handler assigns sequence
-numbers. A raw sequence value does not establish that an append is in order.
-`RecordId` combines the two typed values; its ordering is stream ID first, then
-sequence number, and does not define chronological order across streams.
+`RecordLength` represents the complete encoded byte count as a private `u64`.
+`new` and `TryFrom<u64>` validate `16..=65_535` before narrowing, and
+`RecordLengthError::value()` retains the full rejected input. `get()` extracts the
+number explicitly. A valid length alone does not establish that bytes exist or
+that framing, identity and CRC are valid.
 
-Sequence continuity requires external per-stream state. The future client
-ingestion path must reject an out-of-sequence record, report stream/expected/
-received values, and disconnect that client. File replay must stop at such a
-record and treat the remaining file tail as invalid. The generic reader can
-consume mixed streams and does not know their previous sequence numbers, so it
-must not impose that policy. The first expected sequence and exhaustion behavior
-at `u64::MAX` remain decisions for those future components; do not infer a starting
-value or introduce wrapping sequence arithmetic from the wrapper's limits.
+`Record::length()` and `RecordHeader::length()` return `RecordLength`. Value
+fields are read-only; header snapshots are obtained through `Record::get_header()`.
 
-`RecordId::next()` returns a `RecordId` containing the same stream ID and the
-sequence number increased by one. It uses a checked increment and panics at
-`u64::MAX` in both debug and release builds, never wrapping to zero or moving to
-another stream. Exhaustion is treated as a programming error in this convenience
-method, keeping ordinary calls direct while preventing silent wraparound.
-It leaves the original ID unchanged and performs no allocation or repeated
-stream ID validation. It does not reserve an ID, synchronize producers, or prove
-sequence continuity.
+`StreamId`, `SequenceNumber` and `RecordId` support Serde metadata serialization.
+In JSON the wrappers are integers, and an ID has the shape
+`{"stream_id":42,"sequence_number":123}`. Both fields are required; duplicate and
+unknown object fields are rejected. This metadata representation is separate
+from the binary record encoding.
 
-### Identifier metadata serialization
+<details>
+<summary>Design and maintenance notes</summary>
 
-`StreamId`, `SequenceNumber` and `RecordId` implement Serde's format-independent
-`Serialize` and `Deserialize` traits for metadata such as storage checkpoints.
-In JSON the wrappers are integers; a record ID is an object such as
-`{"stream_id":42,"sequence_number":123}`. Its two fields are required, with
-duplicate and unknown object fields rejected.
+**Logical identity.** A user or another chosen domain boundary stays on its
+logical shard even when the machine hosting that shard changes. The ID therefore
+carries no physical host or execution-context identity. Routing may distribute
+virtual shards over contexts associated with CPU cores; the value itself performs
+no routing or scheduling. `all()` constructs valid wrappers directly from its
+bounded range, without allocating a collection or repeating validation.
 
-`StreamId` uses `#[serde(try_from = "u16", into = "u16")]`, routing loading through
-its existing checked conversion. Do not replace this with transparent derived
-deserialization: that would allow external metadata to construct an invalid ID.
-`SequenceNumber` is transparent to Serde because every `u64` value is valid.
-Integer decoding preserves the full range without conversion through floats.
-Serde reports invalid numeric types/ranges and stream-domain errors through the
-chosen format's error type. It does not establish sequence continuity or record
-existence, which still require application state.
+The command handler assigns sequence numbers. Continuity needs per-stream state,
+which a generic reader of mixed streams does not own. The planned ingestion
+contract rejects out-of-sequence input, reports stream/expected/received values,
+and disconnects that client. Replay treats such a record and the remaining tail
+as invalid. Those stateful checks belong to the ingestion or replay owner;
+raw identifier validity cannot establish them.
 
-These traits describe metadata, not encoded records. They add no stored fields
-or validation to getters and are not called by the record reader/writer codecs.
-The explicit little-endian protocol remains authoritative for record I/O.
+**Length representation.** A native `u64` fits file-position arithmetic while the
+wire length remains a `u16`. Buffer lengths and batch cursors use `usize`, so
+conversions are explicit. Typed `MIN` and `MAX` derive from the protocol limits,
+and `Record` computes the length from its byte handle instead of storing another
+field. Downstream location arithmetic can accept a `RecordLength` without
+confusing it with a payload size, file offset or batch length.
 
-## Ownership, native layout, and accessors
+`RecordLength::new_unchecked` is restricted to the record module and only
+`Record::length()` may call it. The reader has established the supported length,
+exact extent and equality with the encoded field before freezing the bytes. The
+getter can therefore wrap `Bytes::len()` without repeating a range check. Raw
+protocol decoding and reader validation continue to use raw lengths until those
+properties are established.
 
-`Record` owns an immutable `bytes::Bytes` handle. It does not borrow the reader's
-current buffer. Moving a record transfers that handle; cloning a record or its
-byte handle shares storage rather than copying header or payload bytes. A small
-retained record can keep a larger backing allocation alive. This is an accepted
-tradeoff of shared ownership, not evidence that the record should borrow the
-reader or copy every payload.
+**Read-only values.** Private fields and copy getters keep IDs, header snapshots
+and error diagnostics stable after construction. `RecordHeader::new` is restricted
+to the record module and takes the length and identity of the same validated
+record. Getters copy fields without allocation or repeated validation; replacing
+an entire value remains possible. `getset::CopyGetters` implements native field
+access, while the record keeps its specialized byte decoding and ownership APIs.
 
-`body()` and `AsRef<[u8]>` return borrowed slices tied to the record. `body()`
-excludes the header and trailer, while `AsRef<[u8]>` exposes the entire encoding
-for generic byte-consuming APIs. `as_bytes()` exposes the owning handle by
-reference so callers can clone or slice it. `into_bytes()` transfers that handle
-without a clone. These operations serve different ownership needs.
+**Validated metadata.** `StreamId` deserialization uses its checked `u16`
+conversion; a transparent derive would bypass the domain bound. `SequenceNumber`
+can be transparent because every `u64` is valid. Integer decoding preserves the
+full range without floating-point conversion. The selected Serde format retains
+numeric and domain errors; it does not prove record existence or sequence
+continuity. Metadata serialization adds no fields or validation to getters and
+is not used by the record reader/writer codecs.
 
-`get_header()` returns an owned, native-endian `RecordHeader`. Callers can retain
-it independently and reuse it for repeated field access. Its private fields are
-exposed by `length()` and `id()`, returning `RecordLength` and `RecordId` copies.
-Both the header and `Record::length()` preserve the typed length. Individual
-record getters let callers read only the fields they need. Callers obtain
-snapshots through `Record::get_header()`.
-The `RecordHeader::new(length, id)` constructor is restricted to the record
-module with `pub(super)`. Its inputs must come from an already-validated record,
-allowing it to copy the fields without allocation or repeated length validation.
-Publicly obtainable headers therefore retain the validated length range.
+</details>
 
-Record value types expose read-only state. `RecordId::new` constructs an identity,
-and `stream_id()` and `sequence_number()` return copies of its typed components.
-`StreamIdError::value()` returns the rejected raw ID; errors are constructed by
-stream ID validation. `RecordId`, `RecordHeader`, and `StreamIdError` use
-`getset::CopyGetters` on private fields, with no setters or mutable accessors.
-This keeps an identity, header snapshot, or rejection diagnostic stable after
-construction. Callers can still replace an entire value, for example with
-`id = id.next()`; read-only fields do not make the caller's binding immutable.
+### Immutable validity
 
-The generated getters inline simple field copies without allocating or repeating
-validation. `StreamId` and `SequenceNumber` already have private fields and keep
-their handwritten `const get()` methods. `Record` keeps its specialized decoding
-and byte-view accessors; generated getters do not replace protocol logic.
+Public records come from [`RecordReader`](crate::RecordReader), which validates
+the complete encoding before exposing it. Its checks establish length, stream
+ID and CRC validity. They do not establish sequence acceptance, replication or
+durable persistence.
 
-`RecordHeader` and `RecordId` use Rust's default representation. Their native
-field order, offsets, and padding are compiler-selected and are not part of the
-public contract. `StreamId`, `SequenceNumber` and `RecordLength` use `repr(transparent)` to retain
-the layout of their underlying integers. Native layout does not define
-serialization: never derive encoded sizes from `size_of`, serialize raw struct
-memory, or cast a byte pointer to a native header reference. The protocol's
-explicit offsets and little-endian codecs define the wire and file layout.
+Records remain valid independently of subsequent reader activity. The
+[`reader specification`](crate::record_reader) owns how input is validated and
+what happens at EOF, cancellation or failure.
 
-The design uses fixed-width little-endian decoding from byte arrays at arbitrary
-byte addresses. A borrowed native header view would require alignment guarantees
-that `BytesMut` and arbitrary record boundaries do not provide. Padding every
-record would cost up to seven bytes on both wire and disk; inserting padding
-only during reading would require extra movement or
-copying. Fixed-width decoding avoids those costs. No dynamically sized native
-record or `repr(packed)` representation is part of the design.
+<details>
+<summary>Design and maintenance notes</summary>
 
-## Validation boundary and safety
+**Immutable validity.** The crate-private unsafe record constructor accepts a
+byte handle only after all of these properties have been established:
 
-Production records are currently constructed only after the reader validates
-their complete immutable encoding. Before calling `from_validated_bytes`, the
-caller must establish all of the following:
+1. It contains exactly one complete record of 16 through 65,535 bytes.
+2. Its byte length equals the encoded length field.
+3. Its stream ID is in `0..=4095`.
+4. Its stored CRC matches CRC-32C over the entire header and payload.
+5. The handle retains initialized, immutable bytes for the record's lifetime.
 
-1. The bytes represent exactly one complete record, with length in `16..=65_535`.
-2. The encoded length equals the supplied byte handle's length.
-3. The stream ID is within `0..=4095`.
-4. The stored CRC matches CRC-32C over the entire header and payload.
-5. The owning handle retains initialized, immutable bytes for the record's life.
+Immutable shared ownership preserves these properties across reader refills and
+record clones. A public constructor doing only partial validation could not
+establish this contract, so there is no partial `from_bytes` API or separate
+`RecordError`. Getters rely on complete validity. Any future construction path
+that exposes a `Record` would need to establish the same properties.
 
-`from_validated_bytes` is crate-private and unsafe. There is intentionally no
-public `from_bytes` that performs partial validation, no separate `RecordError`,
-and no validation pass in the getters. A future writer may establish the same
-invariants by construction before exposing a `Record`; it must establish all
-of them, not just reserve enough space for the header.
+**Raw byte access.** Protocol helpers decode raw values, including values that
+the reader may reject. Unchecked header views use byte arrays with alignment one
+and valid bit patterns for every initialized byte. CRC reads use unaligned loads
+and explicit little-endian conversion. Their callers establish the byte extent;
+no reference to an unaligned native integer or header is created.
 
-Protocol helpers operate at a different level. They decode raw field values,
-including values that a reader may reject. Unchecked header borrows point to
-`[u8; N]`, whose alignment is one and whose bit patterns are all valid. CRC reads
-use an unaligned integer load and explicit little-endian conversion. The caller
-must prove the byte extent; no reference to an unaligned native integer or header
-struct is created. The local `# Safety` documentation and each unsafe call's proof
-must remain next to the code even though the larger rationale lives here.
+</details>
 
-The crate-private unsafe `write::header(header: *mut u8, length: u16, id: RecordId)`
-initializes all 12 bytes directly with unaligned little-endian stores. The caller
-provides writable header storage; it may be uninitialized. It does not create an
-ordinary mutable byte-array reference before those writes. The subsequent
-`write::crc(record: *mut u8, record_len: usize)` requires an initialized finalized
-header and payload and writable trailer storage in the same allocation. Neither
-method validates framing or grows the buffer. The builder establishes their
-extent and exclusive-access requirements before publishing the completed length.
+## Performance
 
-Do not feed malformed frames to unsafe constructors in tests. Independent known
-fixtures and the bounded test encoder establish valid inputs for record tests.
-Malformed framing and invalid IDs belong in reader tests; raw protocol tests can
-exercise invalid field values while still honoring byte-extent preconditions.
+Record getters decode only requested fields. They perform no allocation, storage
+cloning, checksum calculation or repeated integrity validation. Cloned records
+share payload bytes, although shared handles still carry reference-count costs.
+The [`reader specification`](crate::record_reader) describes batching and
+receive-buffer costs.
 
-## Reader integration contract
+The design target has been 100 million records per minute for record I/O.
+That target and the assembly observations below are not durable-service throughput
+guarantees. The opt-in reader benchmark measures TCP input, parsing and validation;
+its workload and saved results are described in the
+[benchmark documentation](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log-exports/benches/README.md).
 
-`RecordReader::new(source)` is infallible and takes any suitable source; the
-asynchronous methods require Tokio `AsyncRead + Unpin`.
+<details>
+<summary>Design and maintenance notes</summary>
 
-`wait_to_read()` waits until at least one complete record is available, validates
-the complete prefix up to the first incomplete or invalid record, then splits and
-freezes that valid prefix once. The remaining bytes stay in `BytesMut`. It does not wait
-to fill a batch after complete records are available. Repeated waits with unread
-records return immediately. Validated pending header state survives fragmented
-input and cancellation so header checks are not repeated for the same frame.
+**Access costs.** Validated equality between encoded length and handle length lets
+`Record::length()` use `Bytes::len()` without dereferencing record bytes. Validated
+IDs can be wrapped directly, and native copy getters add no integrity checks.
+Ordinary bounds checks in safe slices can still exist; their elimination depends
+on the method and compiler. Inlining may reuse a loaded buffer pointer or header
+fields, so standalone getter instruction counts do not describe every call site.
 
-`try_read_next()` walks the already validated batch using its encoded lengths.
-It performs no I/O, CRC calculation, or stream ID validation, and does not split
-the receive buffer per record. Returned records share slices of the frozen
-batch. The final record takes over the batch handle instead of cloning it.
-`None` means the batch is exhausted; the caller waits again.
-
-If a record fails validation after a valid prefix, the wait returns `true` and
-exposes that prefix first. Repeated waits while the batch has unread records still
-return immediately. Once it is drained, `try_read_next()` returns `None`; the next
-wait validates the offending bytes at the beginning of the receive buffer and
-reports the error without reading more source bytes. Invalid input at the start
-of a batch fails immediately. The reader never skips an invalid record to expose
-later ones. This preserves the valid prefix independently of source chunking.
-
-Keep the offending bytes rather than storing a pending error or adding reader
-state. Invalid length/stream checks or a failing CRC calculation may run twice;
-only this failure path repeats work. Successfully validated records leave the
-receive buffer and are not checked again. A CRC-invalid frame can keep its cached
-length because its length and stream ID already passed validation. The single
-split and existing record ownership rules apply equally to a prefix before error.
-
-An error returned to the caller is terminal; subsequent operations report
-`ReaderFailed`. Retained records remain valid after an error or reader drop.
-Source I/O failures are reported immediately when encountered, without retrying
-them as content errors (`Interrupted` reads retain their existing retry behavior).
-An incomplete tail is retained for further input; EOF within a header, payload,
-or trailer is an error after any preceding complete records have been exposed.
-Clean EOF between records returns `false` and is terminal too; this reader does
-not tail files that grow after EOF.
-
-Refilling can move unfinished data when the mutable buffer grows or reclaims
-space. Sharing completed records does not imply that the entire receive path
-performs no copies or allocations.
-
-```rust
-use tokio::io::AsyncRead;
-use transaction_log_exports::{Record, RecordReadError, RecordReader};
-
-async fn read_first<R: AsyncRead + Unpin>(source: R) -> Result<Option<Record>, RecordReadError> {
-    let mut reader = RecordReader::new(source);
-    if reader.wait_to_read().await? {
-        // The returned record owns its storage after this local reader is dropped.
-        reader.try_read_next()
-    } else {
-        Ok(None)
-    }
-}
-```
-
-## Hot-path decisions and evidence
-
-| Decision | Reason and consequence |
-| --- | --- |
-| Validate at the reader boundary | Repeated field access does not repeat length, stream ID, or CRC validation. |
-| Keep completed storage immutable | Once established, those invariants remain true for every retained handle. |
-| Decode only requested fields | Getters do not eagerly construct or cache a complete header inside every record. |
-| Use `Bytes::len()` for `length()` | The validated equality permits a metadata load and lossless conversion to the length wrapper's `u64`, avoiding a buffer dereference. |
-| Use fixed-size little-endian loads | They support arbitrary alignment; on the inspected little-endian target they compile to ordinary loads without byte swapping. |
-| Wrap validated IDs without checking again | The typed API retains the domain invariant without adding a range branch to `stream_id()`. |
-| Expose native value fields through `getset::CopyGetters` | Private fields preserve read-only APIs; inline field copies avoid allocation, reference counting, and repeated validation. |
-| Keep CRC in a trailer | Validation computes CRC over one contiguous header-and-payload slice. |
-| Split once per prepared batch | Avoid a mutable-buffer split for every consumed record. |
-| Publish a valid prefix before reporting corrupt input | Preserve every preceding valid record without storing an error; rediscover the failure from retained bytes only after the batch drains. |
-| Share completed bytes and move the final handle | Avoid per-record payload copies and an unnecessary final reference-count increment. Shared slices can still incur reference-count costs. |
-
-Getters must not allocate, clone storage, recompute checksums, or add integrity
-validation. This does not prohibit the ordinary bounds checks of safe slice
-operations: whether those checks are optimized away depends on the method and
-compiler. Inlining can also let callers reuse a loaded buffer pointer or header
-fields; do not assume a standalone getter's instruction count describes every
-call site.
+**Code-generation observations.**
 
 On 2026-09-14, optimized standalone getter wrappers were inspected with Rust
 1.98.0, LLVM 22.1.8, targeting `x86_64-pc-windows-msvc`. Excluding the return,
@@ -413,7 +323,7 @@ library. Wrappers returning `RecordLength` from `header.length()` and
 return, without validation branches or helper calls. This checks those access
 paths only; it is not a throughput measurement or a portable layout guarantee.
 
-Save a probe under `target/record_getters.rs` to inspect
+The following probe, saved as `target/record_getters.rs`, exposes
 current code generation:
 
 ```rust
@@ -456,153 +366,52 @@ cargo build --package transaction-log-exports --release --locked
 rustc --edition=2024 --crate-type=lib -C opt-level=3 --emit=asm --extern transaction_log_exports=target/release/libtransaction_log_exports.rlib -L dependency=target/release/deps target/record_getters.rs -o target/record_getters.s
 ```
 
-Inspect the resulting assembly and record the compiler, target, and optimization
-level with any new performance claim. For throughput claims, measure realistic
-payloads and retention/batching patterns as well; byte loads alone do not capture
-CRC work, cache misses, reference counting, allocation, or I/O.
+The resulting assembly describes these access paths on the selected compiler,
+target and optimization level. Throughput also depends on payload size and
+retention/batching patterns: byte loads alone do not capture CRC work, cache
+misses, reference counting, allocation or I/O.
 
-The opt-in [reader benchmark](../../benches/README.md) measures the actual reader
-over localhost TCP with 100 million records and 2 KiB payloads by default. Its
-README defines the workload, timing boundaries, retention options, and limits
-of those measurements. It is separate from correctness tests.
+</details>
 
-## Writing integration and planned service behavior
+## Validation
 
-The agreed producer flow is: assign the record ID in the command handler, write
-the payload, finalize the total length, calculate the CRC, then send the complete
-record. The internal `RecordBuilder` owns mutable framing and finalization in a
-buffer supplied by the enclosing writer. `Record` remains the completed,
-read-only value; adding a `RecordMut` is not part of this design. Accepted body
-writes are bounded to 65,519 bytes, proving that adding the fixed 16-byte overhead
-fits the encoded length without overflow or a repeated range check.
-No provisional header or payload may be sent before finalization.
+From the repository root:
 
-The sibling [record writer module](../record_writer/README.md) provides synchronous
-`RecordWriter::write(id, callback)` with a concrete `&mut RecordBuilder` for static
-dispatch into its `std::io::Write` implementation. The builder type is public, but
-its constructor, fields, and finalization are module-private. Each builder makes
-one record in the writer's `BytesMut`, appending after earlier buffered records.
-The caller explicitly sends the accumulated batch with `flush_buffer().await`.
-Only successful buffer output clears that allocation for reuse.
-Buffering lets the writer compute the final length before emitting the first
-header field and reject an unfinished record before any of it reaches a destination.
-A serializer's `Write::flush` does not finish or send a record.
-
-Construction reserves a complete maximum-sized record and captures a pointer
-covering the spare region. A cached payload count enforces the size limit; body
-writes initialize only their final payload positions. The buffer's readable length
-stays unchanged until `finish(self, id)` initializes the header and CRC trailer
-through the protocol's `write` helpers and publishes the completed length once.
-No bytes are prefilled, and serialization/finalization cannot grow the buffer.
-The writer module documents the full safety proof and retained performance evidence.
-
-Retained write errors prevent finalization. The caller must independently reject
-serializer errors before calling `finish`. Dropping an unfinished builder,
-including after rejected finalization or during unwind, preserves earlier records
-and buffer capacity. Finalization does not create a public `Record`, check sequence
-continuity, send bytes, or establish remote acceptance or durability.
-
-`RecordWriter::for_serialization(destination)` and `RecordWriter::for_records(destination)`
-take ownership of an already-open destination and select its append API at compile
-time. They infer `RecordWriter<W, SerializeRecords>` and `RecordWriter<W, ExistingRecords>`
-respectively. Neither mode can call the other's append method, and there is no mode
-conversion. Zero-sized markers require no runtime mode checks. Both modes share
-buffer output, destination flushing, optional synchronization and failure handling.
-Output requires `AsyncWrite + Unpin`. The caller completes socket handshakes or
-chooses file opening mode and position. No Send bound, thread, task, queue, pool
-or timer is imposed by this middle layer. The caller drives each async operation.
-
-Serialization mode's `write` immediately runs its callback and completes the builder
-without I/O. Existing-record mode's `write_record(&record)` copies an encoding into
-its batch without construction, byte-handle cloning, repeated validation or CRC
-recalculation. This copy keeps the append synchronous and preserves record order;
-the original record can be dropped as soon as the append returns. Each mode's buffer
-grows as needed, with limits applied per record rather than per batch. Callers
-control batch latency and retained capacity by choosing when to send; the writer
-does not impose an automatic send threshold, pool or timer.
-
-`flush_buffer().await` sends all buffered bytes, handling partial writes and
-retaining capacity for reuse. `flush().await` flushes only the destination's own
-buffering; it does not send the writer's pending records. For durable file output,
-perform both operations before `writer.sync_data().await`, available when the
-destination implements `AsyncSyncData`. Tokio files implement this capability;
-other storage wrappers can opt in. Synchronization does not implicitly send or
-flush buffered records and is not a replication acknowledgement. This trait uses
-static dispatch without requiring a boxed or Send future. Storage wrappers must
-explicitly implement it; the capability is not forwarded automatically.
-Applications needing `sync_all` use the file through `get_ref`; those direct
-operations bypass the writer's failure tracking and need caller error handling.
-`into_inner` returns destination ownership and discards unsent
-records without implicit output, flush or shutdown. Applications own batching,
-durable-sync cadence, worker sharing and any background handoffs. A single-buffer
-writer cannot construct another record while a buffer flush is in progress.
-
-Construction errors and callback unwinding roll back only the current record.
-Output errors, panics and cancellation leave the writer unusable, so later writes
-cannot replay a partially accepted record prefix. Failed or incomplete data
-synchronization also makes the writer unusable because durability is uncertain.
-The first I/O error is returned directly; subsequent writes, flushes and syncs
-return `Unusable`. A pending send keeps its cursor only inside that future;
-although the full batch remains buffered on failure, replaying it is unsafe.
-An unpolled future has no effect. Connection setup, stream ordering, acknowledgements, reconnection,
-file recovery and command admission remain application responsibilities. See the
-writer README for ownership, cancellation and output completion contracts.
-
-The broader planned service is a cluster of transaction logs with prompt
-replication to read replicas, roughly one-second durable flushes, and no
-traditional per-record producer acknowledgment. Stream storage is intended to
-use one record file and one index file per stream. These are service design
-constraints, not behavior of this module. Having a validated `Record` proves
-neither sequence acceptance nor replication nor durable persistence. Replication
-topology, recovery rules, and physical storage implementation remain separate work.
-
-## Maintaining and checking this specification
-
-Keep durable requirements and the reasons for them here. Keep API contracts,
-preconditions, and unsafe proofs in Rust documentation and comments. Keep test
-expectations independent enough to catch accidental changes to the wire format.
-The module enables `deny(missing_docs)` for its public API, and this README's Rust
-examples are compiled as documentation tests. These checks cannot detect every
-stale rationale; updating affected documentation is part of a design change.
-
-Review changes against the relevant coverage:
-
-| Area | Coverage location |
-| --- | --- |
-| Accessors, exact payload slices, empty/maximum payloads, typed boundaries, all eight address residues, shared ownership and header lifetime | `record.rs` |
-| Encoded sizes, offsets, uninitialized header/CRC writes at byte alignments with guard bytes, endianness, raw numeric limits, known CRC vectors, every covered bit, excluded trailer, oversized test encoding | `record_protocol.rs` |
-| Entire raw `u16` range, conversions, representation, limits, rejected value accessor, formatting and validated JSON loading | `stream_id.rs` |
-| Every wire-representable length, oversized `u64` inputs through `u64::MAX`, checked construction, protocol-derived limits, const use and preserved invalid inputs | `record_length.rs` |
-| Length error wording, rejected input and concrete error contract | `record_length_error.rs` |
-| Raw sequence boundaries, conversions, representation, formatting and exact full-range JSON integers | `sequence_number.rs` |
-| Successor arithmetic across numeric boundaries, preserved stream ID, panic on exhaustion in debug and release builds, named-field JSON shape and invalid metadata | `record_id.rs` |
-| Public API rejects field mutation and direct header construction; generated accessors remain callable | Rustdoc examples in `record_id.rs`, `record_header.rs`, and `stream_id_error.rs`; existing record and stream tests |
-| Partial input, cancellation, batching, fixed size limits, valid prefixes before malformed/truncated records, error rediscovery without source I/O, terminal failures, retained records across refills and errors | Sibling `record_reader.rs` |
-| Bounded serialization, complete framing/CRC, prefix isolation, rollback, preallocated storage, and reader compatibility | Sibling `record_writer/record_builder.rs` |
-| Synchronous appends without I/O, batching, callback errors, owned destinations, allocation reuse, existing record copies, partial writes, cancellation, separate send/flush/sync operations, terminal failures, lifecycle, file and handshake-complete socket integration | Sibling `record_writer/record_writer.rs` |
-| Constructor-selected append APIs cannot be mixed; synchronization unavailable without its optional trait; public file usage example and builder privacy | Rustdoc examples in sibling `record_writer/README.md` |
-
-The shared test encoder and bitwise CRC reference live in the protocol's
-test-only support module. They deliberately do not call production decoding or
-checksum helpers. The fixed encoded fixture provides an independent compatibility
-check. Do not replace independent expected values with the production function
-being tested. Do not create redundant tests for trivial fields or Rust-derived
-traits merely to increase the test count.
-
-From the workspace root, run the following for relevant changes:
-
-```powershell
+```sh
+cargo test -p transaction-log-exports --locked
+cargo test -p transaction-log-exports --release --locked
 cargo fmt --all --check
-cargo test --package transaction-log-exports --lib record:: --locked
-cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-$env:RUSTDOCFLAGS = '-D warnings'
-cargo doc --workspace --no-deps --locked
+cargo rustdoc -p transaction-log-exports --locked -- -D warnings
 ```
 
-If a change affects getters or unchecked access, also inspect optimized assembly
-and check the byte-extent and ownership proofs. When revising the format, update
-constants, codecs, fixtures and independent expectations, reader integration,
-examples, and this specification together. Preserve the current requirements
-until an intentional design change supersedes them, and describe the replacement
-rationale instead of silently deleting the old reasoning during cleanup.
+These checks cover the record values, their reader/writer integration and
+executable documentation, including examples inside collapsed notes.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+Independent encoded fixtures and a bitwise CRC reference detect shared mistakes
+that matching production encoders and decoders could hide. The reference encoder
+and CRC calculation do not call production decoding or checksum helpers.
+
+| Area | What the tests establish |
+| --- | --- |
+| Wire encoding and CRC | Literal offsets and endianness, known checksum vectors, every covered bit and exclusion of trailer bytes. |
+| Byte alignment and initialization | Access works at all eight address residues; raw header/CRC writes preserve guard bytes around their writable extent. |
+| Record length | Every wire-representable input and oversized `u64` values are checked before narrowing; typed limits, const construction and errors preserve the expected values. |
+| Stream and sequence values | The full raw stream domain is checked, sequence values retain their full width, and successor arithmetic preserves the stream with checked overflow. |
+| Metadata | JSON uses exact integer values and the named record-ID shape; missing, duplicate, unknown and invalid fields are rejected. |
+| Record ownership | Payload bounds, empty/maximum bodies, shared storage, retained records and independent header lifetimes match the public contract. |
+| API restrictions | Compile-fail examples prevent field mutation, direct header construction and unchecked public length construction. |
+
+Unsafe record constructors receive only independently established valid fixtures.
+Malformed frames and invalid IDs enter through reader validation, where rejection
+can be tested without violating constructor preconditions. Raw protocol tests can
+exercise invalid numeric fields while still supplying valid byte extents.
+
+The [`reader`](crate::record_reader) and [`writer`](crate::record_writer)
+specifications describe their integration and lifecycle tests against this
+shared format.
+
+</details>

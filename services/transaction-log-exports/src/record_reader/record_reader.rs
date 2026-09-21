@@ -1,16 +1,10 @@
-//! Buffered reading and complete wire validation for transaction log records.
-//!
-//! See the [`record`](crate::record) specification for the shared wire format,
-//! immutable record invariants, and the reasons for validating and splitting
-//! complete batches before returning records.
-
 use std::io;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::record::{Record, StreamId, StreamIdError, record_protocol as protocol};
+use super::RecordReadError;
+use crate::record::{Record, StreamId, record_protocol as protocol};
 
 const INITIAL_BUFFER_CAPACITY: usize = 64 * 1024;
 
@@ -251,37 +245,6 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
             }
         }
     }
-}
-
-/// Malformed wire data or a failed source read.
-#[derive(Debug, Error)]
-pub enum RecordReadError {
-    #[error(
-        "record header requires {} bytes, got {actual} before end of input",
-        protocol::HEADER_LEN
-    )]
-    TruncatedHeader { actual: usize },
-
-    #[error(
-        "record length {declared} is smaller than the {} bytes required for its header and CRC trailer",
-        protocol::MIN_RECORD_LEN
-    )]
-    InvalidLength { declared: u16 },
-
-    #[error("record header contains an invalid stream ID: {0}")]
-    InvalidStreamId(#[from] StreamIdError),
-
-    #[error("record requires {expected} bytes, got {actual} before end of input")]
-    TruncatedRecord { expected: usize, actual: usize },
-
-    #[error("record CRC-32C mismatch: stored {stored:#010x}, computed {computed:#010x}")]
-    CrcMismatch { stored: u32, computed: u32 },
-
-    #[error("failed to read a record: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("record reader cannot continue after an earlier error")]
-    ReaderFailed,
 }
 
 #[cfg(test)]

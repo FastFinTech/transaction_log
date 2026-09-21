@@ -306,7 +306,8 @@ design decisions, safety invariants and optimization evidence.
 | [Raw clustering inputs](services/transaction-log/src/configuration/README.md) | Mode, local node name and cluster domain with environment, CLI and file-document attributes; startup loading and typed validation. |
 | [Application messages](services/transaction-log/src/messages/README.md) | Collection point for application wire messages and their message-io/Postcard wire contract. |
 | [Exports crate overview](services/transaction-log-exports/src/lib.rs) | Public types and API entry points. |
-| [Record specification](services/transaction-log-exports/src/record/README.md) | Wire format, ownership, validation and reader integration. |
+| [Record specification](services/transaction-log-exports/src/record/README.md) | Record values, wire format, immutable ownership and validation invariants. |
+| [Reader specification](services/transaction-log-exports/src/record_reader/README.md) | Input validation, batch preparation, retained records, cancellation and terminal failures. |
 | [Writer specification](services/transaction-log-exports/src/record_writer/README.md) | Constructor modes, buffering, completion, cancellation and hot-path rationale. |
 | [Storage](services/transaction-log/src/storage/README.md) | Root configuration, physical paths, file acquisition, directory initialization and configuration persistence. |
 | [Stream locations](services/transaction-log/src/streams/location/README.md) | Logical file identities, sequence grouping, record boundaries and lazy range enumeration. |
