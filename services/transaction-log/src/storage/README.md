@@ -525,7 +525,7 @@ the reader's validation responsibilities.
 ## Verification and maintenance
 
 Location and checkpoint tests are specified in their owning
-[location module](../streams/location/README.md#verification) and
+[location module](../streams/location/README.md#validation) and
 [streams module](../streams/README.md#checkpoint-validation).
 
 Tests remain in the corresponding source files. Configuration tests cover relative
