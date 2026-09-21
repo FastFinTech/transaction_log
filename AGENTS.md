@@ -10,7 +10,8 @@ without relying on prior conversations. Document its purpose and scope, public
 contracts, requirements and invariants, design decisions and their reasons,
 hot-path concerns and optimization evidence where applicable, testing guidance,
 and the distinction between implemented and planned behavior. For modules sharing
-a directory, make the README's coverage of each module explicit.
+a directory, explain their distinct responsibilities through the type/module
+table and relevant behavior sections.
 
 Add the README when creating a module. When changing an existing module, update
 its README and fill material documentation gaps as part of the same work. A
@@ -61,8 +62,10 @@ do not keep it for hypothetical future use.
 
 Start with the root [README.md](README.md) for the workspace overview. Before
 changing a module, read its README and the specifications of any related modules
-whose contracts the change touches. Folder boundaries do not limit a shared
-contract: a reader or writer must follow the specification for its record format.
+whose contracts the change touches, including the relevant collapsed notes.
+Collapsing is presentation only; the requirements remain authoritative. Folder
+boundaries do not limit a shared contract: a reader or writer must follow the
+specification for its record format.
 
 The current [record specification](services/transaction-log-exports/src/record/README.md)
 covers record values, the protocol, and reader/writer integration. Read it when
@@ -170,8 +173,52 @@ relevant specification from repository-level documentation instead of copying
 its details into multiple summaries or into this file.
 
 Some module READMEs are included in generated Rust documentation. Maintain their
-examples as compilable documentation tests and preserve that connection when
-moving or reorganizing documentation.
+examples as compilable documentation tests, including examples inside collapsed
+notes. When moving or reorganizing documentation, verify doctest discovery and
+check generated Rustdoc links, tables and disclosure markup.
+
+### Module README structure
+
+Write module and reusable-library READMEs for two reading depths: a concise guide
+for users, with expandable engineering explanations for maintainers. Begin with
+a short summary of what the module does. Where useful, explain its role in the
+wider application, distinguishing actual use from intended use.
+
+Use these section names and ordering consistently:
+
+| Section | Content |
+| --- | --- |
+| Types and modules | Linked types or modules with short descriptions of their responsibilities. |
+| Usage | A small, representative example. |
+| Behavior and guarantees | Contracts callers need to use the module correctly. |
+| Performance | Relevant costs and measured evidence, clearly distinguished. |
+| Validation | Commands for checking the module, with explanations of its testing strategy. |
+
+Omit sections that have no useful content. Choose descriptive subsections within
+this common structure. The root README retains its evaluator-oriented structure.
+
+Put deeper explanations beneath the relevant section in a collapsed `<details>`
+block labelled `Design and maintenance notes` using `<summary>`. Keep section
+headings and essential usage contracts visible. Add notes only where there is
+something useful to explain; do not create empty blocks or filler.
+
+Design and maintenance notes explain how the implementation works, why its design
+was chosen, and which constraints future changes must preserve. Useful material
+includes ownership reasoning, algorithms, failure handling, tradeoffs, performance
+decisions and examples of more involved usage. Validation notes explain what the
+tests establish and why those cases matter.
+
+Keep agent working instructions in this repository-wide file. Module READMEs
+describe the module's contracts, invariants and engineering rationale; do not add
+agent-instruction sections or maintenance checklists that repeat general editing,
+test-placement, benchmarking or documentation-workflow rules.
+
+Avoid documentation about the document itself, routine source-file or dependency
+inventories, and lists of unrelated responsibilities. Mention a source file or
+dependency when it helps explain an engineering decision. Discuss usage in other
+modules when it illuminates a design choice or demonstrates an important
+interaction. Brief application context may belong in the opening summary;
+detailed integration explanations belong with the relevant behavior or example.
 
 ## Validation
 
