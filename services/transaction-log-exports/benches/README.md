@@ -1,23 +1,40 @@
 # Record I/O benchmarks
 
-This directory contains explicitly invoked performance executables for people
-and agents. It is separate from the correctness test suite. Three targets use
-real TCP connections on IPv4 localhost; none starts the Transaction Log service.
+Measure reader, writer and combined record throughput over IPv4 loopback TCP.
+These opt-in executables exercise production record I/O without starting the
+transaction-log service. Disk persistence, replication and service latency are
+outside their measured workloads.
+
+## Types and modules
 
 | Target | Timed producer | Timed receiver | Use |
 | --- | --- | --- | --- |
-| `record_reader` | Replays prebuilt encoded bytes; no `RecordWriter` | Real `RecordReader`, including CRC validation | Compare reader changes independently of writer changes. |
-| `record_writer` | Real `RecordWriter` | Raw byte drain; no `RecordReader` or CRC validation | Compare writer changes independently of reader changes. |
-| `record_io` | Real `RecordWriter` | Real `RecordReader`, including CRC validation | Check the combined path after either side changes. |
+| [`record_reader`](record_reader.rs) | Replays prebuilt encoded bytes; no `RecordWriter` | Real `RecordReader`, including CRC validation | Compare reader changes independently of writer changes. |
+| [`record_writer`](record_writer.rs) | Real `RecordWriter` | Raw byte drain; no `RecordReader` or CRC validation | Compare writer changes independently of reader changes. |
+| [`record_io`](record_io.rs) | Real `RecordWriter` | Real `RecordReader`, including CRC validation | Check the combined path after either side changes. |
 
-Each target still includes TCP, memory and scheduling costs. An individual target
-isolates it from the other production component, not from the entire system.
-Compare a target against its own before/after baseline; do not subtract durations
-or rates between targets to infer isolated CPU cost, since their work overlaps.
-Read the [record specification](../src/record/README.md) before changing the
-workload or interpreting a result.
 
-## Run, archive and compare the suite
+[Support](support/README.md) shares writer/combined workers and reporting;
+[environment](environment/README.md) collects machine context outside timing.
+
+## Usage
+
+Run a small harness check from the workspace root:
+
+```sh
+python scripts/benchmarks.py run --records 10003 --warmup-records 1001 --runs 2 --include-copy
+```
+
+For the full suite, `python scripts/benchmarks.py run` defaults to three
+100-million-record samples per target, eight connections, 2 KiB payloads and a
+separate one-million-record warmup. It builds first, runs serially and retains
+logs plus structured results. Individual Cargo targets default to one connection
+and one sample.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+### Run, archive and compare the suite
 
 From the workspace root, `python scripts/benchmarks.py run` builds the three
 targets once and runs them serially, using eight connections and three measured
@@ -39,10 +56,10 @@ is silently chosen, and matching machine/workload settings are required by defau
 The [root README](../../../README.md) presents the selected results for repository
 readers; this document owns workload contracts and historical measurements.
 
-## Writer and combined runs
+### Writer and combined runs
 
 The default workload for every target is **100 million records with 2,048-byte
-payloads**, after a separate one-million-record warmup. These new commands divide
+payloads**, after a separate one-million-record warmup. These commands divide
 that total across eight writer/receiver pairs:
 
 ```powershell
@@ -50,7 +67,7 @@ cargo bench -p transaction-log-exports --bench record_writer --locked -- --conne
 cargo bench -p transaction-log-exports --bench record_io --locked -- --connections 8
 ```
 
-Use one connection by omitting `--connections`, or specify it explicitly. The new
+Use one connection by omitting `--connections`, or specify it explicitly. The writer
 targets share their producer and coordination code in [support](support/README.md),
 whose README documents timing, ownership, failure behavior and verification.
 The reader-only implementation stays independent so writer changes do not change
@@ -81,12 +98,12 @@ cargo bench -p transaction-log-exports --bench record_io --locked -- --connectio
 cargo bench -p transaction-log-exports --bench record_writer --locked -- --write-chunk-bytes 2048
 ```
 
-The options below in the reader section also apply to the new targets, with these
+The options below in the reader section also apply to the writer targets, with these
 differences: `--batch-records` counts records per `flush_buffer`, `--retain-records`
 is available only on targets with a real reader, and the writer targets additionally
 accept `--workload serialize|copy` and `--write-chunk-bytes N` (positive, default 8).
 An explicit chunk option with the copy workload is rejected. Each run prints its
-configuration and per-connection/aggregate `RESULT` data. The new targets time a
+configuration and per-connection/aggregate `RESULT` data. The writer targets time a
 common worker start through the last sender **or** receiver completion, print both
 durations, and verify encoded byte counts and clean EOF. The combined target also
 validates and counts every record. The raw-drain target derives its record count
@@ -102,10 +119,10 @@ These are opt-in executables, with the same early skip guard as `record_reader`.
 Ordinary tests and all-target test runs must never launch a long transfer.
 Build without measuring using `cargo bench -p transaction-log-exports --no-run --locked`.
 Run comparisons serially under comparable conditions and retain raw results;
-see the maintenance guidance below. The executables enforce no fixed performance
+see the validation guidance below. The executables enforce no fixed performance
 threshold; the suite comparison command accepts an explicit regression budget.
 
-## Running the reader benchmark
+### Running the reader benchmark
 
 Run from the workspace root. The default is **100 million records with 2,048-byte
 payloads**, one measured transfer following a one-million-record warmup:
@@ -167,11 +184,24 @@ Ordinary `cargo test --workspace` does not execute it. Although
 `cargo test --workspace --all-targets` selects benchmark targets, this executable
 checks for Cargo's `--bench` argument before doing any workload setup. Without
 that argument, or when `--test` is present, it prints a skip message and exits.
-This rule must stay intact: routine tests must never launch a long measurement.
+This guard keeps routine tests from launching a long measurement.
 An optimized build is required for measurements. `cargo bench --no-run` and
 `cargo clippy --workspace --all-targets` can check compilation without running it.
 
-## Workload and timing contract
+</details>
+
+## Behavior and guarantees
+
+A result is successful only after exact per-connection counts and clean EOF.
+Real-reader targets validate framing, stream-ID domains and CRC. The writer-only
+drain validates bytes/counts, not record contents. Timed work starts from one common
+clock; the reader target ends at the last reader, while writer/combined targets
+include the last sender or receiver.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+### Workload and timing contract
 
 Each sender is a dedicated blocking OS thread using `TcpStream::write_all`.
 Each reader runs the real `RecordReader` on its own OS thread and Tokio
@@ -229,7 +259,7 @@ does not enforce sequence continuity; this fixture is unsuitable for benchmarkin
 a future service endpoint that does. Keep that distinction explicit rather than
 loosening service validation to accept a benchmark.
 
-## Results and their limits
+### Results and their limits
 
 Each successful transfer must reach clean EOF, pass the reader's validation, and
 match both the expected record count and encoded byte count on every connection.
@@ -262,39 +292,22 @@ sampling or regression threshold. A custom benchmark main keeps a 100-million-
 record transfer a single deliberate operation. Criterion can be added later
 for focused microbenchmarks without changing this executable's timing contract.
 In-memory decoding/extraction benchmarks, cross-machine clients, mixed payload
-distributions, and automated baseline comparison remain future work.
+distributions, remain future work. Automated baseline comparison is implemented by the suite runner.
 
-## Maintenance and verification
+</details>
 
-When changing this executable, check argument handling, both consumption modes,
-empty and maximum payloads, a non-divisible final sender batch, repeated runs,
-and both ordinary and all-target test commands. For concurrency changes, also
-check totals not divisible by the connection count, one record per connection,
-warmup partitioning, per-connection counts, and that aggregate time equals the
-last reader finish rather than the sum of reader times. Small explicit socket runs are
-sufficient to verify the harness; never put the 100-million-record workload in
-unit tests. Keep production APIs and dependency features free of benchmark-only
-hooks. Networking support and anyhow for this executable are dev-dependencies.
+## Performance
 
-Before claiming a performance change, compare the same optimized toolchain,
-target, payload size, batch size, retention window, and warmup/run settings.
-Record `rustc -vV`, CPU model, OS, build flags, and background load with the
-configuration and output. Run measurements serially on an otherwise idle
-machine; avoid running compilation or other benchmarks concurrently. Preserve
-the command and raw results, for example:
+The [published observations](../../../benchmarks/README.md) retain completed suites
+with source, workload and machine metadata. These are measurements on a shared
+desktop, not service guarantees or approved regression baselines. Comparisons use
+repeated observations of the same workload; concurrent rates cannot isolate CPU
+cost by subtraction. The 100-million-records/minute design target is not a result.
 
-```powershell
-rustc -vV
-Get-CimInstance Win32_Processor | Select-Object Name
-cargo bench -p transaction-log-exports --bench record_reader --locked | Tee-Object -FilePath target/record-reader-socket.txt
-```
+### Initial measurement: 2026-09-14
 
-The output file above is resolved by PowerShell from the workspace root and
-lives under ignored `target/`. Keep durable observations with their conditions
-in this README; do not substitute the 100-million-records/minute design target
-for a measured result.
-
-## Initial measurement: 2026-09-14
+<details>
+<summary>Design and maintenance notes</summary>
 
 The default command above completed on an Intel Core i9-12900HK (14 cores,
 20 logical processors), Windows 11 Pro 10.0.26200, Rust 1.98.0
@@ -341,7 +354,12 @@ result. Multiplying its rate by eight projects approximately 319 million
 records/minute only under linear scaling. Use the explicit concurrent mode to
 measure actual aggregate throughput.
 
-## Eight-connection measurement: 2026-09-14
+</details>
+
+### Eight-connection measurement: 2026-09-14
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 After implementing concurrent readers, this command completed on the same
 i9-12900HK / Windows 11 / Rust 1.98.0 setup described above:
@@ -408,7 +426,12 @@ comparisons, repeat both `--connections 1` and `--connections 8` with this same
 executable and the same workload and environment. No specific resource bottleneck
 was established by this benchmark.
 
-## Three-target measurement: 2026-09-16
+</details>
+
+### Three-target measurement: 2026-09-16
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 After adding the independent writer and combined targets, all three commands ran
 serially on an Intel Core i9-12900HK (14 cores / 20 logical processors), Windows
@@ -472,3 +495,36 @@ Later completed suites and their machine/source metadata are preserved in the
 single-sample compiler comparisons varied substantially on this shared desktop
 and did not establish a compiler regression. The root README presents those saved
 results; the earlier single-run figures above remain historical observations.
+
+</details>
+
+<a id="maintenance-and-verification"></a>
+
+## Validation
+
+```sh
+cargo bench -p transaction-log-exports --no-run --locked
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
+python scripts/benchmarks.py self-test
+```
+
+These commands compile targets and verify contracts without full transfers. Small
+explicit runs check actual socket execution; long measurements remain separate.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+Harness checks cover argument handling, both reader consumption modes, empty and
+maximum payloads, partial batches, repeated runs, uneven connection/warmup totals
+and one record per connection. Independently checked per-worker counts and common
+start maxima protect timing semantics. Ordinary/all-target invocations exercise
+early skipping before runtime, socket or metadata setup.
+
+The [automation guide](../../../scripts/README.md) owns serial execution, result
+validation, raw-log retention and comparisons with an explicit budget. Saved data
+and measurement conditions distinguish observations from targets or extrapolation;
+production APIs contain no benchmark-only timing hooks.
+
+</details>

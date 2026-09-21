@@ -1,30 +1,53 @@
 # Validated clustering configuration
 
-`clustering::configuration` owns deployment values and established configuration,
-distinct from the
-[raw inputs](../../configuration/README.md). Startup converts raw inputs
-with `ClusteringConfiguration::try_from` before reporting the application version.
-The executable then exits. Reading stored configuration, comparing deployment
-settings, assigning UUIDs and initializing storage are not wired into startup.
-The [clustering overview](../README.md) and [lifecycle design](../../../../../CLUSTERING.md)
-own the planned runtime behavior; configuration does not enforce it.
+Represent single or fixed three-node deployment settings, validate their static
+values and pair them with an established UUID. These models are implemented within
+the clustering scaffold. Startup validates raw configuration and exits; identity
+establishment, persisted-setting comparison and runtime coordination remain planned.
 
-## Module coverage and public contracts
+## Types and modules
 
-- `clustering_configuration.rs`: `Single` or `Cluster(ClusterMembership)`, composition
-  of validated values and conversion from raw fields, with same-file tests.
-- `established_clustering_configuration.rs`: deployment configuration paired with
-  its permanent UUID in either mode, derived Serde and same-file tests.
-- `clustering_configuration_error.rs`: one error type for mode, node name,
-  conditional fields and concrete hostname errors.
-- `node_name.rs`: the fixed `NodeName` slots and their parsing/tests.
-- `cluster_membership.rs`: local slot and shared domain, infallible construction,
-  derived Serde, role lookup and hostname formatting, with same-file tests.
-- `hostname.rs`, `hostname_error.rs`, `hostname_error_kind.rs`: DNS-name value,
-  parsing/tests, retained original input and typed validation reasons.
-- `mod.rs`: thin declarations, exports and this specification's Rustdoc inclusion.
+| Type | Responsibility |
+| --- | --- |
+| [`ClusteringConfiguration`] | Select single mode or validated cluster membership; convert raw fields. |
+| [`EstablishedClusteringConfiguration`] | Pair configuration with a supplied permanent UUID in either mode. |
+| [`ClusterMembership`] | Own the local slot and domain, derive the role and format peer hostnames. |
+| [`NodeName`] | Represent exactly `master`, `replica-1` or `replica-2`. |
+| [`Hostname`] | Own a normalized DNS hostname with read-only access. |
+| [`ClusteringConfigurationError`] | Preserve mode, conditional-field, node and hostname failures. |
+| [`HostnameError`] / [`HostnameErrorKind`] | Retain original hostname input and a typed validation reason. |
 
-## Fixed topology and conversion
+[Raw inputs](crate::configuration) own loading. [Storage](crate::storage) persists
+the established value; the [clustering overview](crate::clustering) owns planned
+session behavior.
+
+## Usage
+
+```rust
+use transaction_log::clustering::configuration::{ClusterMembership, Hostname, NodeName};
+
+let membership = ClusterMembership::new(
+    NodeName::Replica1,
+    Hostname::parse(" PAYMENTS.EXAMPLE.COM. ".into())?,
+);
+assert!(!membership.is_master());
+assert_eq!(membership.hostname(NodeName::Master), "master.payments.example.com.");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Construction validates values, not peer identity or readiness. Formatting a peer
+hostname neither resolves DNS nor checks the derived name's total length.
+
+## Behavior and guarantees
+
+### Fixed topology and conversion
+
+Conversion accepts trimmed, case-sensitive `single` or `cluster`. Single mode
+forbids the cluster group; cluster mode requires it. Node slots are fixed and
+case-sensitive. Errors preserve original input or the concrete hostname failure.
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 Only `master`, `replica-1` and `replica-2` are valid node names. `NodeName::parse`
 trims surrounding whitespace, is case-sensitive and preserves rejected input in
@@ -69,7 +92,17 @@ sorting, duplicate checks or list-mismatch error machinery is needed. Runtime mu
 still reject duplicate active slots and verify the expected peer at each derived
 hostname; different DNS names can point to the same process.
 
-## Established configuration
+</details>
+
+### Established configuration
+
+The established model contains a supplied UUID and validated configuration, with
+private read-only fields. Its constructor does not generate or establish identity.
+Storage can replace this metadata; enforcing permanent mode, slot and UUID belongs
+to the future lifecycle caller.
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 `EstablishedClusteringConfiguration` pairs two private, read-only fields:
 `cluster_id: uuid::Uuid` and `clustering_configuration: ClusteringConfiguration`.
@@ -111,7 +144,7 @@ Clustered JSON is:
 {"cluster_id":"12345678-9abc-def0-1234-56789abcdef0","clustering_configuration":{"cluster":{"my_node_name":"master","cluster_domain":"cluster.example"}}}
 ```
 
-The [storage provider](../../storage/README.md#provider-metadata-operations) saves/restores this type
+The [storage provider](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/storage/README.md#provider-metadata-operations) saves/restores this type
 directly using Serde in `clustering.json`, with no intermediate persistence model.
 Storage owns filesystem operations and I/O/serialization errors; clustering owns
 the type. Startup does not yet invoke those operations. Cloning configuration
@@ -119,27 +152,18 @@ copies its domain string; these values are not per-record hot-path state.
 Same-file tests cover independent JSON fixtures in both modes and all slots,
 normalization, UUID/slot distinctions and malformed metadata.
 
-## Hostname syntax, ownership and rationale
+</details>
 
-### Serialization
+### Hostname syntax, ownership and rationale
 
-The configuration types implement format-independent Serde traits, including
-the established model described above. UUID assignment and storage read/write
-operations remain separate from these value types.
-JSON clustering configuration is `"single"` or
-`{"cluster":{"my_node_name":"master","cluster_domain":"cluster.example"}}`.
-`NodeName` and `Hostname` serialize as strings; deserialization calls their
-existing parsers, preserving trimming, case handling and syntax checks.
-`ClusteringConfiguration` and `ClusterMembership` derive Serde. Membership loading
-uses each field type's existing validation. Missing, duplicate and unknown
-membership fields are rejected through the derive and `deny_unknown_fields`.
-Derived node hostname lengths are not checked by this model. Serde loading validates
-static values only; it cannot enforce storage permanence or peer agreement.
+Hostname parsing trims surrounding whitespace and stores lowercase ASCII, preserving
+one optional root dot. Labels contain 1–63 ASCII letters, digits or hyphens with
+alphanumeric boundaries; the full name is at most 253 bytes excluding that dot.
+IP literals and malformed names are rejected. Parsing does not prove reachability
+or authenticated ownership.
 
-Serialization through owned string conversions clones the hostname value;
-these startup operations are not part of record processing.
-
-### DNS validation
+<details>
+<summary>Design and maintenance notes</summary>
 
 `Hostname::parse(String)` trims with `str::trim`, validates and stores lowercase
 ASCII. Private fields and a read-only `name()` getter preserve validity; equality
@@ -178,7 +202,43 @@ hostname allocates a new string, rather than caching three addresses for occasio
 These are configuration operations, not per-record work. There are no locks,
 workers, DNS queries, unsafe code or performance measurements here.
 
-## Planned lifecycle and validation
+</details>
+
+### Serialization
+
+Serde uses the same field parsers as direct construction. Missing, duplicate and
+unknown membership/established-object fields are rejected. Static decoding cannot
+establish agreement with storage or peers.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+The configuration types implement format-independent Serde traits, including
+the established model described above. UUID assignment and storage read/write
+operations remain separate from these value types.
+JSON clustering configuration is `"single"` or
+`{"cluster":{"my_node_name":"master","cluster_domain":"cluster.example"}}`.
+`NodeName` and `Hostname` serialize as strings; deserialization calls their
+existing parsers, preserving trimming, case handling and syntax checks.
+`ClusteringConfiguration` and `ClusterMembership` derive Serde. Membership loading
+uses each field type's existing validation. Missing, duplicate and unknown
+membership fields are rejected through the derive and `deny_unknown_fields`.
+Derived node hostname lengths are not checked by this model. Serde loading validates
+static values only; it cannot enforce storage permanence or peer agreement.
+
+Serialization through owned string conversions clones the hostname value;
+these startup operations are not part of record processing.
+
+</details>
+
+### Planned lifecycle
+
+Networking and session control are scaffolding. The agreed lifecycle is described
+in the [cluster design](https://github.com/FastFinTech/transaction_log/blob/main/CLUSTERING.md);
+these value types do not implement it.
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 All three permanent members must connect and resynchronize at startup before
 command-handler admission. Once serving, losing either replica ends the cluster
@@ -188,7 +248,27 @@ storage identities, mode permanence, recovery and durable acknowledgement rules
 remain runtime/persistence responsibilities, not guarantees of these value objects.
 Fixed ports are planned but numbers have not been selected.
 
-Same-file tests cover all slots and invalid alternatives, normalization, root-dot
+</details>
+
+## Performance
+
+Configuration owns and occasionally clones domain strings; peer hostname formatting
+allocates on demand instead of caching three addresses. These are startup/control
+operations outside record processing. No performance measurements are available.
+
+## Validation
+
+```powershell
+cargo test -p transaction-log --locked clustering::configuration
+cargo clippy -p transaction-log --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo rustdoc -p transaction-log --bin transaction-log --locked -- -D warnings
+```
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+Tests cover all slots and invalid alternatives, normalization, root-dot
 agreement, formatted hostnames, the standalone hostname length boundary with and
 without a root dot, invalid domain syntax, mode/conditional-field errors and role
 selection. Membership decoding tests retain field validation and malformed-object
@@ -196,9 +276,4 @@ coverage without reinstating cross-field length checks.
 Hostname tests cover 63/64-byte labels, 253/254-byte full names, all ASCII classes,
 Unicode, IP literals, malformed labels, error offsets and precedence.
 
-```sh
-cargo test -p transaction-log --locked
-cargo fmt --all --check
-cargo clippy -p transaction-log --all-targets --locked -- -D warnings
-cargo doc -p transaction-log --no-deps --locked
-```
+</details>

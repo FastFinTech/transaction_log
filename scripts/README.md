@@ -1,12 +1,33 @@
 # Benchmark automation
 
-`benchmarks.py` is the single entry point for building, running, recording,
-rendering and comparing the benchmark suite. It uses Python 3.11+ and the standard
-library, plus Cargo, rustc and Git on PATH. Run it from any working directory;
-it resolves the workspace from its own location. It does not run deployments,
-publish artifacts externally or edit the root README automatically.
+Build, run, archive, report and compare the record I/O suite with Python 3.11+ and
+its standard library. Cargo, rustc and Git must be on PATH. Commands resolve the
+workspace from the script's location and can run from any working directory.
 
-## Run the suite
+## Types and modules
+
+| Command | Responsibility |
+| --- | --- |
+| [`benchmarks.py run`](benchmarks.py) | Build selected targets once, measure serially and retain a new result bundle. |
+| `report` | Render saved JSON without building or measuring. |
+| `compare` | Compare compatible completed suites against an explicit regression budget. |
+| `self-test` | Exercise parsing, reporting and comparison without Rust builds or transfers. |
+
+## Usage
+
+```sh
+python scripts/benchmarks.py run --records 10003 --warmup-records 1001 --runs 2 --include-copy
+python scripts/benchmarks.py report benchmarks/2026-09-16-rust-1.98.1.json
+```
+
+The default full run uses three 100-million-record samples per target and eight
+connections. `--help` lists options. Reporting reads existing data only; the runner
+does not deploy, publish artifacts externally or edit the repository README.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+### Run the suite
 
 ```sh
 # Default: three 100-million-record samples per target, eight connections,
@@ -38,7 +59,19 @@ Retention requires omitting the raw-drain writer target. A zero warmup disables 
 samples in that case; zero disables the timeout. Timeout is a failed run, not a
 valid throughput observation. `--help` describes the full CLI.
 
-## Result bundles and schema
+</details>
+
+## Behavior and guarantees
+
+Every run gets a new bundle; an existing output directory is never overwritten.
+JSON is authoritative and retains completed earlier cases if later work fails.
+Failed, incomplete or still-running suites cannot become successful regression
+baselines. Timeout defaults to 3,600 seconds per build/case; zero disables it.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+### Result bundles and schema
 
 The default directory is `benchmark-results/<UTC timestamp>-<commit>-<unique ID>`.
 This is ignored by Git and survives `cargo clean`. An explicit `--output` must
@@ -91,7 +124,19 @@ cannot serve as a successful regression baseline. A hard process/host terminatio
 can leave a `running` checkpoint, which comparisons also reject. The CSV and
 Markdown are convenience views; JSON is authoritative.
 
-## Regenerate a table or compare builds
+</details>
+
+### Comparisons
+
+Comparison requires matching workloads and, by default, matching build/machine
+identity. The regression budget is explicit. Cross-environment comparison requires
+an override and remains labelled; matching metadata does not establish matching
+thermal or background conditions.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+### Regenerate a table or compare builds
 
 ```sh
 python scripts/benchmarks.py report benchmark-results/build-123/results.json
@@ -127,16 +172,31 @@ budget (`argparse` also uses 2 for malformed command syntax). Upload artifacts e
 when the runner or comparison fails. The provider-specific CI workflow and artifact
 retention policy are intentionally left to the hosting/build infrastructure.
 
-## Verification
+</details>
+
+## Performance
+
+The script orchestrates and checks results outside the Rust timing loops. It
+compares median throughput and reports spread across samples. Short harness checks
+are not stable performance baselines; workload/timing contracts belong to the
+[benchmark specification](../services/transaction-log-exports/benches/README.md).
+
+<a id="verification"></a>
+
+## Validation
 
 ```sh
 python scripts/benchmarks.py self-test
 ```
 
-Same-file tests exercise report roundtrips, partial status, invalid/truncated data,
-timing/count validation, regression thresholds and incompatible environments. They
-do not compile Rust or transfer records. Exercise short actual suites before long
-runs when changing execution, target discovery or argument forwarding. Also check
-no-overwrite behavior, failed-run persistence and CLI exit codes. Run Rust tests,
-Clippy, formatting and Rustdoc checks when changing the metadata collector; ordinary
-and all-target tests must skip metadata probes as well as benchmark workloads.
+<details>
+<summary>Design and maintenance notes</summary>
+
+Self-tests exercise report round trips, partial status, malformed/truncated data,
+timing/count validation, regression thresholds and incompatible environments without
+compiling Rust or transferring records. Small actual suites separately validate
+execution, Cargo target discovery and argument forwarding, including no-overwrite
+behavior, failed-run persistence and exit codes. Rust tests/Clippy check the metadata
+collector, while ordinary/all-target runs confirm probes and transfers are skipped.
+
+</details>

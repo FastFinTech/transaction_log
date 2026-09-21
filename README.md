@@ -1,75 +1,74 @@
 # Transaction Log
 
-A performance-focused Rust transaction log for event-sourced CQRS systems.
-The project is building toward a replicated service that accepts ordered event
-streams, persists them, and serves stream-specific reads. Throughput, predictable
-latency, buffer ownership and the cost of each record operation drive the design.
+A performance-focused Rust transaction log for event-sourced CQRS systems, building
+toward durable ordered streams, historical reads and fixed-membership replication.
 
-**Status:** the record format, reader, writer and TCP benchmark suite are
-implemented, alongside log-file identities, record-range location models, path
-layout and stream-directory initialization. An indexed log writer now appends
-ordered records and dense offsets to an owned file pair, with explicit flush,
-sync and finalization. File recovery validates from a supplied trusted boundary,
-repairs indexes and hands over partial or full files. The service executable is a
-scaffold; startup-wide recovery orchestration, queries, replication and client protocol
-handling remain in development.
+**Implemented:** binary record I/O, indexed file appends, storage metadata and
+per-stream recovery. **Current executable:** a configuration-validation scaffold
+that prints its version and exits. Clustering and application messages are mostly
+scaffolding; client serving, replication and startup integration remain planned.
 
-The service entry point (`services/transaction-log/src/main.rs`) loads
-raw startup inputs from CLI arguments and environment variables. `--help`
-prints generated option descriptions; missing required inputs produce a loading
-error. After loading, it prints `Transaction Log v<version>` to standard output,
-then exits. No storage access or setup is wired into startup.
-Typed conversion validates the fixed three-node topology; server startup and
-integration of stream recovery remain planned. Storage defaults to `/data` on Linux and `./data` on Windows;
-`--storage-directory` or `TL_STORAGE_DIRECTORY` overrides it for local runs.
-Cargo embeds the service's inherited workspace package version at compile time;
-the executable does not read a manifest or runtime version setting. CI can assign
-a release version before compilation; automated version assignment and version
-handshakes are not yet implemented.
+## Build and run
+
+The workspace uses Rust edition 2024 and is tested with Rust 1.98.1. From the
+repository root:
+
+```sh
+cargo run -- --cluster-mode single --storage-directory ./data
+cargo run -- --help
+cargo test --workspace --locked
+```
+
+The executable does not yet create storage or start a server. The
+[service overview](services/transaction-log/README.md) describes its current behavior
+and [configuration inputs](services/transaction-log/src/configuration/README.md).
+
+## Implementation progress
+
+| Area | Implemented | Planned |
+| --- | --- | --- |
+| Record I/O | Typed identities, CRC framing, retained immutable records, batched reader and synchronous writer modes. | Additional workload and latency measurements. |
+| Storage and streams | Paths, fresh pairs, indexed ordered appends, flush/sync/finalization, metadata persistence and per-stream recovery with checkpoint advancement. | Startup-wide orchestration, live rotation and durability scheduling. |
+| Configuration | CLI/environment loading, typed fixed-topology values and stored configuration APIs. | UUID establishment and comparison with persisted settings at startup. |
+| Clustering and messages | Configuration models and module scaffolding; reusable message framing is available separately. | Version/identity exchanges, replication, coordination and application schemas. |
+| Serving | Location and range models. | Client lifecycle, ingestion admission/queues/routing, historical queries, subscriptions and status endpoints. |
+| Measurement | Independent and combined record benchmarks, saved artifacts, reporting and explicit-budget comparisons. | Disk/recovery/replication benchmarks, dedicated performance workers and CI artifact hosting. |
+
+The [stream initializer](services/transaction-log/src/streams/stream_initializer/README.md)
+recovers an individual stream and hands its active pair to the indexed writer.
+Application startup does not call it yet. The [cluster design](CLUSTERING.md) records
+planned lifecycle requirements and open questions.
+
+## Workspace
+
+| Component | Start here |
+| --- | --- |
+| [Record I/O library](services/transaction-log-exports/README.md) | Public record, reader and writer APIs with executable examples. |
+| [Service](services/transaction-log/README.md) | Storage, streams, configuration and application scaffolding. |
+| [Object pool](lib/object-pool/README.md) | Single-threaded reuse and reclamation. |
+| [Message I/O](lib/message-io/README.md) | Bounded length-prefixed Serde/Postcard control messages. |
+| [Benchmark suite](services/transaction-log-exports/benches/README.md) | Workloads, timing boundaries and measurement history. |
+| [Benchmark automation](scripts/README.md) / [saved measurements](benchmarks/README.md) | Run, archive, report and compare observations. |
 
 ## Design priorities
 
-- **Measure the hot path.** Independent reader and writer benchmarks support
-  focused changes; a combined benchmark checks their effect on the complete
-  record I/O path. Performance claims include workload and machine context.
-- **Keep ownership explicit.** Read records retain shared ownership of their bytes
-  across reader refills. Writers serialize directly into reusable batch storage.
-- **Keep record creation synchronous.** Applications choose when to send a batch,
-  flush destination buffers and synchronize file data.
-- **Validate at boundaries.** The reader validates framing, stream IDs and CRC
-  before exposing records. Accessors consume that established validity.
-- **Use static dispatch.** Writer constructors select serialization or
-  existing-record copying at compile time, preventing accidental API mixing
-  without a runtime mode branch.
-
-The design target has been 100 million records per minute for record I/O.
-The measurements below cover loopback transport and the implemented record layer;
-they do not establish that rate for durable storage or the planned cluster.
+Record ownership stays explicit, validity is established at decoding boundaries,
+and synchronous appends build reusable batches. Applications choose when bytes are
+sent, flushed and synchronized. Constructor-selected writer types keep serialization
+and existing-record copying distinct. The module specifications explain the
+engineering choices and their constraints in expandable notes.
 
 ## Benchmarks
 
-Performance is a primary deliverable of this project. The suite currently covers:
+The design target has been 100 million records per minute for record I/O. The
+measurements below cover loopback transport and the implemented record layer;
+they do not establish durable-storage or replicated-service throughput.
 
-| Target | Producer | Receiver | Purpose |
-| --- | --- | --- | --- |
-| `record_reader` | Replayed prebuilt bytes | Production reader, with CRC validation | Evaluate reader changes independently of the writer. |
-| `record_writer` | Production writer | Raw byte drain | Evaluate writer changes independently of the reader. |
-| `record_io` | Production writer | Production reader, with CRC validation | Measure the combined path over loopback TCP. |
-
-The writer targets support two workloads; the published writer measurements use
-serialization:
-
-- **Serialize:** a callback writes a 2 KiB payload in eight-byte chunks, then the
-  writer finalizes its header and CRC.
-- **Copy:** `write_record` appends existing validated records to the output buffer.
-  Fixture creation and initial validation happen before timing; copying and
-  sending are measured. The combined receiver still validates every received CRC.
-
-**Benchmarks will be added as system implementation continues.** Planned coverage
-includes stream-file append and replay, indexing and queries, durable flushes,
-replication, recovery, and application-level latency under load. Those results
-will be reported separately so a socket result cannot be mistaken for durable
-transaction-log throughput.
+| Target | Timed path |
+| --- | --- |
+| `record_reader` | Prebuilt bytes to the production reader, including CRC validation. |
+| `record_writer` | Production writer to a raw byte drain. |
+| `record_io` | Production writer to the production reader. |
 
 ### 100-million-record results
 
@@ -96,6 +95,13 @@ The mixed comparison does not establish a compiler regression or justify a
 downgrade. This desktop has uncontrolled background activity, thermal state
 and power limits; these observations are not an approved regression baseline.
 <!-- benchmark-results:end -->
+
+Each sample uses eight connections, 2 KiB payloads and 8,192-record batches after
+an untimed warmup. Published writer samples use serialization; existing-record
+copying is a separate supported workload.
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 Each measured sample transfers **100,000,000 records across eight connections**:
 12,500,000 records per connection. Payloads are 2,048 bytes; the complete encoded
@@ -144,186 +150,49 @@ to a code change. Throughput-derived nanoseconds per record are not latency
 percentiles, and subtracting concurrent benchmark times does not isolate the
 cost of one component.
 
-### Run and archive the complete suite
+</details>
 
-Requires Rust/Cargo, Git and Python 3.11+; the runner uses only Python's standard
-library. From the repository root:
+### Run and archive
 
-```sh
-python scripts/benchmarks.py run
-```
-
-This builds all three targets once, then runs them serially. Defaults are
-100 million records per sample, eight connections, 2 KiB payloads and **three
-measured samples per target**. The published quick comparisons used `--runs 1`.
-To also measure existing-record copying:
-
-```sh
-python scripts/benchmarks.py run --include-copy
-```
-
-Start with a shorter harness check:
+Requires Python 3.11+, Cargo, rustc and Git. Start with a short harness check:
 
 ```sh
 python scripts/benchmarks.py run --records 10003 --warmup-records 1001 --runs 2 --include-copy
 ```
 
-Every invocation creates a new directory under `benchmark-results/`, containing:
+The full `python scripts/benchmarks.py run` builds first and measures serially,
+defaulting to three 100-million-record samples per target. It retains JSON, CSV,
+Markdown and raw logs under ignored `benchmark-results/`. The
+[automation guide](scripts/README.md) covers reporting, compatibility checks,
+explicit regression budgets and preserving complete bundles. Ordinary tests skip
+long transfers. There is no configured performance CI or external artifact service.
 
-| Artifact | Contents |
-| --- | --- |
-| `results.json` | Versioned machine, toolchain, source identity, configuration and per-sample/per-connection results. |
-| `samples.csv` | Normalized samples for analysis and trend charts. |
-| `summary.md` | Generated machine/workload context and median results table. |
-| `*.log` | Full benchmark output and Cargo build diagnostics. |
+<a id="workspace-and-development"></a>
 
-Each benchmark also prints machine specifications when invoked directly with
-`cargo bench`. The suite records Git revision, dirty-tree state, a source/config
-fingerprint, compiler settings, timestamps and exact commands. It preserves
-partial results when a case fails and refuses to overwrite an existing run.
-The local results directory is Git-ignored and survives `cargo clean`; archive
-it as a CI artifact or in durable storage to retain history across build agents.
-
-Individual targets remain independently callable:
+## Development and documentation
 
 ```sh
-cargo bench -p transaction-log-exports --bench record_reader --locked -- --connections 8
-cargo bench -p transaction-log-exports --bench record_writer --locked -- --connections 8
-cargo bench -p transaction-log-exports --bench record_io --locked -- --connections 8
-```
-
-These commands default to one measured sample. Ordinary and all-target test runs
-skip long benchmark workloads.
-
-### Regression tracking and build integration
-
-The runner can be called from a build or deployment pipeline, then its result
-bundle uploaded even if the build fails. Tables can be regenerated without
-rerunning the workload:
-
-```sh
-python scripts/benchmarks.py report path/to/results.json --output report.md
-python scripts/benchmarks.py compare path/to/baseline/results.json path/to/current/results.json --max-regression-percent 5 --output comparison.md
-```
-
-Comparisons use median throughput for matching workloads and environments.
-Machine, compiler, build-setting or workload mismatches are rejected by default;
-available RAM is recorded but excluded from comparison identity. A slowdown beyond
-the explicitly chosen budget returns a nonzero exit code. The 5% example is not an
-established project threshold: a stable runner and sufficient samples are needed
-before setting one.
-
-Keep approved baselines rather than automatically promoting each new build.
-There is no CI-provider-specific workflow or artifact-retention service configured
-yet. [Automation documentation](scripts/README.md) describes the result schema,
-failure handling, comparison rules and integration commands.
-
-## Implementation progress
-
-- [x] Rust workspace, async application entry point and editor/debugger configuration.
-- [x] Binary record protocol, typed stream/sequence identifiers and CRC-32C framing.
-- [x] Immutable record ownership and inexpensive header/payload access.
-- [x] Async reader with batch validation and records that survive subsequent reads.
-- [x] Synchronous record builder and compile-time writer modes.
-- [x] Explicit async buffer output, destination flushing and optional file data synchronization.
-- [x] Single-threaded object-pool utility with unused-object reclamation.
-- [x] Reusable async Serde message I/O with bounded, length-prefixed Postcard frames; application messages and connection integration remain pending.
-- [x] Storage provider with owned startup configuration, async directory initialization, fresh log/index-pair creation and deterministic log/index/checkpoint paths.
-- [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
-- [x] Typed record start/end locations and a range model with lazy enumeration of bounded, postfix, whole-file and prefix reads.
-- [x] Stream-owned file identities, record endpoints/ranges and checkpoint model, with validated Serde metadata and checkpoint persistence; stream initialization implements step orchestration, checkpoint loading with stream-ID checking, and maximum-log discovery checked against the checkpoint's file number.
-- [x] Indexed log writer with stream/sequence checks, log-before-index flushing, separate flushed/durable progress and full-file finalization.
-- [x] File-only index writer with reusable buffering and separate buffer output, file flushing and data synchronization.
-- [x] Provider-based recovery file acquisition, supplied-boundary validation, unified index/log repair and synchronized partial/full handover.
-- [x] Independent reader/writer and combined loopback benchmarks.
-- [x] Benchmark artifacts with machine specifications, report generation and regression comparison.
-- [ ] Service connection setup, handshake and client lifecycle.
-- [ ] Stream routing, ingestion queues, admission control and periodic progress/status messages.
-- [ ] Client ingestion rejection/disconnection.
-- [ ] Multi-file lifecycle coordination and stream-specific index queries.
-- [x] Per-stream recovery: checkpoint loading, discovery, sequential pair validation, later-file cleanup, checkpoint advancement, active-pair preparation and final handover.
-- [x] Consume an initialized stream as an indexed log writer, preserving recovered progress and durability.
-- [ ] Durable flush scheduling and startup-wide recovery orchestration.
-- [ ] Replication and cluster coordination.
-- [x] Raw and validated single/cluster configuration with fixed node slots and derived DNS hostnames; storage supports configuration read/write, while startup integration remains deferred.
-- [ ] Storage, indexing, replication, recovery and latency benchmarks.
-- [ ] Dedicated performance CI workers and durable benchmark-history publication.
-
-The checklist distinguishes implemented I/O components from service behavior.
-The indexed log writer coordinates an individual pair; the service's persistence
-schedule, live file rotation and startup integration remain to be implemented.
-Pair recovery and storage-level checkpoint publication are implemented. The
-stream initializer loads checkpoint metadata, checks discovery bounds and validates
-successive pairs through the first partial file or gap, then removes the discarded
-range, publishes the recovered checkpoint and prepares the active pair. This
-per-stream operation is complete, and its result can be consumed as an indexed log
-writer. Application startup does not call it yet.
-
-## Workspace and development
-
-| Path | Responsibility |
-| --- | --- |
-| [`services/transaction-log`](services/transaction-log) | Service scaffold, storage models/paths, file acquisition, indexed appends and pair validation/repair. |
-| [`services/transaction-log-exports`](services/transaction-log-exports) | Public record types, reader, writer and benchmarks. |
-| [`lib/object-pool`](lib/object-pool) | Reusable single-threaded object pool. |
-| [`lib/message-io`](lib/message-io) | Async extension traits for bounded length-prefixed Postcard messages. |
-| [`scripts`](scripts/README.md) | Benchmark execution, reporting and comparison tooling. |
-| [`benchmarks`](benchmarks/README.md) | Selected structured measurements published with the repository. |
-
-The workspace uses Rust edition 2024 and is currently tested with Rust 1.98.1.
-
-```sh
-cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all --check
-cargo run -- --cluster-mode single --storage-directory ./data
-cargo run -- --help
+cargo doc --workspace --no-deps --open
 ```
 
-The application validates configuration, prints its embedded version and exits. Storage startup integration remains deferred.
-Owned [test-storage guards](services/transaction-log/src/storage/README.md#shared-test-storage)
-clean each case's files during normal completion or panic unwinding, preserving
-the empty stream directories for fast reuse under ordinary `cargo test`.
-For VS Code or Devin, install the extensions recommended in
-[.vscode/extensions.json](.vscode/extensions.json), including rust-analyzer,
-CodeLLDB and Dependi. The **Debug Transaction Log** launch configuration builds
-and launches the app under the debugger. External-code stepping filters are best-effort;
-their configuration is in [.vscode/settings.json](.vscode/settings.json).
+Crate overviews lead to module specifications for APIs, ownership, failure behavior
+and maintained design rationale. README examples included in Rustdoc are checked
+as documentation tests; the service's binary target needs the
+[manual doctest procedure](services/transaction-log/src/streams/README.md#verification-and-performance).
 
-## Documentation
+<details>
+<summary>Design and maintenance notes</summary>
 
-This root README is the repository entry point: project purpose, implementation
-status, performance evidence and how to build or evaluate the project.
-Crate documentation is the API reference, with examples and ownership/error
-contracts for library consumers. Module READMEs preserve detailed requirements,
-design decisions, safety invariants and optimization evidence.
+Owned [storage fixtures](services/transaction-log/src/storage/README.md#shared-test-storage)
+clean test files on normal completion or unwinding while retaining empty stream
+bases for reuse. Platform-specific filesystem tests cover Windows and Unix rules.
 
-| Documentation | Scope |
-| --- | --- |
-| [Clustering and read replicas](CLUSTERING.md) | Planned permanent deployment modes, fixed membership/master, startup gating, replica-loss exit policy and Kubernetes deployment requirements; open replication/read contracts. |
-| [Clustering](services/transaction-log/src/clustering/README.md) | Module boundaries and planned handshake/runtime responsibilities. |
-| [Clustering configuration](services/transaction-log/src/clustering/configuration/README.md) | Deployment settings, established configuration with permanent UUID, fixed topology, node/domain parsing and Serde contracts. |
-| [Raw clustering inputs](services/transaction-log/src/configuration/README.md) | Mode, local node name and cluster domain with environment, CLI and file-document attributes; startup loading and typed validation. |
-| [Application messages](services/transaction-log/src/messages/README.md) | Collection point for application wire messages and their message-io/Postcard wire contract. |
-| [Exports crate overview](services/transaction-log-exports/src/lib.rs) | Public types and API entry points. |
-| [Record specification](services/transaction-log-exports/src/record/README.md) | Record values, wire format, immutable ownership and validation invariants. |
-| [Reader specification](services/transaction-log-exports/src/record_reader/README.md) | Input validation, batch preparation, retained records, cancellation and terminal failures. |
-| [Writer specification](services/transaction-log-exports/src/record_writer/README.md) | Constructor modes, buffering, completion, cancellation and hot-path rationale. |
-| [Storage](services/transaction-log/src/storage/README.md) | Root configuration, physical paths, file acquisition, directory initialization and configuration persistence. |
-| [Stream locations](services/transaction-log/src/streams/location/README.md) | Logical file identities, sequence grouping, record boundaries and lazy range enumeration. |
-| [Stream checkpoint](services/transaction-log/src/streams/README.md#stream-checkpoint-model) | Stream-owned checkpoint model, Serde representation and certification/publication contract; storage read/write and initializer advancement are implemented. |
-| [Stream operations](services/transaction-log/src/streams/README.md) | Indexed appends, validation, repair, partial/full handover and failure handling. |
-| [Object pool](lib/object-pool/README.md) | Ownership, reclamation policy and usage. |
-| [Message I/O](lib/message-io/README.md) | Framing, Serde extension APIs, size limits, ownership and partial-I/O/cancellation contracts. |
-| [Benchmark specification](services/transaction-log-exports/benches/README.md) | Workloads, timing contracts and measurement history. |
+[Editor recommendations](.vscode/extensions.json) include rust-analyzer, CodeLLDB
+and Dependi. The **Debug Transaction Log** launch configuration builds and runs the
+scaffold under the debugger; external-code stepping filters in
+[settings](.vscode/settings.json) are best-effort. Repository-wide contribution and
+agent guidance is maintained in [AGENTS.md](AGENTS.md).
 
-Several module READMEs are included directly in Rustdoc and their Rust examples
-are checked as documentation tests. Keep API details there and link from this page,
-rather than maintaining a second copy in the root README. Changes to API contracts
-and their rationale should update the relevant module documentation and tests.
-
-Build the library documentation locally:
-
-```sh
-cargo doc -p transaction-log-exports --no-deps --open
-```
+</details>

@@ -1,63 +1,60 @@
 # Clustering
 
-This application module owns validated cluster configuration and will contain
-handshakes and runtime coordination. `mod.rs` declares `configuration` and includes
-this overview in Rustdoc. The [root design](../../../../CLUSTERING.md) records the
-agreed lifecycle. Networking, replication and readiness remain planned.
+Scaffolding for fixed-membership cluster startup and runtime coordination. Validated
+configuration models are implemented; networking, handshakes, replication and
+readiness are not. The executable currently validates inputs, prints its version
+and exits.
 
-## Module boundaries
+## Types and modules
 
-[`configuration`](configuration/README.md) owns `ClusteringConfiguration`,
-`EstablishedClusteringConfiguration`, `ClusterMembership`, `NodeName`, `Hostname`
-and their validation errors. Established configuration pairs deployment settings
-with an internally supplied UUID in either mode. Storage saves/restores that type
-directly; UUID establishment and startup integration remain deferred.
-There are exactly three slots: master, replica-1
-and replica-2. One cluster domain derives all node hostnames. Shared agreement is
-UUID and domain equality once established; local node slots intentionally differ. Membership stores only
-the local slot and domain; node hostnames are formatted when needed.
+| Module | Responsibility |
+| --- | --- |
+| [`configuration`] | Validated deployment settings, node/domain values and established configuration with a supplied UUID. |
 
-Unvalidated inputs and `conf` source attributes live under
-[`configuration`](../configuration/README.md).
-Startup loads and converts them, prints the version and exits. It neither accesses
-storage nor starts a cluster.
-Runtime modules
-will belong beside validated `configuration`, rather than inside it.
+[Raw configuration](crate::configuration) owns loading, and [storage](crate::storage)
+can persist the established value. UUID assignment and startup integration remain
+planned. The [cluster design](https://github.com/FastFinTech/transaction_log/blob/main/CLUSTERING.md)
+records the agreed lifecycle and open questions.
 
-## Planned session contract
+## Behavior and guarantees
 
-All three members must connect and resynchronize before command admission. Losing
-either required replica ends the operating session; reconnects and replacements
-are startup-only activities. Recovery is coordinated across the cluster and
-command handlers. There is no election, promotion or degraded service mode.
+Only the configuration contracts are implemented. The planned runtime uses one
+permanent master and exactly two required replicas, with no election or degraded
+service mode.
 
-Handshakes must verify application version first, then persisted cluster identity,
-shared domain and expected fixed node slot. Duplicate active slots must be
-rejected, including the master slot. DNS can accidentally route different names
-to one process, so derived names alone do not establish peer identity. Claimed
-identity also does not establish authenticated ownership or storage continuity.
+<details>
+<summary>Design and maintenance notes</summary>
 
-Runtime owners must enforce startup readiness, stop command admission on failure
-and invalidate handler connections. Durable acknowledgement, in-flight outcomes,
-storage reconciliation, authentication and session recovery remain unspecified.
-Static configuration establishes none of these guarantees.
+**Planned session contract.** All three members connect and resynchronize before
+command admission. Losing either replica ends the operating session; reconnects
+and replacements occur during startup. Recovery must coordinate with command
+handlers, stop admission on failure and invalidate handler connections.
 
-The [message I/O crate](../../../../lib/message-io/README.md) provides bounded
-length-prefixed Postcard messages for intermittent control traffic. Application
-message schemas and connection integration remain planned; version agreement
-belongs before clustering rather than in the codec.
+Handshakes check application version before cluster negotiation, then the persisted
+UUID, shared domain and expected fixed slot. Duplicate active slots, including the
+master, are rejected. Local slots intentionally differ, so shared agreement compares
+UUID/domain rather than whole membership values. Different DNS names can resolve
+to the same process; neither a derived address nor claimed identity proves
+authenticated ownership or storage continuity.
 
-## Verification
+Durable acknowledgement, in-flight outcomes, storage reconciliation, authentication
+and session recovery remain unspecified. The reusable
+[message-io crate](https://github.com/FastFinTech/transaction_log/blob/main/lib/message-io/README.md)
+is intended for intermittent gossip/control messages. Application schemas and
+connection integration remain planned; the codec performs no version agreement.
+Runtime components will own these behaviors separately from the static values.
 
-Follow the [configuration specification](configuration/README.md) when changing
-its types. Run:
+</details>
 
-```sh
-cargo test -p transaction-log --locked
-cargo fmt --all --check
+## Validation
+
+```powershell
+cargo test -p transaction-log --locked clustering
 cargo clippy -p transaction-log --all-targets --locked -- -D warnings
-cargo doc -p transaction-log --no-deps --locked
+cargo fmt --all --check
+cargo rustdoc -p transaction-log --bin transaction-log --locked -- -D warnings
 ```
 
-Add module specifications and same-file behavior tests for future runtime modules.
-No cluster performance measurements or availability guarantees are established.
+Configuration tests establish parsing, value and metadata contracts. There are no
+implemented cluster exchanges, availability guarantees or runtime measurements to
+validate yet.

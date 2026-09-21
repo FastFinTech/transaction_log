@@ -1,94 +1,83 @@
 # Configuration inputs
 
-`raw_application_configuration.rs` defines `RawApplicationConfiguration`, the
-entry point's loader. It flattens clustering CLI/environment options and adds
-`--storage-directory` / `TL_STORAGE_DIRECTORY`. Storage defaults to `/data` on
-non-Windows systems (the intended Linux container volume mount) and `./data` on
-Windows. Override it for native local debugging; every local cluster process needs
-a separate directory. The file key is `storage_directory`, beside `mode` and the
-optional nested `cluster` object. File reading remains caller work.
+Load raw service options from CLI arguments and environment variables, with optional
+caller-supplied documents. Startup converts clustering inputs into validated values,
+prints the application version and exits. Storage and cluster startup integration
+remain planned.
 
-This module owns all raw application configuration inputs. Each type has its own source file; `mod.rs` declares and re-exports `RawApplicationConfiguration`, `RawClusteringConfiguration` and `RawClusterConfiguration`. Wire message types live in the separate [messages module](../messages/README.md).
+## Types and modules
 
-Raw inputs are distinct from validated subsystem values. The `conf` derive macro
-handles source mapping, presence/type errors and CLI help without custom loading
-machinery. Domain validity belongs to conversion into each subsystem's typed
-configuration. Loading raw strings does not establish a valid deployment.
+| Type | Responsibility |
+| --- | --- |
+| [`RawApplicationConfiguration`] | Combine the storage directory with flattened clustering options. |
+| [`RawClusteringConfiguration`] | Require a deployment mode and collect the optional cluster group. |
+| [`RawClusterConfiguration`] | Hold the local node name and shared domain before semantic validation. |
 
-The entry point loads application inputs from CLI arguments and environment
-variables, including generated help, and converts them into validated clustering
-configuration and prints the application version. Storage startup integration remains deferred.
-Application-wide source selection, file reading and cluster startup
-are not implemented. Environment-only and
-CLI-only loading need no file. Configuration
-uses owned strings at startup and makes no hot-path performance claim.
+[Typed clustering configuration](crate::clustering::configuration) validates mode,
+node slots and DNS syntax. The raw types expose private fields through read-only
+getters and preserve unvalidated strings.
 
-Run `cargo test -p transaction-log --locked`, `cargo fmt --all --check` and
-`cargo clippy -p transaction-log --all-targets --locked -- -D warnings` from the
-workspace root when changing inputs or their source mappings.
+## Usage
 
-## Raw clustering inputs
-
-`configuration` defines `RawClusteringConfiguration` in
-`raw_clustering_configuration.rs`, with the grouped `RawClusterConfiguration` in
-`raw_cluster_configuration.rs`. `mod.rs` exports both and includes this specification
-in Rustdoc. [`conf`](https://docs.rs/conf/latest/conf/) field attributes describe
-environment variables, CLI flags and file-document keys. Fields are private with
-read-only getters. There is no custom loader or raw error hierarchy.
-
-| Field | Environment variable | CLI flag | Type |
-| --- | --- | --- | --- |
-| `mode` | `TL_CLUSTER_MODE` | `--cluster-mode` | Required string |
-| `cluster.my_node_name` | `TL_CLUSTER_MY_NODE_NAME` | `--cluster-my-node-name` | Required string within the optional group |
-| `cluster.cluster_domain` | `TL_CLUSTER_DOMAIN` | `--cluster-domain` | Required string within the optional group |
-
-Single mode needs only `TL_CLUSTER_MODE=single`. Cluster inputs look like:
-
-```text
-TL_CLUSTER_MODE=cluster
-TL_CLUSTER_MY_NODE_NAME=replica-1
-TL_CLUSTER_DOMAIN=payments.example.com
+```sh
+cargo run -- --cluster-mode single --storage-directory ./data
+cargo run -- --help
 ```
 
-The topology is always one master and exactly two replicas.
-`--cluster-mode` is permanent once the database's storage is initialized;
-single storage cannot become clustered, and clustered storage cannot become single.
-This is the agreed lifecycle requirement, not a guarantee of raw loading.
-Comparison with stored configuration and storage setup remain unimplemented.
+Loading these options does not create storage. Each local cluster process will
+need its own directory when storage integration is implemented.
 
-`--cluster-my-node-name` is permanent once the node's storage is initialized;
-changing configuration or restarting must not reassign that storage to another
-node slot. Future startup must reject disagreement with stored configuration;
-the raw types and static conversion cannot enforce that persisted-state rule.
+<details>
+<summary>Design and maintenance notes</summary>
 
-Node names and domain syntax are validated by the
-[typed conversion](../clustering/configuration/README.md),
-not raw loading. `cluster: Option<RawClusterConfiguration>` groups both settings.
-Neither supplied means `None`; either supplied activates the group and the parser
-requires both. A present file object, including an empty object, also activates
-the group. Inputs can complete a group across sources according to precedence.
-Raw strings retain whitespace, empty values and malformed input. The crate rejects
-missing mode and incomplete groups; conversion checks allowed mode/node values,
-mode/group consistency and DNS syntax. There is no replica count, master pair
-or replica list. No field has a default: deployment mode must be explicit.
+**Explicit inputs without process-global changes.** The same loader accepts supplied
+arguments and environment pairs, useful for embedding and tests:
 
-Raw loading is intentionally independent of mode semantics. For example,
-`mode=cluster` without the group loads successfully but fails typed conversion;
-`mode=single` with a complete group loads successfully but fails conversion.
-An incomplete group fails loading regardless of mode. `ClusterMembership::new`
-then combines the parsed node and domain without further validation. Formatted
-node hostname lengths are not checked by membership or the raw configuration.
+```rust
+use conf::Conf;
+use transaction_log::{
+    configuration::RawApplicationConfiguration,
+    clustering::configuration::ClusteringConfiguration,
+};
 
-There is no UUID input. The
-[`EstablishedClusteringConfiguration`](../clustering/configuration/README.md#established-configuration) combines
-validated configuration with a UUID in either mode. First-load UUID assignment
-and subsequent storage checks belong to later startup work, not this raw model.
+let raw = RawApplicationConfiguration::try_parse_from(
+    ["transaction-log", "--cluster-mode", "single"],
+    [] as [(&str, &str); 0],
+)?;
+let configuration = ClusteringConfiguration::try_from(raw.clustering().clone())?;
+assert_eq!(configuration, ClusteringConfiguration::Single);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
-`#[conf(flatten)]` preserves flat CLI/environment names while file documents use
-a nested object:
+The declarative `conf` loader owns source mapping, presence/type errors and generated
+help. Subsystem conversion owns semantic validation, avoiding a custom raw loader
+or duplicate error hierarchy.
+
+</details>
+
+## Behavior and guarantees
+
+### Source mappings
+
+| File field | CLI flag | Environment variable | Requirement/default |
+| --- | --- | --- | --- |
+| `storage_directory` | `--storage-directory` | `TL_STORAGE_DIRECTORY` | `./data` on Windows; `/data` on other platforms. |
+| `mode` | `--cluster-mode` | `TL_CLUSTER_MODE` | Required string. |
+| `cluster.my_node_name` | `--cluster-my-node-name` | `TL_CLUSTER_MY_NODE_NAME` | Required when the cluster group is present. |
+| `cluster.cluster_domain` | `--cluster-domain` | `TL_CLUSTER_DOMAIN` | Required when the cluster group is present. |
+
+CLI values override environment values, which override a supplied document.
+Clustering fields have no defaults. File selection and reading remain caller work;
+the executable currently loads only process arguments and environment variables.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Grouped file input.** Flat CLI/environment names map to a nested document:
 
 ```json
 {
+  "storage_directory": "node-data",
   "mode": "cluster",
   "cluster": {
     "my_node_name": "replica-1",
@@ -97,41 +86,70 @@ a nested object:
 }
 ```
 
-Single-mode documents omit `cluster`. File keys are the field names.
-`#[conf(serde)]` permits a supplied Serde deserializer
-through `conf_builder().doc(name, deserializer)`. File format/path selection and
-reading bytes remain caller responsibilities; no file is required or loaded by
-startup. Precedence is CLI over environment over the supplied document.
+Single-mode documents omit `cluster`. The `conf(serde)` attributes permit a Serde
+deserializer through `conf_builder().doc(name, deserializer)`; they do not choose
+a file format/path or read bytes. A file is unnecessary for CLI-only or
+environment-only loading. The non-Windows storage default targets the intended
+Linux container volume mount and can be overridden for native debugging.
 
-Startup loads these options through `RawApplicationConfiguration` and
-`conf::Conf::parse` for process arguments and environment variables,
-then `ClusteringConfiguration::try_from`. `--help` uses field doc comments and exits
-successfully before required-field checks. Loading errors exit with failure;
-domain errors propagate through the entry point. The executable prints its
-embedded application version and exits. It does not access storage, compare
-persisted configuration, assign UUIDs, initialize directories or connect a cluster.
-File-source selection and runtime clustering remain deferred.
-Owned strings are configuration work, with no
-record hot-path or performance claim.
+</details>
 
-### Design assessment
+### Raw clustering inputs
 
-The current raw types match the agreed minimal design: explicit single/cluster
-mode and one optional group containing local node name and cluster domain.
-Declarative loading owns source mappings and presence requirements; typed
-conversion owns semantic validation. No custom raw errors, discovery settings,
-configurable membership or application setup behavior are needed here.
-Keep persistence and startup decisions outside this module. No raw-model API
-change is currently required.
+Supplying neither cluster field leaves the group absent. Supplying either field,
+or a file object even when empty, activates it and requires both fields. Sources
+can complete the group together according to precedence. Raw strings retain
+whitespace, empty values and malformed syntax.
 
-Same-file tests use explicit inputs rather than mutating process-global environment.
-They cover environment/CLI/document mappings, source precedence, required mode,
-absent/complete/partial groups in each source, groups completed across sources,
-empty strings and preservation of unvalidated input. Run:
+Loading and semantic conversion are separate: `cluster` mode without a group can
+load but fails conversion; `single` with a complete group also fails conversion.
+An incomplete group fails loading regardless of mode.
 
-```sh
-cargo test -p transaction-log --locked
-cargo fmt --all --check
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Static values versus persisted identity.** Typed conversion checks allowed mode
+and node names, mode/group consistency and domain syntax. Membership then combines
+validated values without another check; it does not validate the length of a
+formatted `node.domain` result. The topology is one master and exactly two replicas,
+with no configurable member list or replica count.
+
+Mode and local node slot are intended to remain permanent for initialized storage.
+Comparing new inputs with stored settings belongs to future startup work, so raw
+loading and static conversion cannot enforce that rule. There is no UUID input.
+`EstablishedClusteringConfiguration` combines a supplied UUID with validated values;
+first-load assignment and later storage agreement remain lifecycle work.
+
+</details>
+
+### Executable behavior
+
+`conf::Conf::parse` handles process inputs and generated `--help`. Help exits
+successfully before required-field checks. Loading errors fail; typed conversion
+errors propagate through the entry point. Successful conversion prints the embedded
+version and exits, without storage access, UUID assignment or cluster connections.
+
+## Performance
+
+Loading and conversion own strings during startup. They do not run per record,
+and no configuration-throughput measurements are available.
+
+## Validation
+
+```powershell
+cargo test -p transaction-log --locked configuration
 cargo clippy -p transaction-log --all-targets --locked -- -D warnings
-cargo doc -p transaction-log --no-deps --locked
+cargo fmt --all --check
+cargo rustdoc -p transaction-log --bin transaction-log --locked -- -D warnings
 ```
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+Tests use explicit inputs rather than mutating the process environment. They cover
+CLI/environment/document mappings, precedence, storage defaults, required mode,
+absent/complete/partial groups in each source, groups completed across sources and
+preservation of empty or malformed raw strings. Typed configuration tests separately
+establish domain validity and distinguish it from successful raw loading.
+
+</details>

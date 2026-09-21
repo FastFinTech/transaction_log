@@ -1,21 +1,43 @@
 # Writer and combined benchmark support
 
-`mod.rs` is compiled only into the `record_writer` and `record_io` benchmark
-binaries. It holds their argument handling, fixtures, producer, receivers,
-startup coordination and reporting. These related private harness types stay
-together so the two targets cannot silently drift in producer or timing policy.
-The parent [benchmark README](../README.md) documents commands and results;
-the [record specification](../../src/record/README.md) owns the encoded format,
-and the [writer specification](../../src/record_writer/README.md) owns output
-and failure semantics. No benchmark hooks enter the production library.
+Share producer workloads, startup coordination and reporting between the writer
+and combined TCP benchmarks. The reader-only target keeps its independent prebuilt
+sender. These are explicitly invoked harnesses; no hooks enter production record I/O.
 
-The shared [environment collector](../environment/README.md) emits machine
-specifications once after configuration/fixture preparation, before warmup or
-measurement. The suite runner archives those specifications alongside source and
-toolchain identity. Metadata collection must stay outside timed worker execution
-and behind the explicit benchmark-run guard.
+## Types and modules
 
-## Measurement boundaries
+| Entry point | Responsibility |
+| --- | --- |
+| [`ReceiverKind`](mod.rs) | Select a raw byte drain or the production record reader. |
+| [`run`](mod.rs) | Parse options, prepare workers, run warmup/measurements and report validated results. |
+| [Environment collector](../environment/README.md) | Emit machine metadata before timed work. |
+
+The [benchmark overview](../README.md) owns commands/results. The
+[record](../../src/record/README.md) and [writer](../../src/record_writer/README.md)
+specifications own the encoding and production API contracts.
+
+## Usage
+
+A short check exercises both serialization and existing-record copying:
+
+```sh
+python scripts/benchmarks.py run --targets record_writer record_io --records 10003 --warmup-records 1001 --runs 2 --include-copy
+```
+
+Run from the workspace root. Ordinary and all-target tests skip transfers;
+`--help` is safe, and benchmarks require the explicit `--bench` run guard.
+
+## Behavior and guarantees
+
+### Measurement boundaries
+
+Workers start from one common clock. Writer-only timing ends at the last sender
+or raw-drain receiver completion; combined timing includes the production reader.
+Success requires every worker, exact bytes and clean EOF. The combined receiver
+also validates and counts records.
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 `record_writer` uses the real `RecordWriter` and a blocking TCP receiver that
 only drains bytes into one reusable 256 KiB buffer. No `RecordReader`, framing
@@ -50,13 +72,23 @@ records are inspected/dropped after the reader timestamp; that cleanup can overl
 other workers still transferring. Evictions during transfer are measured.
 
 The reader-only target reports last-reader completion as its aggregate duration;
-the new targets also include the last sender's completion. Both new durations are
+the writer and combined targets also include the last sender's completion. Both durations are
 printed separately to make that distinction visible. Neither target measures
 per-record latency, acknowledgements, disk persistence or command handling.
 Sender and receiver work overlap; subtracting their durations does not isolate CPU
 time. Amortized nanoseconds per record are throughput-derived, not latency samples.
 
-## Producer workloads and memory
+</details>
+
+### Producer workloads and memory
+
+`serialize` generates each record through the synchronous writer callback;
+`copy` borrows prevalidated fixture records and copies their encodings. Both send
+reusable batches and flush the destination once at the end. Fixture preparation
+is outside timing, but a measured writer's first buffer growth is included.
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 `--workload serialize` selects `RecordWriter::for_serialization`. One callback
 writes a deterministic payload in `--write-chunk-bytes` chunks (eight bytes by
@@ -92,7 +124,16 @@ is 206.4 GB, while memory is bounded by fixture size, per-writer batch capacity,
 receiver buffers and optional retained records. Large batch/retention settings
 can still demand substantial memory, and growth can reserve more than live bytes.
 
-## Validation, startup and failure handling
+</details>
+
+### Startup, failures and reporting
+
+Arguments are validated before work. Startup failure releases waiting workers;
+worker errors produce a failed process, not a successful throughput result. The
+raw-drain target checks bytes without claiming record-content validation.
+
+<details>
+<summary>Design and maintenance notes</summary>
 
 The count means total records across all connections. Remainders are assigned to
 the first connections, preserving the exact requested total for warmup and runs.
@@ -119,13 +160,10 @@ are joined before their results are propagated. Errors produce a failed process,
 not a successful throughput line for that run. There is no automatic retry or
 deadline imposed on an explicitly requested long measurement.
 
-The program must check Cargo's `--bench` flag before configuration, fixture
+The program checks Cargo's `--bench` flag before configuration, fixture
 allocation, runtime creation or socket setup. Without it, or when `--test` is
-present, it prints a skip message. `--help` is always safe. Keep `harness = false`
-and `test = false` on the manifest targets, and preserve this extra guard because
-all-target test runs can still select custom benchmark executables.
-
-## Reporting and maintenance
+present, it prints a skip message. `--help` is always safe. The manifest uses `harness = false` and `test = false`; the extra guard remains
+necessary because all-target tests can still select custom benchmark executables.
 
 Configuration and `RESULT` lines identify target, workload, record/payload/batch
 sizes, chunk size and retention. Individual connection lines use the same timing
@@ -134,18 +172,29 @@ receiver, `receive_batches` counts nonempty `read` calls; on the record receiver
 it counts prepared `RecordReader` batches. Those two receive counts have different
 meanings and should not be compared as equivalent operations.
 
-Before full measurements, run small cases for both targets and workloads: one
-and eight connections, uneven record/warmup totals, one record per connection,
-partial output batches, multiple runs, empty/maximum payloads, non-divisible body
-chunks and retained records. Verify rejected arguments and that ordinary/all-target
-tests skip all benchmark workloads. Exercise the actual executables; do not put
-long transfers into unit tests. Build all targets with Clippy and keep formatting
-clean. For changes to startup or timing, inspect failure exits and independently
-check reported counts and common-start maxima.
+</details>
 
-Performance runs are serial, optimized and opt-in. Keep toolchain, machine, OS,
-payload/chunk sizes, batching, connection count, retention and background load
-with any recorded results. Use short runs to test the harness; do not treat them
-as reliable throughput baselines. Compare each target against itself before and
-after a production change, then use the combined target to check its effect on
-the full path. Never infer a precise writer cost by subtracting concurrent rates.
+## Performance
+
+These measurements include loopback transport, memory bandwidth, scheduling and
+backpressure. Concurrent sender/receiver times cannot be subtracted to isolate CPU
+cost, and throughput-derived ns/record is not a latency sample. Results and their
+conditions are retained in the [measurement history](../README.md#performance).
+
+## Validation
+
+Small executable runs establish partitioning, exact counts, EOF, workload selection
+and common-start maxima. Ordinary/all-target tests verify the skip guard; Clippy
+and formatting check both target builds without starting long transfers.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+Coverage uses one/eight connections, uneven record and warmup totals, one record
+per connection, partial batches, repeated runs, empty/maximum payloads, non-divisible
+body chunks and retained records. Invalid arguments exercise rejection before
+setup. Failure exits and independently checked count/timing maxima protect the
+coordination contract. Short transfers verify the harness and are not throughput
+baselines; full measurements follow the repository's serial measurement policy.
+
+</details>
