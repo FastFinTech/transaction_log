@@ -10,6 +10,8 @@ use crate::streams::RecordEndLocation;
 /// Use `checkpoint.end().record_id()`, `checkpoint.end().position()` and
 /// `checkpoint.end().log_file_id()` to inspect the boundary. Endpoint behavior
 /// belongs to that type rather than duplicate checkpoint accessors.
+/// The position is a [`crate::streams::LogFilePosition`]; its raw byte offset is
+/// available through `checkpoint.end().position().get()`.
 ///
 /// A checkpoint published for recovery certifies a contiguous prefix of validated
 /// records AND their correct index entries on this replica. Its owner must not
@@ -36,7 +38,8 @@ pub struct StreamCheckpoint {
     /// Last included record and its exclusive byte end in that record's log file.
     ///
     /// This may precede the file's physical length when an uncheckpointed tail
-    /// follows it. A `u64` preserves positions beyond 4 GiB on every target.
+    /// follows it. The endpoint's `LogFilePosition` preserves the full `u64`
+    /// offset, including positions beyond 4 GiB, on every target.
     end: RecordEndLocation,
 }
 
@@ -58,6 +61,7 @@ mod tests {
     use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
 
     use super::{RecordEndLocation, StreamCheckpoint};
+    use crate::streams::LogFilePosition;
 
     #[test]
     fn checkpoint_preserves_the_supplied_endpoint() {
@@ -72,7 +76,7 @@ mod tests {
             ] {
                 let end = RecordEndLocation::new(
                     RecordId::new(stream_id, SequenceNumber::new(sequence)),
-                    position,
+                    LogFilePosition::new(position),
                 );
                 let checkpoint = StreamCheckpoint::new(end);
                 assert_eq!(checkpoint.end(), end);
@@ -93,7 +97,7 @@ mod tests {
 }"#;
         let checkpoint = StreamCheckpoint::new(RecordEndLocation::new(
             RecordId::new(StreamId::new(42).unwrap(), SequenceNumber::new(99_999)),
-            6_553_500_000,
+            LogFilePosition::new(6_553_500_000),
         ));
         let mut bytes = Vec::new();
         serde_json::to_writer_pretty(&mut bytes, &checkpoint).unwrap();
@@ -108,7 +112,7 @@ mod tests {
         // 51,616 maximum-size records in the terminal file range.
         let checkpoint = StreamCheckpoint::new(RecordEndLocation::new(
             RecordId::new(StreamId::MAX, SequenceNumber::MAX),
-            3_382_654_560,
+            LogFilePosition::new(3_382_654_560),
         ));
         assert_eq!(serde_json::to_string(&checkpoint).unwrap(), json);
         assert_eq!(

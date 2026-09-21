@@ -36,7 +36,7 @@ describe potential work once measurements or implemented queue admission justify
 
 | Component | Responsibility |
 | --- | --- |
-| [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. |
+| [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. Endpoints and file ranges use `LogFilePosition`, preserved through writing, recovery and checkpoint metadata. |
 | [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write and initializer advancement are implemented. |
 | [Stream initializer](stream_initializer/README.md) | Checked checkpoint loading/discovery, sequential pair validation, later-file cleanup, checkpoint advancement, active-pair preparation and final handover. |
 | [Indexed log writer](indexed_log_writer/README.md) | Consume an initialized stream or take a fresh empty pair; append ordered records and control flushing, synchronization, progress and finalization. Start here for normal output. |
@@ -147,11 +147,12 @@ position together:
 
 - `checkpoint.end().record_id()` identifies the last complete record included in
   the checkpoint. Its identity already includes the stream ID.
-- `checkpoint.end().position()` is the byte offset from the beginning of that
+- `checkpoint.end().position()` returns a `LogFilePosition` from the beginning of that
   record's log file to immediately after the complete encoded record, including its CRC.
   The boundary is exclusive: following bytes have not been checkpointed by this
   snapshot. It is not the position of the last byte, an index-file position, or
-  a cumulative byte count across multiple files.
+  a cumulative byte count across multiple files. Use `.get()` to extract the raw
+  `u64` when passing the offset to an I/O or encoding API.
 
 `checkpoint.end().log_file_id()` derives the file identity through the endpoint,
 so the model does not store redundant stream/file identifiers that could disagree.
@@ -164,9 +165,9 @@ increments the sequence and remains usable at `u64::MAX`. An endpoint may preced
 the physical end of a file containing newer, uncheckpointed records.
 
 Use `Option<StreamCheckpoint>` for an absent checkpoint, including an empty stream;
-do not reserve sequence zero as a sentinel. Positions use `u64` because log files
-can exceed 4 GiB. The model is a small owned `Copy` value without allocation,
-mutable accessors or filesystem access. Its native layout does not define its
+do not reserve sequence zero as a sentinel. `LogFilePosition` preserves the full
+`u64` width because log files can exceed 4 GiB. The model is a small owned `Copy`
+value without allocation, mutable accessors or filesystem access. Its native layout does not define its
 serialized representation.
 
 `StreamCheckpoint::new(end)` is an infallible data constructor. It does not
@@ -191,15 +192,14 @@ trusted index prefix or mismatching endpoint requires the caller to supply an
 earlier trustworthy boundary for a separate attempt.
 
 ```rust
-use transaction_log::streams::RecordEndLocation;
-use transaction_log::streams::StreamCheckpoint;
+use transaction_log::streams::{LogFilePosition, RecordEndLocation, StreamCheckpoint};
 use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
 
 let id = RecordId::new(StreamId::new(42)?, SequenceNumber::new(99_999));
-let end = RecordEndLocation::new(id, 6_553_500_000);
+let end = RecordEndLocation::new(id, LogFilePosition::new(6_553_500_000));
 let checkpoint = StreamCheckpoint::new(end);
 assert_eq!(checkpoint.end().record_id(), id);
-assert_eq!(checkpoint.end().position(), 6_553_500_000);
+assert_eq!(checkpoint.end().position(), LogFilePosition::new(6_553_500_000));
 assert_eq!(checkpoint.end().log_file_id().file_number().get(), 0);
 
 let bytes = serde_json::to_vec_pretty(&checkpoint)?;
@@ -248,7 +248,10 @@ request handling is implemented yet.
 
 Checkpoint metadata uses human-readable JSON. It is small and updated outside
 the per-record hot path, so a compact binary encoding is not necessary. Serde
-derives describe the fields, and `serde_json` provides the JSON codec:
+derives describe the fields, and `serde_json` provides the JSON codec.
+
+`LogFilePosition` is transparent to Serde, so the position remains a numeric field
+inside the endpoint. No additional wrapper object is stored:
 
 ```json
 {

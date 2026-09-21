@@ -11,9 +11,9 @@ pub mod validation;
 pub use index_writer::{IndexWriteError, IndexWriter};
 pub use indexed_log_writer::{AppendOutcome, IndexedLogWriteError, IndexedLogWriter};
 pub use location::{
-    LogFileId, LogFileIdRangeError, LogFileNumber, LogFileNumberError, LogFileRange,
-    RECORDS_PER_FILE, RecordEndLocation, RecordRangeLocation, RecordRangeLocationError,
-    RecordStartLocation,
+    LogFileId, LogFileIdRangeError, LogFileNumber, LogFileNumberError, LogFilePosition,
+    LogFileRange, RECORDS_PER_FILE, RecordEndLocation, RecordRangeLocation,
+    RecordRangeLocationError, RecordStartLocation,
 };
 pub use stream_checkpoint::StreamCheckpoint;
 pub use stream_initializer::{InitializedStream, StreamInitializer};

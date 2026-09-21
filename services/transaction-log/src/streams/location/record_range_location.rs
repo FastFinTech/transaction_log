@@ -3,7 +3,8 @@ use std::iter::FusedIterator;
 use getset::CopyGetters;
 
 use super::{
-    LogFileId, LogFileRange, RecordEndLocation, RecordRangeLocationError, RecordStartLocation,
+    LogFileId, LogFilePosition, LogFileRange, RecordEndLocation, RecordRangeLocationError,
+    RecordStartLocation,
 };
 
 /// Outer byte boundaries of an inclusive range of records in one stream.
@@ -43,14 +44,14 @@ impl RecordRangeLocation {
     /// CRCs or readable file extents. Those checks remain with the resolver.
     ///
     /// ```
-    /// use transaction_log::streams::{RecordEndLocation, RecordRangeLocation, RecordStartLocation};
+    /// use transaction_log::streams::{LogFilePosition, RecordEndLocation, RecordRangeLocation, RecordStartLocation};
     /// use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
     ///
     /// let id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
-    /// let start = RecordStartLocation::new(id, 0);
-    /// let end = RecordEndLocation::new(id, 16);
+    /// let start = RecordStartLocation::new(id, LogFilePosition::new(0));
+    /// let end = RecordEndLocation::new(id, LogFilePosition::new(16));
     /// let range = RecordRangeLocation::new(start, end)?;
-    /// assert_eq!(range.start().position(), 0);
+    /// assert_eq!(range.start().position(), LogFilePosition::new(0));
     /// assert_eq!(range.end().record_id(), id);
     /// assert_eq!(range.iter().count(), 1);
     /// # Ok::<(), transaction_log::streams::RecordRangeLocationError>(())
@@ -59,12 +60,12 @@ impl RecordRangeLocation {
     /// Endpoint roles cannot be swapped:
     ///
     /// ```compile_fail,E0308
-    /// use transaction_log::streams::{RecordEndLocation, RecordRangeLocation, RecordStartLocation};
+    /// use transaction_log::streams::{LogFilePosition, RecordEndLocation, RecordRangeLocation, RecordStartLocation};
     /// use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
     ///
     /// let id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
-    /// let start = RecordStartLocation::new(id, 0);
-    /// let end = RecordEndLocation::new(id, 16);
+    /// let start = RecordStartLocation::new(id, LogFilePosition::new(0));
+    /// let end = RecordEndLocation::new(id, LogFilePosition::new(16));
     /// let _ = RecordRangeLocation::new(end, start);
     /// ```
     ///
@@ -99,7 +100,7 @@ impl RecordRangeLocation {
         let end_file_start = if start_file == end_file {
             start.position()
         } else {
-            0
+            LogFilePosition::new(0)
         };
         if end.position() <= end_file_start {
             return Err(RecordRangeLocationError::InvalidByteSpan {
@@ -162,8 +163,8 @@ mod tests {
     use transaction_log_exports::{RecordId, SequenceNumber, StreamId};
 
     use super::{
-        LogFileId, LogFileRange, RecordEndLocation, RecordRangeLocation, RecordRangeLocationError,
-        RecordStartLocation,
+        LogFileId, LogFilePosition, LogFileRange, RecordEndLocation, RecordRangeLocation,
+        RecordRangeLocationError, RecordStartLocation,
     };
     use crate::streams::LogFileNumber;
 
@@ -182,8 +183,8 @@ mod tests {
             ),
         ] {
             let id = RecordId::new(stream_id, SequenceNumber::new(sequence));
-            let start_location = RecordStartLocation::new(id, start);
-            let end_location = RecordEndLocation::new(id, end);
+            let start_location = RecordStartLocation::new(id, LogFilePosition::new(start));
+            let end_location = RecordEndLocation::new(id, LogFilePosition::new(end));
             let location = RecordRangeLocation::new(start_location, end_location).unwrap();
             let file_id = LogFileId::new(stream_id, LogFileNumber::new(file_number).unwrap());
 
@@ -196,8 +197,8 @@ mod tests {
                 [(
                     file_id,
                     LogFileRange::FileRange {
-                        start_position: start,
-                        end_position: end
+                        start_position: LogFilePosition::new(start),
+                        end_position: LogFilePosition::new(end)
                     }
                 ),]
             );
@@ -210,8 +211,8 @@ mod tests {
         let end = RecordId::new(StreamId::MIN, SequenceNumber::new(100_020));
         // An inclusive request for records 10..=20 covers eleven records.
         let location = RecordRangeLocation::new(
-            RecordStartLocation::new(start, 160),
-            RecordEndLocation::new(end, 336),
+            RecordStartLocation::new(start, LogFilePosition::new(160)),
+            RecordEndLocation::new(end, LogFilePosition::new(336)),
         )
         .unwrap();
         assert_eq!(
@@ -219,8 +220,8 @@ mod tests {
             [(
                 LogFileId::new(StreamId::MIN, LogFileNumber::new(1).unwrap()),
                 LogFileRange::FileRange {
-                    start_position: 160,
-                    end_position: 336
+                    start_position: LogFilePosition::new(160),
+                    end_position: LogFilePosition::new(336)
                 }
             ),]
         );
@@ -232,8 +233,8 @@ mod tests {
         let start = RecordId::new(stream_id, SequenceNumber::new(99_998));
         let end = RecordId::new(stream_id, SequenceNumber::new(300_001));
         let location = RecordRangeLocation::new(
-            RecordStartLocation::new(start, 1_599_968),
-            RecordEndLocation::new(end, 32),
+            RecordStartLocation::new(start, LogFilePosition::new(1_599_968)),
+            RecordEndLocation::new(end, LogFilePosition::new(32)),
         )
         .unwrap();
         let actual: Vec<_> = location
@@ -249,15 +250,20 @@ mod tests {
                 (
                     0,
                     LogFileRange::FilePostfix {
-                        start_position: 1_599_968
+                        start_position: LogFilePosition::new(1_599_968)
                     }
                 ),
                 (1, LogFileRange::EntireFile),
                 (2, LogFileRange::EntireFile),
-                (3, LogFileRange::FilePrefix { end_position: 32 }),
+                (
+                    3,
+                    LogFileRange::FilePrefix {
+                        end_position: LogFilePosition::new(32)
+                    }
+                ),
             ]
         );
-        assert_eq!(location.end().position(), 32);
+        assert_eq!(location.end().position(), LogFilePosition::new(32));
         assert_eq!(location.end().log_file_id().file_number().get(), 3);
     }
 
@@ -266,8 +272,8 @@ mod tests {
         let start = RecordId::new(StreamId::MIN, SequenceNumber::new(99_999));
         let end = RecordId::new(StreamId::MIN, SequenceNumber::new(100_000));
         let location = RecordRangeLocation::new(
-            RecordStartLocation::new(start, 1_599_984),
-            RecordEndLocation::new(end, 16),
+            RecordStartLocation::new(start, LogFilePosition::new(1_599_984)),
+            RecordEndLocation::new(end, LogFilePosition::new(16)),
         )
         .unwrap();
         let actual: Vec<_> = location
@@ -280,10 +286,15 @@ mod tests {
                 (
                     0,
                     LogFileRange::FilePostfix {
-                        start_position: 1_599_984
+                        start_position: LogFilePosition::new(1_599_984)
                     }
                 ),
-                (1, LogFileRange::FilePrefix { end_position: 16 }),
+                (
+                    1,
+                    LogFileRange::FilePrefix {
+                        end_position: LogFilePosition::new(16)
+                    }
+                ),
             ]
         );
     }
@@ -297,19 +308,24 @@ mod tests {
                 vec![(
                     0,
                     LogFileRange::FileRange {
-                        start_position: 0,
-                        end_position: 1_600_000,
+                        start_position: LogFilePosition::new(0),
+                        end_position: LogFilePosition::new(1_600_000),
                     },
                 )],
             ),
             (
                 199_999,
                 vec![
-                    (0, LogFileRange::FilePostfix { start_position: 0 }),
+                    (
+                        0,
+                        LogFileRange::FilePostfix {
+                            start_position: LogFilePosition::new(0),
+                        },
+                    ),
                     (
                         1,
                         LogFileRange::FilePrefix {
-                            end_position: 1_600_000,
+                            end_position: LogFilePosition::new(1_600_000),
                         },
                     ),
                 ],
@@ -317,8 +333,8 @@ mod tests {
         ] {
             let end = RecordId::new(StreamId::MIN, SequenceNumber::new(last_sequence));
             let location = RecordRangeLocation::new(
-                RecordStartLocation::new(start, 0),
-                RecordEndLocation::new(end, 1_600_000),
+                RecordStartLocation::new(start, LogFilePosition::new(0)),
+                RecordEndLocation::new(end, LogFilePosition::new(1_600_000)),
             )
             .unwrap();
             let actual: Vec<_> = location
@@ -337,8 +353,8 @@ mod tests {
         );
         let end = RecordId::new(StreamId::MAX, SequenceNumber::MAX);
         let location = RecordRangeLocation::new(
-            RecordStartLocation::new(start, 1_599_984),
-            RecordEndLocation::new(end, 825_856),
+            RecordStartLocation::new(start, LogFilePosition::new(1_599_984)),
+            RecordEndLocation::new(end, LogFilePosition::new(825_856)),
         )
         .unwrap();
         let mut iter = location.iter();
@@ -351,7 +367,7 @@ mod tests {
             Some((
                 LogFileId::new(StreamId::MAX, LogFileNumber::MAX),
                 LogFileRange::FilePrefix {
-                    end_position: 825_856
+                    end_position: LogFilePosition::new(825_856)
                 }
             ))
         );
@@ -370,8 +386,8 @@ mod tests {
         let start = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
         let end = RecordId::new(StreamId::MIN, SequenceNumber::MAX);
         let location = RecordRangeLocation::new(
-            RecordStartLocation::new(start, 0),
-            RecordEndLocation::new(end, 825_856),
+            RecordStartLocation::new(start, LogFilePosition::new(0)),
+            RecordEndLocation::new(end, LogFilePosition::new(825_856)),
         )
         .unwrap();
         // There are 184,467,440,737,096 files in the assigned range. Constructing
@@ -384,7 +400,12 @@ mod tests {
         assert_eq!(
             first_three,
             [
-                (0, LogFileRange::FilePostfix { start_position: 0 }),
+                (
+                    0,
+                    LogFileRange::FilePostfix {
+                        start_position: LogFilePosition::new(0)
+                    }
+                ),
                 (1, LogFileRange::EntireFile),
                 (2, LogFileRange::EntireFile),
             ]
@@ -401,8 +422,8 @@ mod tests {
         let other_stream = RecordId::new(StreamId::MAX, SequenceNumber::new(20));
         assert_eq!(
             RecordRangeLocation::new(
-                RecordStartLocation::new(start, 320),
-                RecordEndLocation::new(other_stream, 336),
+                RecordStartLocation::new(start, LogFilePosition::new(320)),
+                RecordEndLocation::new(other_stream, LogFilePosition::new(336)),
             )
             .unwrap_err(),
             RecordRangeLocationError::DifferentStreams {
@@ -413,8 +434,8 @@ mod tests {
         let earlier = RecordId::new(StreamId::MIN, SequenceNumber::new(19));
         assert_eq!(
             RecordRangeLocation::new(
-                RecordStartLocation::new(start, 320),
-                RecordEndLocation::new(earlier, 336),
+                RecordStartLocation::new(start, LogFilePosition::new(320)),
+                RecordEndLocation::new(earlier, LogFilePosition::new(336)),
             )
             .unwrap_err(),
             RecordRangeLocationError::ReversedRecords {
@@ -427,8 +448,8 @@ mod tests {
         let last = RecordId::new(StreamId::MIN, SequenceNumber::new(99_999));
         assert!(matches!(
             RecordRangeLocation::new(
-                RecordStartLocation::new(first, 0),
-                RecordEndLocation::new(last, 1_600_000),
+                RecordStartLocation::new(first, LogFilePosition::new(0)),
+                RecordEndLocation::new(last, LogFilePosition::new(1_600_000)),
             ),
             Err(RecordRangeLocationError::ReversedRecords { .. })
         ));
@@ -440,28 +461,28 @@ mod tests {
         for (start, end) in [(0, 0), (16, 16), (32, 16), (u64::MAX, 16)] {
             assert_eq!(
                 RecordRangeLocation::new(
-                    RecordStartLocation::new(id, start),
-                    RecordEndLocation::new(id, end),
+                    RecordStartLocation::new(id, LogFilePosition::new(start)),
+                    RecordEndLocation::new(id, LogFilePosition::new(end)),
                 )
                 .unwrap_err(),
                 RecordRangeLocationError::InvalidByteSpan {
                     log_file_id: LogFileId::new(StreamId::MIN, LogFileNumber::MIN),
-                    start_position: start,
-                    end_position: end,
+                    start_position: LogFilePosition::new(start),
+                    end_position: LogFilePosition::new(end),
                 }
             );
         }
         let later = RecordId::new(StreamId::MIN, SequenceNumber::new(100_000));
         assert_eq!(
             RecordRangeLocation::new(
-                RecordStartLocation::new(id, 0),
-                RecordEndLocation::new(later, 0),
+                RecordStartLocation::new(id, LogFilePosition::new(0)),
+                RecordEndLocation::new(later, LogFilePosition::new(0)),
             )
             .unwrap_err(),
             RecordRangeLocationError::InvalidByteSpan {
                 log_file_id: LogFileId::new(StreamId::MIN, LogFileNumber::new(1).unwrap()),
-                start_position: 0,
-                end_position: 0,
+                start_position: LogFilePosition::new(0),
+                end_position: LogFilePosition::new(0),
             }
         );
     }

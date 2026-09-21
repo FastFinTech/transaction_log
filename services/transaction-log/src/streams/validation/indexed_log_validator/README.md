@@ -57,6 +57,14 @@ records. Passing the newly discovered final endpoint as the trusted boundary wou
 incorrectly require the existing index to certify records that still need indexing.
 An empty suffix still removes obsolete index entries after the trusted boundary.
 
+The suffix is borrowed directly as `&[LogFilePosition]`; the combined validator
+does not copy or convert it. Trusted and returned endpoints retain their typed
+log positions. For partial handover, the accepted log end defaults to
+`LogFilePosition::START` for an empty file and is unwrapped only at the seek call.
+The index cursor remains a `u64` byte address derived from its entry count and
+entry width; it is not a log-file position. Index encoding and recovery behavior
+are unchanged by these types.
+
 ## Operation and result
 
 1. Borrow `StorageProvider` to open the existing log with read/write access, then

@@ -281,7 +281,7 @@ mod tests {
         },
         streams::{
             IndexFileValidationError, IndexedLogValidationError, LogFileId, LogFileNumber,
-            LogFileValidationError, RecordEndLocation, StreamCheckpoint,
+            LogFilePosition, LogFileValidationError, RecordEndLocation, StreamCheckpoint,
         },
     };
 
@@ -373,7 +373,7 @@ mod tests {
                 state.checkpoint,
                 Some(StreamCheckpoint::new(RecordEndLocation::new(
                     RecordId::new(stream_id, SequenceNumber::new(sequence)),
-                    position,
+                    LogFilePosition::new(position),
                 ))),
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), json);
@@ -397,7 +397,7 @@ mod tests {
         let mut state = InitializationState::new(stream_id, provider);
         let previous = Some(StreamCheckpoint::new(RecordEndLocation::new(
             RecordId::new(stream_id, SequenceNumber::new(0)),
-            16,
+            LogFilePosition::new(16),
         )));
         state.checkpoint = previous;
 
@@ -425,7 +425,7 @@ mod tests {
         let mut state = InitializationState::new(stream_id, provider);
         let previous = Some(StreamCheckpoint::new(RecordEndLocation::new(
             RecordId::new(stream_id, SequenceNumber::new(0)),
-            16,
+            LogFilePosition::new(16),
         )));
         state.checkpoint = previous;
 
@@ -449,7 +449,7 @@ mod tests {
         let mut state = InitializationState::new(stream_id, provider);
         let previous = Some(StreamCheckpoint::new(RecordEndLocation::new(
             RecordId::new(stream_id, SequenceNumber::new(0)),
-            16,
+            LogFilePosition::new(16),
         )));
         state.checkpoint = previous;
 
@@ -540,7 +540,7 @@ mod tests {
             fs::write(&path, b"").unwrap();
             let checkpoint = StreamCheckpoint::new(RecordEndLocation::new(
                 RecordId::new(stream_id, SequenceNumber::new(200_000)),
-                16,
+                LogFilePosition::new(16),
             ));
             let mut state = InitializationState::new(stream_id, provider);
             state.checkpoint = Some(checkpoint);
@@ -568,7 +568,7 @@ mod tests {
                 LogFileId::new(stream_id, LogFileNumber::new(checkpoint_number).unwrap());
             let checkpoint = StreamCheckpoint::new(RecordEndLocation::new(
                 checkpoint_file.first_record_id(),
-                16,
+                LogFilePosition::new(16),
             ));
             if let Some(number) = maximum_number {
                 let path = provider.log_file_path(LogFileId::new(
@@ -678,8 +678,12 @@ mod tests {
 
             state.validate_files().await.unwrap();
 
-            let end = (!log.is_empty())
-                .then(|| RecordEndLocation::new(file_id(stream_id, 0).first_record_id(), 16));
+            let end = (!log.is_empty()).then(|| {
+                RecordEndLocation::new(
+                    file_id(stream_id, 0).first_record_id(),
+                    LogFilePosition::new(16),
+                )
+            });
             assert_eq!(state.recovered_end, end);
             assert_eq!(state.first_file_to_remove, Some(file_id(stream_id, 1)));
             let mut pair = state.active_pair.take().unwrap();
@@ -687,7 +691,8 @@ mod tests {
             assert_eq!(pair.end(), end);
             assert_eq!(
                 pair.log.stream_position().await.unwrap(),
-                end.map_or(0, |end| end.position())
+                end.map_or(LogFilePosition::START, |end| end.position())
+                    .get()
             );
             assert_eq!(
                 pair.index.stream_position().await.unwrap(),
@@ -742,9 +747,15 @@ mod tests {
             state.validate_files().await.unwrap();
 
             let expected_end = if tail.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
-                RecordEndLocation::new(file_id(stream_id, 2).first_record_id(), 16)
+                RecordEndLocation::new(
+                    file_id(stream_id, 2).first_record_id(),
+                    LogFilePosition::new(16),
+                )
             } else {
-                RecordEndLocation::new(file_id(stream_id, 1).last_record_id(), 1_600_000)
+                RecordEndLocation::new(
+                    file_id(stream_id, 1).last_record_id(),
+                    LogFilePosition::new(1_600_000),
+                )
             };
             assert_eq!(state.recovered_end, Some(expected_end));
             assert_eq!(state.first_file_to_remove, None);
@@ -787,13 +798,16 @@ mod tests {
             &[first, second].concat(),
             Some(&16_u64.to_le_bytes()),
         );
-        let trusted = RecordEndLocation::new(file_id(stream_id, 0).first_record_id(), 16);
+        let trusted = RecordEndLocation::new(
+            file_id(stream_id, 0).first_record_id(),
+            LogFilePosition::new(16),
+        );
         let checkpoint_bytes = store_checkpoint(storage, trusted);
         let mut state = validation_state(stream_id, storage).await;
 
         state.validate_files().await.unwrap();
 
-        let expected = RecordEndLocation::new(trusted.record_id().next(), 35);
+        let expected = RecordEndLocation::new(trusted.record_id().next(), LogFilePosition::new(35));
         assert_eq!(state.recovered_end, Some(expected));
         assert_eq!(state.active_pair.as_ref().unwrap().end(), Some(expected));
         assert_eq!(state.checkpoint.unwrap().end(), trusted);
@@ -829,7 +843,10 @@ mod tests {
             &trusted_log,
             Some(&trusted_index),
         );
-        let trusted = RecordEndLocation::new(file_id(stream_id, 1).last_record_id(), 1_600_000);
+        let trusted = RecordEndLocation::new(
+            file_id(stream_id, 1).last_record_id(),
+            LogFilePosition::new(1_600_000),
+        );
         let checkpoint_bytes = store_checkpoint(storage, trusted);
         let next_log = encoded_records(file_id(stream_id, 2), 0..1).await;
         store_pair(storage, file_id(stream_id, 2), &next_log, None);
@@ -841,7 +858,7 @@ mod tests {
             state.recovered_end,
             Some(RecordEndLocation::new(
                 file_id(stream_id, 2).first_record_id(),
-                16
+                LogFilePosition::new(16)
             ))
         );
         assert_eq!(
@@ -902,7 +919,7 @@ mod tests {
                 state.recovered_end,
                 (gap == file_id(stream_id, 1)).then(|| RecordEndLocation::new(
                     file_id(stream_id, 0).last_record_id(),
-                    1_600_000
+                    LogFilePosition::new(1_600_000)
                 ))
             );
             assert!(!storage.log_file_path(gap).exists());
@@ -932,7 +949,10 @@ mod tests {
             b"orphan index",
         )
         .unwrap();
-        let trusted = RecordEndLocation::new(file_id(stream_id, 1).first_record_id(), 16);
+        let trusted = RecordEndLocation::new(
+            file_id(stream_id, 1).first_record_id(),
+            LogFilePosition::new(16),
+        );
         let checkpoint_bytes = store_checkpoint(storage, trusted);
         let mut state = validation_state(stream_id, storage).await;
 
@@ -969,7 +989,7 @@ mod tests {
             store_pair(storage, file_id(stream_id, 1), b"future log", None);
             let trusted = RecordEndLocation::new(
                 file_id(stream_id, 0).first_record_id(),
-                if invalid_log { 17 } else { 16 },
+                LogFilePosition::new(if invalid_log { 17 } else { 16 }),
             );
             let checkpoint_bytes = store_checkpoint(storage, trusted);
             let mut state = validation_state(stream_id, storage).await;
@@ -1023,7 +1043,7 @@ mod tests {
             state.recovered_end,
             Some(RecordEndLocation::new(
                 file_id(stream_id, 0).last_record_id(),
-                1_600_000
+                LogFilePosition::new(1_600_000)
             ))
         );
         assert_eq!(state.first_file_to_remove, None);
@@ -1086,7 +1106,7 @@ mod tests {
             state.recovered_end,
             Some(RecordEndLocation::new(
                 file_id(stream_id, 0).first_record_id(),
-                16
+                LogFilePosition::new(16)
             ))
         );
         assert!(!storage.checkpoint_file_path(state.stream_id).exists());
@@ -1107,7 +1127,7 @@ mod tests {
         let active = file_id(stream_id, 999);
         let active_log = encoded_records(active, 0..1).await;
         store_pair(storage, active, &active_log, Some(&16_u64.to_le_bytes()));
-        let trusted = RecordEndLocation::new(active.first_record_id(), 16);
+        let trusted = RecordEndLocation::new(active.first_record_id(), LogFilePosition::new(16));
         let checkpoint_bytes = store_checkpoint(storage, trusted);
         // Cross a range-directory boundary; include log-only, index-only and absent pairs.
         store_pair(storage, file_id(stream_id, 1000), b"log only", None);
@@ -1226,7 +1246,7 @@ mod tests {
             state.recovered_end,
             Some(RecordEndLocation::new(
                 file_id(stream_id, 0).last_record_id(),
-                1_600_000
+                LogFilePosition::new(1_600_000)
             ))
         );
         assert!(state.active_pair.is_none());
@@ -1246,7 +1266,10 @@ mod tests {
                 &first,
                 Some(&16_u64.to_le_bytes()),
             );
-            let trusted = RecordEndLocation::new(file_id(stream_id, 0).first_record_id(), 16);
+            let trusted = RecordEndLocation::new(
+                file_id(stream_id, 0).first_record_id(),
+                LogFilePosition::new(16),
+            );
             let checkpoint_bytes = store_checkpoint(storage, trusted);
             for number in 1..=3 {
                 store_pair(
@@ -1379,8 +1402,9 @@ mod tests {
             let mut state = validation_state(stream_id, storage).await;
             state.validate_files().await.unwrap();
             state.remove_later_files().await.unwrap();
-            let expected_end =
-                has_records.then(|| RecordEndLocation::new(active_id.first_record_id(), 16));
+            let expected_end = has_records.then(|| {
+                RecordEndLocation::new(active_id.first_record_id(), LogFilePosition::new(16))
+            });
             let index_bytes = if has_records {
                 16_u64.to_le_bytes().to_vec()
             } else {
@@ -1428,7 +1452,10 @@ mod tests {
                 .flat_map(|count| (count * 16).to_le_bytes())
                 .collect();
             store_pair(storage, complete_id, &log_bytes, Some(&index_bytes));
-            let trusted = RecordEndLocation::new(complete_id.last_record_id(), 1_600_000);
+            let trusted = RecordEndLocation::new(
+                complete_id.last_record_id(),
+                LogFilePosition::new(1_600_000),
+            );
             let checkpoint_bytes = store_checkpoint(storage, trusted);
             let active_id = complete_id.next();
             let maximum = if has_gap {
@@ -1546,7 +1573,10 @@ mod tests {
             let mut accepted_log = record_fixture(stream_id, FIRST);
             if has_checkpoint {
                 accepted_log.extend(record_fixture(stream_id, SECOND));
-                store_checkpoint(storage, RecordEndLocation::new(id.first_record_id(), 16));
+                store_checkpoint(
+                    storage,
+                    RecordEndLocation::new(id.first_record_id(), LogFilePosition::new(16)),
+                );
             }
             let mut corrupt_log = accepted_log.clone();
             corrupt_log.extend([3, 0, 0]);
@@ -1559,7 +1589,7 @@ mod tests {
             store_pair(storage, id.next(), b"discard", Some(b"discard"));
             let end = RecordEndLocation::new(
                 RecordId::new(stream_id, SequenceNumber::new(u64::from(has_checkpoint))),
-                if has_checkpoint { 35 } else { 16 },
+                LogFilePosition::new(if has_checkpoint { 35 } else { 16 }),
             );
             let expected_index: Vec<u8> = if has_checkpoint {
                 vec![16_u64, 35]
@@ -1578,7 +1608,7 @@ mod tests {
             assert_eq!(initialized.end(), Some(end));
             assert_eq!(
                 initialized.log.stream_position().await.unwrap(),
-                end.position()
+                end.position().get()
             );
             assert_eq!(
                 initialized.index.stream_position().await.unwrap(),
@@ -1610,7 +1640,7 @@ mod tests {
         let storage = fixture.provider();
         let stream_id = fixture.stream_id();
         let id = LogFileId::first(stream_id);
-        let end = RecordEndLocation::new(id.first_record_id(), 16);
+        let end = RecordEndLocation::new(id.first_record_id(), LogFilePosition::new(16));
         store_pair(
             storage,
             id,
@@ -1646,7 +1676,7 @@ mod tests {
             store_pair(storage, complete, &log, Some(&16_u64.to_le_bytes()));
             store_checkpoint(
                 storage,
-                RecordEndLocation::new(complete.first_record_id(), 16),
+                RecordEndLocation::new(complete.first_record_id(), LogFilePosition::new(16)),
             );
             let active = complete.next();
             match successor {
@@ -1657,7 +1687,8 @@ mod tests {
                 }
                 _ => {}
             }
-            let end = RecordEndLocation::new(complete.last_record_id(), 1_600_000);
+            let end =
+                RecordEndLocation::new(complete.last_record_id(), LogFilePosition::new(1_600_000));
 
             let mut initialized = StreamInitializer::initialize(stream_id, storage)
                 .await
@@ -1690,7 +1721,7 @@ mod tests {
             store_pair(storage, complete, &log, Some(&16_u64.to_le_bytes()));
             let original = store_checkpoint(
                 storage,
-                RecordEndLocation::new(complete.first_record_id(), 16),
+                RecordEndLocation::new(complete.first_record_id(), LogFilePosition::new(16)),
             );
             let active = complete.next();
             let checkpoint_path = storage.checkpoint_file_path(stream_id);
@@ -1714,7 +1745,10 @@ mod tests {
                 assert!(!storage.log_file_path(active).exists());
                 assert!(!storage.index_file_path(active).exists());
             } else {
-                let end = RecordEndLocation::new(complete.last_record_id(), 1_600_000);
+                let end = RecordEndLocation::new(
+                    complete.last_record_id(),
+                    LogFilePosition::new(1_600_000),
+                );
                 assert_eq!(
                     storage.read_checkpoint(stream_id).await.unwrap(),
                     Some(StreamCheckpoint::new(end))
@@ -1734,7 +1768,10 @@ mod tests {
         let mut log = record_fixture(stream_id, FIRST);
         log.extend(record_fixture(stream_id, SECOND));
         store_pair(storage, id, &log, Some(&16_u64.to_le_bytes()));
-        let original = store_checkpoint(storage, RecordEndLocation::new(id.first_record_id(), 16));
+        let original = store_checkpoint(
+            storage,
+            RecordEndLocation::new(id.first_record_id(), LogFilePosition::new(16)),
+        );
         let blocked_path = storage.log_file_path(id.next());
         fs::create_dir(&blocked_path).unwrap();
         store_pair(storage, id.next().next(), b"discard later", None);

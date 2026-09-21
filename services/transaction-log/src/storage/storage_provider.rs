@@ -1735,7 +1735,7 @@ mod checkpoint_tests {
             checkpoint.end().record_id().sequence_number().get(),
             u64::MAX
         );
-        assert_eq!(checkpoint.end().position(), 3_382_654_560);
+        assert_eq!(checkpoint.end().position().get(), 3_382_654_560);
         bytes.push(b' ');
         fs::write(&path, &bytes).unwrap();
         assert!(matches!(provider.read_checkpoint(stream_id).await,

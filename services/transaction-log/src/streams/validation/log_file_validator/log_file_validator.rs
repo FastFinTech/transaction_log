@@ -1,15 +1,12 @@
 use std::io::SeekFrom;
 
 use tokio::io::{AsyncRead, AsyncSeekExt};
-use transaction_log_exports::{
-    RecordReadError, RecordReader,
-    record::record_protocol::{MAX_RECORD_LEN, MIN_RECORD_LEN},
-};
+use transaction_log_exports::{RecordLength, RecordReadError, RecordReader};
 
 use super::{LogFileValidationError as Error, ValidatedLogFile};
 use crate::streams::{
-    LogFileId, LogTailError, RECORDS_PER_FILE, RecordEndLocation, RecordStartLocation,
-    ValidationFile,
+    LogFileId, LogFilePosition, LogTailError, RECORDS_PER_FILE, RecordEndLocation,
+    RecordStartLocation, ValidationFile,
 };
 
 /// Startup validation and tail recovery for an exclusively owned log file.
@@ -55,24 +52,25 @@ impl LogFileValidator {
                 "trusted endpoint belongs to another file",
             ));
         }
-        let file_length = file.length().await?;
-        let start_position = last_trusted.map_or(0, |end| end.position());
+        let file_end = LogFilePosition::new(file.length().await?);
+        let start_position = last_trusted.map_or(LogFilePosition::START, |end| end.position());
         let trusted_count =
             last_trusted.map_or(0, |end| LogFileId::record_count_through(end.record_id()));
-        if start_position > file_length
-            || start_position < trusted_count * MIN_RECORD_LEN as u64
-            || start_position > trusted_count * MAX_RECORD_LEN as u64
-        {
+        let possible_positions = LogFilePosition::new(trusted_count * RecordLength::MIN.get())
+            ..=LogFilePosition::new(trusted_count * RecordLength::MAX.get());
+        if start_position > file_end || !possible_positions.contains(&start_position) {
             return Err(Error::InvalidStart(
                 "position is outside the possible trusted record extent",
             ));
         }
 
-        file.seek(SeekFrom::Start(start_position)).await?;
-        let scan_results = scan_records(&mut file, file_id, last_trusted, file_length).await?;
+        file.seek(SeekFrom::Start(start_position.get())).await?;
+        let scan_results = scan_records(&mut file, file_id, last_trusted, file_end).await?;
         if scan_results.tail_error.is_some() {
-            let valid_length = scan_results.validated_end.map_or(0, |end| end.position());
-            file.set_len(valid_length).await?;
+            let valid_end = scan_results
+                .validated_end
+                .map_or(LogFilePosition::START, |end| end.position());
+            file.set_len(valid_end.get()).await?;
         }
         file.sync_data().await?;
         Ok(ValidatedLogFile {
@@ -89,7 +87,7 @@ struct LogScanResult {
     /// Last accepted record, retaining the trusted endpoint if no new record passed.
     validated_end: Option<RecordEndLocation>,
     /// Absolute exclusive ends of newly accepted records only, in file order.
-    suffix_ends: Vec<u64>,
+    suffix_ends: Vec<LogFilePosition>,
     /// First content violation, or `None` when the file ends at the accepted boundary.
     tail_error: Option<LogTailError>,
 }
@@ -97,14 +95,14 @@ struct LogScanResult {
 /// Determines the accepted endpoint, suffix offsets and complete tail diagnosis.
 ///
 /// The caller establishes a valid trusted boundary and positions the source there.
-/// `file_length` is the entire file's byte length, not the source's remaining length.
+/// `file_end` is the whole file's exclusive EOF position, including the trusted prefix.
 /// It lets the scanner diagnose bytes beyond the record cap without an EOF probe.
 /// An operational error drops partial findings instead of returning a scan result.
 async fn scan_records<R: AsyncRead + Unpin>(
     source: R,
     file_id: LogFileId,
     last_trusted: Option<RecordEndLocation>,
-    file_length: u64,
+    file_end: LogFilePosition,
 ) -> Result<LogScanResult, Error> {
     if let Some(end) = last_trusted {
         assert_eq!(
@@ -119,8 +117,8 @@ async fn scan_records<R: AsyncRead + Unpin>(
     let mut suffix_ends = Vec::new();
     let tail_error = 'scan: loop {
         if count == RECORDS_PER_FILE {
-            let position = validated_end.map_or(0, |end| end.position());
-            break (position < file_length).then_some(LogTailError::ExtraData);
+            let end = validated_end.expect("a full log file has a last accepted record");
+            break (end.position() < file_end).then_some(LogTailError::ExtraData);
         }
         // Keep this exhaustive: a new reader error must get an explicit recovery
         // policy rather than accidentally authorizing deletion after an I/O failure.
@@ -142,9 +140,11 @@ async fn scan_records<R: AsyncRead + Unpin>(
             let Some(record) = reader.try_read_next().map_err(Error::Read)? else {
                 break;
             };
+            // The count guard keeps the next record in this file, so its start
+            // needs no file-rotation calculation. The trusted file ID was checked above.
             let start = validated_end.map_or_else(
-                || RecordStartLocation::new(file_id.first_record_id(), 0),
-                RecordEndLocation::next_record_start,
+                || RecordStartLocation::new(file_id.first_record_id(), LogFilePosition::START),
+                |end| RecordStartLocation::new(end.record_id().next(), end.position()),
             );
             if record.id() != start.record_id() {
                 break 'scan Some(LogTailError::UnexpectedRecordId {
@@ -205,7 +205,11 @@ mod tests {
     }
 
     fn end(sequence: u64, position: u64) -> RecordEndLocation {
-        RecordEndLocation::new(id(7, sequence), position)
+        RecordEndLocation::new(id(7, sequence), LogFilePosition::new(position))
+    }
+
+    fn positions(values: &[u64]) -> Vec<LogFilePosition> {
+        values.iter().copied().map(LogFilePosition::new).collect()
     }
 
     fn file_id() -> LogFileId {
@@ -240,19 +244,26 @@ mod tests {
     async fn scan_returns_complete_findings_for_empty_clean_and_trusted_inputs() {
         let bytes = [FIRST, SECOND, THIRD].concat();
         for (last_trusted, start, expected_ends) in [
-            (None, 0, vec![16, 35, 52]),
-            (Some(end(0, 16)), 16, vec![35, 52]),
-            (Some(end(1, 35)), 35, vec![52]),
+            (None, 0, positions(&[16, 35, 52])),
+            (Some(end(0, 16)), 16, positions(&[35, 52])),
+            (Some(end(1, 35)), 35, positions(&[52])),
             (Some(end(2, 52)), 52, vec![]),
         ] {
-            let scan = scan_records(&bytes[start..], file_id(), last_trusted, 52)
-                .await
-                .unwrap();
+            let scan = scan_records(
+                &bytes[start..],
+                file_id(),
+                last_trusted,
+                LogFilePosition::new(52),
+            )
+            .await
+            .unwrap();
             assert_eq!(scan.validated_end, Some(end(2, 52)));
             assert_eq!(scan.suffix_ends, expected_ends);
             assert!(scan.tail_error.is_none());
         }
-        let scan = scan_records(&[][..], file_id(), None, 0).await.unwrap();
+        let scan = scan_records(&[][..], file_id(), None, LogFilePosition::START)
+            .await
+            .unwrap();
         assert_eq!(scan.validated_end, None);
         assert!(scan.suffix_ends.is_empty());
         assert!(scan.tail_error.is_none());
@@ -263,18 +274,24 @@ mod tests {
         for last_trusted in [None, Some(end(0, 16))] {
             for length in 1..SECOND.len() {
                 let bytes = [FIRST, &SECOND[..length]].concat();
-                let start = last_trusted.map_or(0, |end| end.position()) as usize;
-                let scan =
-                    scan_records(&bytes[start..], file_id(), last_trusted, bytes.len() as u64)
-                        .await
-                        .unwrap();
+                let start = last_trusted
+                    .map_or(LogFilePosition::START, |end| end.position())
+                    .get() as usize;
+                let scan = scan_records(
+                    &bytes[start..],
+                    file_id(),
+                    last_trusted,
+                    LogFilePosition::new(bytes.len() as u64),
+                )
+                .await
+                .unwrap();
                 assert_eq!(scan.validated_end, Some(end(0, 16)));
                 assert_eq!(
                     scan.suffix_ends,
                     if last_trusted.is_some() {
                         vec![]
                     } else {
-                        vec![16]
+                        positions(&[16])
                     }
                 );
                 if length < 12 {
@@ -301,11 +318,16 @@ mod tests {
         let mut corrupt_second = SECOND.to_vec();
         corrupt_second[12] ^= 1;
         let bytes = [FIRST, &corrupt_second, THIRD].concat();
-        let scan = scan_records(bytes.as_slice(), file_id(), None, bytes.len() as u64)
-            .await
-            .unwrap();
+        let scan = scan_records(
+            bytes.as_slice(),
+            file_id(),
+            None,
+            LogFilePosition::new(bytes.len() as u64),
+        )
+        .await
+        .unwrap();
         assert_eq!(scan.validated_end, Some(end(0, 16)));
-        assert_eq!(scan.suffix_ends, [16]);
+        assert_eq!(scan.suffix_ends, positions(&[16]));
         assert!(matches!(
             scan.tail_error,
             Some(LogTailError::Record(RecordReadError::CrcMismatch { .. }))
@@ -318,11 +340,16 @@ mod tests {
             (encoded(8, 1, 1).await, id(8, 1)),
         ] {
             let bytes = [FIRST, &offending, &corrupt_second].concat();
-            let scan = scan_records(bytes.as_slice(), file_id(), None, bytes.len() as u64)
-                .await
-                .unwrap();
+            let scan = scan_records(
+                bytes.as_slice(),
+                file_id(),
+                None,
+                LogFilePosition::new(bytes.len() as u64),
+            )
+            .await
+            .unwrap();
             assert_eq!(scan.validated_end, Some(end(0, 16)));
-            assert_eq!(scan.suffix_ends, [16]);
+            assert_eq!(scan.suffix_ends, positions(&[16]));
             assert!(matches!(scan.tail_error,
                 Some(LogTailError::UnexpectedRecordId { expected, actual: found })
                 if expected == id(7, 1) && found == actual));
@@ -336,9 +363,14 @@ mod tests {
         let mut invalid_stream = FIRST.to_vec();
         invalid_stream[2..4].copy_from_slice(&4096u16.to_le_bytes());
         for (bytes, length_error) in [(invalid_length, true), (invalid_stream, false)] {
-            let scan = scan_records(bytes.as_slice(), file_id(), None, bytes.len() as u64)
-                .await
-                .unwrap();
+            let scan = scan_records(
+                bytes.as_slice(),
+                file_id(),
+                None,
+                LogFilePosition::new(bytes.len() as u64),
+            )
+            .await
+            .unwrap();
             assert_eq!(scan.validated_end, None);
             assert!(scan.suffix_ends.is_empty());
             if length_error {
@@ -373,7 +405,13 @@ mod tests {
     async fn operational_read_errors_return_no_scan_result_even_after_valid_records() {
         for prefix in [vec![], [FIRST, SECOND].concat()] {
             let source = prefix.as_slice().chain(ReadFailure);
-            let result = scan_records(source, file_id(), None, prefix.len() as u64 + 1).await;
+            let result = scan_records(
+                source,
+                file_id(),
+                None,
+                LogFilePosition::new(prefix.len() as u64 + 1),
+            )
+            .await;
             assert!(matches!(result,
                 Err(Error::Read(RecordReadError::Io(error))) if error.raw_os_error() == Some(123)));
         }
@@ -388,7 +426,7 @@ mod tests {
                 ReadFailure,
                 file_id(),
                 Some(trusted),
-                trusted.position() + extra,
+                LogFilePosition::new(trusted.position().get() + extra),
             )
             .await
             .unwrap();
@@ -409,13 +447,20 @@ mod tests {
         let expected_end = end(199_999, 1_600_000);
         for extra in [vec![], vec![0xaa], encoded(7, 200_000, 1).await] {
             let bytes = [records.as_slice(), &extra].concat();
-            let scan = scan_records(bytes.as_slice(), file_id, None, bytes.len() as u64)
-                .await
-                .unwrap();
+            let scan = scan_records(
+                bytes.as_slice(),
+                file_id,
+                None,
+                LogFilePosition::new(bytes.len() as u64),
+            )
+            .await
+            .unwrap();
             assert_eq!(scan.validated_end, Some(expected_end));
             assert_eq!(
                 scan.suffix_ends,
-                (1..=RECORDS_PER_FILE).map(|n| n * 16).collect::<Vec<_>>()
+                (1..=RECORDS_PER_FILE)
+                    .map(|n| LogFilePosition::new(n * 16))
+                    .collect::<Vec<_>>()
             );
             if extra.is_empty() {
                 assert!(scan.tail_error.is_none());
@@ -427,12 +472,12 @@ mod tests {
                 &bytes[1_599_984..],
                 file_id,
                 Some(trusted),
-                bytes.len() as u64,
+                LogFilePosition::new(bytes.len() as u64),
             )
             .await
             .unwrap();
             assert_eq!(scan.validated_end, Some(expected_end));
-            assert_eq!(scan.suffix_ends, [1_600_000]);
+            assert_eq!(scan.suffix_ends, positions(&[1_600_000]));
             assert_eq!(scan.tail_error.is_some(), !extra.is_empty());
         }
     }
@@ -469,11 +514,16 @@ mod tests {
                 bytes: &bytes,
                 chunk_size,
             };
-            let scan = scan_records(source, file_id(), None, bytes.len() as u64)
-                .await
-                .unwrap();
+            let scan = scan_records(
+                source,
+                file_id(),
+                None,
+                LogFilePosition::new(bytes.len() as u64),
+            )
+            .await
+            .unwrap();
             assert_eq!(scan.validated_end, Some(end(1, 35)));
-            assert_eq!(scan.suffix_ends, [16, 35]);
+            assert_eq!(scan.suffix_ends, positions(&[16, 35]));
             assert!(matches!(
                 scan.tail_error,
                 Some(LogTailError::Record(RecordReadError::CrcMismatch { .. }))
@@ -490,7 +540,7 @@ mod tests {
                 None,
                 [FIRST, SECOND, THIRD].concat(),
                 Some(end(2, 52)),
-                vec![16, 35, 52],
+                positions(&[16, 35, 52]),
                 false,
             ),
             (
@@ -498,7 +548,7 @@ mod tests {
                 Some(end(0, 16)),
                 [FIRST, SECOND].concat(),
                 Some(end(1, 35)),
-                vec![35],
+                positions(&[35]),
                 true,
             ),
             (
@@ -516,7 +566,7 @@ mod tests {
                 Some(end(0, 16)),
                 [&[0; 16][..], SECOND].concat(),
                 Some(end(1, 35)),
-                vec![35],
+                positions(&[35]),
                 false,
             ),
         ] {
@@ -541,7 +591,7 @@ mod tests {
             (
                 "wrong stream",
                 FIRST.to_vec(),
-                RecordEndLocation::new(id(8, 0), 16),
+                RecordEndLocation::new(id(8, 0), LogFilePosition::new(16)),
             ),
             ("wrong file", FIRST.to_vec(), end(100_000, 16)),
             ("empty file", vec![], end(0, 16)),
@@ -716,7 +766,9 @@ mod tests {
                 assert_eq!(result.validated_end(), Some(final_end));
                 let first_new_count =
                     trusted.map_or(1, |end| end.record_id().sequence_number().get() + 2);
-                let expected_ends: Vec<_> = (first_new_count..=100_000).map(|n| n * 16).collect();
+                let expected_ends: Vec<_> = (first_new_count..=100_000)
+                    .map(|n| LogFilePosition::new(n * 16))
+                    .collect();
                 assert_eq!(result.suffix_ends(), expected_ends);
                 if extra.is_empty() {
                     assert!(result.removed_tail().is_none());
@@ -768,7 +820,7 @@ mod tests {
                     result.validated_end(),
                     Some(end(final_sequence, retained_length))
                 );
-                assert_eq!(result.suffix_ends(), expected_ends);
+                assert_eq!(result.suffix_ends(), positions(expected_ends));
                 if removed_bytes == 0 {
                     assert!(result.removed_tail().is_none());
                 } else {
@@ -815,7 +867,12 @@ mod tests {
     #[test]
     fn cancelled_scan_cannot_return_its_partial_findings() {
         let source = FIRST.chain(PendingReader);
-        let mut future = Box::pin(scan_records(source, file_id(), None, 17));
+        let mut future = Box::pin(scan_records(
+            source,
+            file_id(),
+            None,
+            LogFilePosition::new(17),
+        ));
         assert!(
             future
                 .as_mut()

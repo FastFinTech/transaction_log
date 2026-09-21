@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
 
 use super::IndexFileValidationError as Error;
 use crate::streams::{
-    IndexWriter, RECORDS_PER_FILE, RecordEndLocation, ValidationFile,
+    IndexWriter, LogFilePosition, RECORDS_PER_FILE, RecordEndLocation, ValidationFile,
     index_writer::INDEX_ENTRY_LEN, location::LogFileId,
 };
 
@@ -36,7 +36,7 @@ impl IndexFileValidator {
     /// value must equal its byte position. Earlier entries remain caller-certified.
     /// `None` means no trusted prefix, so the entire index is replaced.
     ///
-    /// `suffix_ends` contains the absolute exclusive ends of every consecutive record
+    /// `suffix_ends` contains typed absolute exclusive log ends of every consecutive record
     /// accepted by log validation after that same checkpoint. The caller establishes
     /// their validity; this operation checks only the combined entry count. Existing
     /// suffix bytes are never read or compared. An empty slice removes the suffix.
@@ -50,7 +50,7 @@ impl IndexFileValidator {
     pub async fn validate<F: ValidationFile + AsyncWrite>(
         mut file: F,
         last_trusted: Option<RecordEndLocation>,
-        suffix_ends: &[u64],
+        suffix_ends: &[LogFilePosition],
     ) -> Result<F, Error> {
         let trusted_entry_count =
             last_trusted.map_or(0, |end| LogFileId::record_count_through(end.record_id()));
@@ -91,12 +91,14 @@ impl IndexFileValidator {
 
     /// Reads one zero-based entry selected from a record's position within its file.
     ///
+    /// Decodes the entry into its log-file position. Index-file byte offsets and
+    /// lengths remain raw byte counts; they are not positions in the paired log.
     /// Returns `None` if the file length does not cover the complete entry.
     /// Seeking or reading errors, including a later short read, remain I/O errors.
     async fn read_index_at<F: ValidationFile>(
         file: &mut F,
         entry_index: u64,
-    ) -> Result<Option<u64>, Error> {
+    ) -> Result<Option<LogFilePosition>, Error> {
         let entry_start = entry_index * INDEX_ENTRY_LEN as u64;
         if file.length().await? < entry_start + INDEX_ENTRY_LEN as u64 {
             return Ok(None);
@@ -104,7 +106,7 @@ impl IndexFileValidator {
         file.seek(SeekFrom::Start(entry_start)).await?;
         let mut bytes = [0; INDEX_ENTRY_LEN];
         file.read_exact(&mut bytes).await?;
-        Ok(Some(u64::from_le_bytes(bytes)))
+        Ok(Some(LogFilePosition::new(u64::from_le_bytes(bytes))))
     }
 }
 
@@ -137,8 +139,12 @@ mod tests {
     fn end(sequence: u64, position: u64) -> RecordEndLocation {
         RecordEndLocation::new(
             RecordId::new(StreamId::new(7).unwrap(), SequenceNumber::new(sequence)),
-            position,
+            LogFilePosition::new(position),
         )
+    }
+
+    fn positions(values: &[u64]) -> Vec<LogFilePosition> {
+        values.iter().copied().map(LogFilePosition::new).collect()
     }
 
     async fn open_read_write(path: &Path) -> File {
@@ -163,9 +169,10 @@ mod tests {
         let mut bytes = encoded(&[16, 35, 52, 999]);
         bytes.push(0xaa);
         let (_directory, path, file) = opened_file(&bytes).await;
-        let mut file = IndexFileValidator::validate(file, Some(end(100_002, 52)), &[70])
-            .await
-            .unwrap();
+        let mut file =
+            IndexFileValidator::validate(file, Some(end(100_002, 52)), &positions(&[70]))
+                .await
+                .unwrap();
         let expected = encoded(&[16, 35, 52, 70]);
         assert_eq!(tokio::fs::read(path).await.unwrap(), expected);
         file.seek(SeekFrom::Start(0)).await.unwrap();
@@ -183,12 +190,13 @@ mod tests {
         for (bytes, actual_position) in cases {
             let (_directory, path, file) = opened_file(&bytes).await;
             assert!(matches!(
-                IndexFileValidator::validate(file, Some(end(2, 52)), &[70]).await,
+                IndexFileValidator::validate(file, Some(end(2, 52)), &positions(&[70])).await,
                 Err(Error::TrustedIndexMismatch {
                     entry_index: 2,
-                    expected_position: 52,
+                    expected_position,
                     actual_position: actual,
-                }) if actual == actual_position
+                }) if expected_position == LogFilePosition::new(52)
+                    && actual == actual_position.map(LogFilePosition::new)
             ));
             assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
         }
@@ -235,12 +243,12 @@ mod tests {
             for suffix in &cases {
                 let bytes = [prefix.as_slice(), suffix].concat();
                 let (_directory, path, file) = opened_file(&bytes).await;
-                let file = IndexFileValidator::validate(file, last_trusted, &[35, 52])
+                let file = IndexFileValidator::validate(file, last_trusted, &positions(&[35, 52]))
                     .await
                     .unwrap();
                 assert_eq!(tokio::fs::read(&path).await.unwrap(), expected);
                 // Repeating replacement must never append a second copy.
-                let _file = IndexFileValidator::validate(file, last_trusted, &[35, 52])
+                let _file = IndexFileValidator::validate(file, last_trusted, &positions(&[35, 52]))
                     .await
                     .unwrap();
                 assert_eq!(tokio::fs::read(&path).await.unwrap(), expected);
@@ -253,7 +261,7 @@ mod tests {
         let bytes = encoded(&[16, 35, 99, 101]);
         let (_directory, path, mut file) = opened_file(&bytes).await;
         for ends in [&[52, 70][..], &[88], &[], &[], &[55, 89]] {
-            file = IndexFileValidator::validate(file, Some(end(1, 35)), ends)
+            file = IndexFileValidator::validate(file, Some(end(1, 35)), &positions(ends))
                 .await
                 .unwrap();
             let expected = [encoded(&[16, 35]), encoded(ends)].concat();
@@ -273,9 +281,13 @@ mod tests {
     #[tokio::test]
     async fn replacement_preserves_full_width_offsets_in_little_endian_order() {
         let (_directory, path, file) = opened_file(&[0xaa; 25]).await;
-        let _file = IndexFileValidator::validate(file, None, &[0x0102_0304_0506_0708, u64::MAX])
-            .await
-            .unwrap();
+        let _file = IndexFileValidator::validate(
+            file,
+            None,
+            &positions(&[0x0102_0304_0506_0708, u64::MAX]),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             tokio::fs::read(path).await.unwrap(),
             [
@@ -297,7 +309,7 @@ mod tests {
             let available = (RECORDS_PER_FILE - trusted_count) as usize;
             let ends = vec![32; available + 1];
             assert!(matches!(
-                IndexFileValidator::validate(file, last_trusted, &ends).await,
+                IndexFileValidator::validate(file, last_trusted, &positions(&ends)).await,
                 Err(Error::TooManyEntries {
                     count,
                     maximum: RECORDS_PER_FILE,
@@ -307,7 +319,7 @@ mod tests {
             let _file = IndexFileValidator::validate(
                 open_read_write(&path).await,
                 last_trusted,
-                &ends[..available],
+                &positions(&ends[..available]),
             )
             .await
             .unwrap();
@@ -323,7 +335,7 @@ mod tests {
         let (_directory, path, file) = opened_file(&encoded(&[16, 99])).await;
         drop(file);
         let file = OpenOptions::new().write(true).open(&path).await.unwrap();
-        let _file = IndexFileValidator::validate(file, None, &[16, 35])
+        let _file = IndexFileValidator::validate(file, None, &positions(&[16, 35]))
             .await
             .unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), encoded(&[16, 35]));
@@ -335,7 +347,13 @@ mod tests {
         for ends in [&[16][..], &[]] {
             let (_directory, path, file) = opened_file(&bytes).await;
             drop(file);
-            match IndexFileValidator::validate(File::open(&path).await.unwrap(), None, ends).await {
+            match IndexFileValidator::validate(
+                File::open(&path).await.unwrap(),
+                None,
+                &positions(ends),
+            )
+            .await
+            {
                 Err(Error::Io(error)) => assert!(error.raw_os_error().is_some()),
                 _ => panic!("replacement must require a writable handle even for matching entries"),
             }
@@ -385,12 +403,12 @@ mod tests {
     async fn empty_matching_trusted_and_rebuilt_indexes_wait_for_sync_before_returning() {
         for (bytes, last_trusted, suffix_ends, expected) in [
             (vec![], None, vec![], vec![]),
-            (encoded(&[16]), None, vec![16], encoded(&[16])),
+            (encoded(&[16]), None, positions(&[16]), encoded(&[16])),
             (encoded(&[16]), Some(end(0, 16)), vec![], encoded(&[16])),
             (
                 [encoded(&[16, 99]), vec![0xaa]].concat(),
                 Some(end(0, 16)),
-                vec![35, 52],
+                positions(&[35, 52]),
                 encoded(&[16, 35, 52]),
             ),
         ] {
@@ -432,7 +450,7 @@ mod tests {
     async fn sync_failure_returns_no_file_for_empty_matching_or_trusted_indexes() {
         for (bytes, last_trusted, suffix_ends) in [
             (vec![], None, vec![]),
-            (encoded(&[16]), None, vec![16]),
+            (encoded(&[16]), None, positions(&[16])),
             (encoded(&[16]), Some(end(0, 16)), vec![]),
         ] {
             let (_directory, path, file) = opened_file(&bytes).await;
@@ -458,9 +476,10 @@ mod tests {
                 ..FileProbe::default()
             });
             let file = TestFile::new(file, Rc::clone(&probe));
-            let _file = IndexFileValidator::validate(file, Some(end(0, 16)), &[35, 52, 70])
-                .await
-                .unwrap();
+            let _file =
+                IndexFileValidator::validate(file, Some(end(0, 16)), &positions(&[35, 52, 70]))
+                    .await
+                    .unwrap();
             assert_eq!(probe.bytes_written.get(), 24);
             assert!(
                 probe
@@ -503,7 +522,8 @@ mod tests {
                 ..FileProbe::default()
             });
             let file = TestFile::new(file, Rc::clone(&probe));
-            let result = IndexFileValidator::validate(file, Some(end(0, 16)), &[35, 52]).await;
+            let result =
+                IndexFileValidator::validate(file, Some(end(0, 16)), &positions(&[35, 52])).await;
             let error = match (fail_at, result) {
                 (Operation::Truncate(_) | Operation::Sync, Err(Error::Io(error))) => error,
                 (
@@ -534,10 +554,11 @@ mod tests {
                 ..FileProbe::default()
             });
             let file = TestFile::new(file, Rc::clone(&probe));
+            let suffix_ends = positions(&[35, 52]);
             let mut validation = Box::pin(IndexFileValidator::validate(
                 file,
                 Some(end(0, 16)),
-                &[35, 52],
+                &suffix_ends,
             ));
             wait_for_pause(&probe, validation.as_mut()).await;
             drop(validation);

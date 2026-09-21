@@ -88,6 +88,12 @@ stream checkpoint still covers the final record in file 7. The private
 `recovered_end` preserves that stream-wide progress. `None` is never a sentinel
 record ID; sequence zero remains a valid first record.
 
+Checkpoint, recovered and returned endpoints carry `LogFilePosition` through
+`RecordEndLocation`. The initializer passes these values between storage and
+validation without extracting offsets or doing byte arithmetic. The pair validator
+owns append positioning. Tests unwrap positions with `get()` only when comparing
+against raw file cursors; independent JSON and index-byte fixtures remain numeric.
+
 ## Private state and step signatures
 
 `InitializationState<'a>` owns the selected stream ID, the borrowed provider,

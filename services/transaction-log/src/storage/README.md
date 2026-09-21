@@ -176,6 +176,12 @@ Startup integration remains deferred. Same-file provider
 tests cover literal JSON, exact/over-limit input, absent paths, malformed metadata
 and a directory in place of a checkpoint file.
 
+Checkpoint endpoints expose `LogFilePosition` in Rust. Its transparent Serde
+representation keeps the JSON `position` field numeric, so these provider
+operations need no offset conversion or new persistence format. Literal-fixture
+tests can extract the decoded offset with `.get()` to compare it with raw
+expected JSON values.
+
 `write_checkpoint(&checkpoint).await` uses Tokio filesystem I/O. It derives the
 stream path from the model, requires an existing, durably established stream
 directory and exclusive ownership, and serializes before touching files. It

@@ -1,7 +1,7 @@
 use getset::{CopyGetters, Getters};
 use tokio::fs::File;
 
-use crate::streams::{LogTailError, RecordEndLocation};
+use crate::streams::{LogFilePosition, LogTailError, RecordEndLocation};
 
 /// An owned log file after successful validation, tail removal and synchronization.
 ///
@@ -18,7 +18,7 @@ pub struct ValidatedLogFile<F = File> {
     #[getset(get_copy = "pub")]
     pub(super) validated_end: Option<RecordEndLocation>,
     /// Absolute exclusive ends of newly validated records, excluding trusted ones.
-    pub(super) suffix_ends: Vec<u64>,
+    pub(super) suffix_ends: Vec<LogFilePosition>,
     /// Content violation whose tail was successfully removed, or `None` if clean.
     #[getset(get = "pub")]
     pub(super) removed_tail: Option<LogTailError>,
@@ -31,7 +31,7 @@ impl<F> ValidatedLogFile<F> {
     /// An empty slice means no new records were accepted; the trusted prefix may
     /// still be nonempty. Both validators receive the original checkpoint-certified
     /// endpoint; this result's final endpoint must not replace it in the index call.
-    pub fn suffix_ends(&self) -> &[u64] {
+    pub fn suffix_ends(&self) -> &[LogFilePosition] {
         &self.suffix_ends
     }
 

@@ -43,7 +43,7 @@ the full-file guard still rejects another append to this writer.
 
 The existing `RecordStartLocation` calculation remains for the byte offset:
 `RecordEndLocation::next_record_start()` for a buffered prefix, or the file's
-first ID at position zero for an empty pair. This retains the helper's general
+first ID at `LogFilePosition::START` (byte zero) for an empty pair. This retains the helper's general
 rollover calculation even though the full-file guard prevents crossing files.
 The cached ID is additional state, not evidence of a performance improvement.
 Checked ID advancement retains the existing panic policy at sequence exhaustion.
@@ -54,6 +54,11 @@ becomes buffered progress and the append outcome only after both buffers accept
 the record. The writer does not maintain a separate local offset or reconstruct
 the endpoint afterward. `to_next()` is unnecessary here: the writer needs the
 accepted end and cached successor ID, not a successor file's byte position.
+
+Positions remain `LogFilePosition` throughout append calculation, progress and
+the call to `IndexWriter::write`. Only the index encoder extracts the raw `u64`
+for its existing eight-byte little-endian format. No new offset validation or
+change to the cached-ID and paired-acceptance contracts accompanies this typing.
 
 `new(file_id, log, index)` accepts an empty pair positioned at zero, with an owned
 `tokio::fs::File` for the index. The caller establishes emptiness and exclusive
@@ -332,5 +337,7 @@ fault tests construct their private test writers directly; a separate arithmetic
 test seeds large-offset progress without allocating a multi-gigabyte prefix.
 
 Follow the [module verification guidance](../README.md#verification-and-performance).
+The writer and its tests use `LogFilePosition`; recovery tests run against the
+real initializer and storage fixture. Keep those integration tests intact.
 This component has no disk-performance measurements yet. Future benchmarks should
 separate buffered appends, cached file output and durable synchronization.

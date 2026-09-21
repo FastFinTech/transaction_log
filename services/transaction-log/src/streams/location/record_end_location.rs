@@ -2,7 +2,7 @@ use getset::CopyGetters;
 use serde::{Deserialize, Serialize};
 use transaction_log_exports::RecordId;
 
-use super::{LogFileId, RecordStartLocation};
+use super::{LogFileId, LogFilePosition, RecordStartLocation};
 
 /// The exclusive byte end of a record within its assigned log file.
 ///
@@ -18,8 +18,8 @@ use super::{LogFileId, RecordStartLocation};
 /// accidentally swapping their roles.
 ///
 /// Serde uses named `record_id` and `position` fields. Deserialization validates
-/// the nested identifiers and the `u64` position, and rejects missing, duplicate
-/// or unknown object fields. It does not verify the position against storage.
+/// the nested identifiers and the position's `u64` representation, and rejects
+/// missing, duplicate or unknown object fields. It does not verify the position against storage.
 /// The endpoint's role comes from its Rust type or enclosing field, not a type
 /// tag in the serialized data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CopyGetters, Serialize, Deserialize)]
@@ -29,7 +29,7 @@ pub struct RecordEndLocation {
     /// Record whose complete encoding ends at this exclusive position.
     record_id: RecordId,
     /// Exclusive byte offset from the beginning of that record's log file.
-    position: u64,
+    position: LogFilePosition,
 }
 
 impl RecordEndLocation {
@@ -39,7 +39,7 @@ impl RecordEndLocation {
     /// the record. The model does not substitute partial numeric validation for
     /// reading storage. [`super::RecordRangeLocation::new`] checks this endpoint's
     /// relationship to a start, including rejecting a zero end position.
-    pub const fn new(record_id: RecordId, position: u64) -> Self {
+    pub const fn new(record_id: RecordId, position: LogFilePosition) -> Self {
         Self {
             record_id,
             position,
@@ -68,7 +68,7 @@ impl RecordEndLocation {
         let position = if LogFileId::from_record_id(next_id) == self.log_file_id() {
             self.position
         } else {
-            0
+            LogFilePosition::new(0)
         };
         RecordStartLocation::new(next_id, position)
     }
@@ -78,7 +78,7 @@ impl RecordEndLocation {
 mod tests {
     use transaction_log_exports::{SequenceNumber, StreamId};
 
-    use super::{RecordEndLocation, RecordId};
+    use super::{LogFilePosition, RecordEndLocation, RecordId};
 
     #[test]
     fn next_start_preserves_offsets_or_resets_at_file_boundaries_without_wrapping() {
@@ -93,14 +93,14 @@ mod tests {
             ] {
                 let end = RecordEndLocation::new(
                     RecordId::new(stream, SequenceNumber::new(sequence)),
-                    position,
+                    LogFilePosition::new(position),
                 );
                 let start = end.next_record_start();
                 assert_eq!(
                     start.record_id(),
                     RecordId::new(stream, SequenceNumber::new(next_sequence))
                 );
-                assert_eq!(start.position(), next_position);
+                assert_eq!(start.position(), LogFilePosition::new(next_position));
                 assert_eq!(start.log_file_id().file_number().get(), next_file);
             }
         }
@@ -111,7 +111,7 @@ mod tests {
         for stream in [StreamId::MIN, StreamId::MAX] {
             for position in [0, u64::MAX] {
                 let id = RecordId::new(stream, SequenceNumber::MAX);
-                let end = RecordEndLocation::new(id, position);
+                let end = RecordEndLocation::new(id, LogFilePosition::new(position));
                 let expected = std::panic::catch_unwind(|| id.next()).unwrap_err();
                 let actual = std::panic::catch_unwind(|| end.next_record_start()).unwrap_err();
                 let message = |panic: &Box<dyn std::any::Any + Send>| {
@@ -137,10 +137,10 @@ mod tests {
                 (u64::MAX, 3_382_654_560, 184_467_440_737_095),
             ] {
                 let record_id = RecordId::new(stream_id, SequenceNumber::new(sequence));
-                let location = RecordEndLocation::new(record_id, position);
+                let location = RecordEndLocation::new(record_id, LogFilePosition::new(position));
 
                 assert_eq!(location.record_id(), record_id);
-                assert_eq!(location.position(), position);
+                assert_eq!(location.position(), LogFilePosition::new(position));
                 assert_eq!(location.log_file_id().stream_id(), stream_id);
                 assert_eq!(location.log_file_id().file_number().get(), file_number);
             }
@@ -153,7 +153,7 @@ mod tests {
             r#"{"record_id":{"stream_id":42,"sequence_number":99999},"position":6553500000}"#;
         let location = RecordEndLocation::new(
             RecordId::new(StreamId::new(42).unwrap(), SequenceNumber::new(99_999)),
-            6_553_500_000,
+            LogFilePosition::new(6_553_500_000),
         );
         let mut bytes = Vec::new();
         serde_json::to_writer(&mut bytes, &location).unwrap();
@@ -180,7 +180,7 @@ mod tests {
                 u64::MAX,
             ),
         ] {
-            let location = RecordEndLocation::new(record_id, position);
+            let location = RecordEndLocation::new(record_id, LogFilePosition::new(position));
             assert_eq!(serde_json::to_string(&location).unwrap(), json);
             assert_eq!(
                 serde_json::from_str::<RecordEndLocation>(json).unwrap(),

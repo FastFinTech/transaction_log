@@ -40,9 +40,16 @@ external-change guards.
 
 Validation checks that the trusted endpoint belongs to the supplied
 file and that its byte position is within the file and plausible for the trusted
-record count. It then seeks to that position. A mismatched or impossible endpoint
+record count, using the bounds from `RecordLength::MIN` and `RecordLength::MAX`.
+It then seeks to that position. A mismatched or impossible endpoint
 returns an error without truncation. Earlier checkpoint-certified bytes are not
-rescanned. `None` means byte zero and the file's first assigned record ID.
+rescanned. `None` means `LogFilePosition::START` and the file's first assigned record ID.
+
+The raw length returned by `ValidationFile::length()` is converted once into
+`file_end: LogFilePosition`, the whole file's exclusive EOF position. Start,
+plausible-boundary and accepted-end comparisons stay typed. Raw offsets are
+extracted with `get()` for seeking and truncation; the underlying file capability
+continues to express byte lengths as `u64`.
 
 Reuse `RecordReader` for framing, stream-ID domain and CRC validation; the
 [record specification](../../../../../transaction-log-exports/src/record/README.md)
@@ -57,12 +64,18 @@ in the same reader batch. The scan never skips corruption to find later records.
 The private `scan_records` owns its offset vector and returns one `LogScanResult`:
 
 - `validated_end`: the last accepted record, initialized to the trusted endpoint;
-- `suffix_ends`: absolute exclusive byte ends of newly accepted records only;
+- `suffix_ends: Vec<LogFilePosition>`: absolute exclusive byte ends of newly
+  accepted records only;
 - `tail_error`: the first content violation, or `None` for a clean end.
 
-The accepted endpoint supplies both the next expected ID and its byte start
-through `RecordEndLocation::next_record_start()`. With no accepted endpoint,
-the start is the file's first assigned ID at byte zero. After checking the
+The accepted endpoint supplies both the next expected ID and its byte start.
+The scanner constructs that start from `end.record_id().next()` and
+`end.position()` directly: its `count < RECORDS_PER_FILE` guard ensures the next
+record remains in the current file, so the general file-rotation calculation in
+`next_record_start()` is unnecessary here. The supplied trusted file identity is
+checked before scanning; record acceptance advances the count and endpoint together.
+With no accepted endpoint, the start is the file's first assigned ID at
+`LogFilePosition::START`. After checking the
 incoming ID, `RecordStartLocation::to_end(record.length())` supplies the accepted
 end and its suffix-index offset. The scanner keeps no separate mutable byte
 position or expected ID. It already needs each accepted end for the index, so
@@ -72,13 +85,15 @@ The caller does not reconstruct IDs from counts or offsets. Empty input with no
 checkpoint gives no endpoint; a trusted prefix with no accepted suffix keeps
 its original endpoint and an empty vector.
 
-The scanner receives the initial whole-file length, including trusted bytes. At
-100,000 accepted records it uses that length to diagnose every extra byte without
+The scanner receives the initial whole-file EOF position, including trusted bytes. At
+100,000 accepted records it uses that position to diagnose every extra byte without
 probing EOF, including when the entire file was already trusted. This comparison
 uses the accepted end in the current file, not the next record's start, which
-would reset to zero at file rotation. `None` is a complete
+would reset to zero at file rotation. A full file necessarily has an accepted
+endpoint; the scanner asserts that invariant instead of supplying a fallback zero.
+`None` is a complete
 clean-tail diagnosis, rather than an instruction for the caller to distinguish EOF
-from reaching the record cap. The length is not rechecked for external changes.
+from reaching the record cap. EOF is not rechecked for external changes.
 
 Operational read failures return `Err` and drop partial findings. Error classification
 is exhaustive so a newly added reader error requires an explicit recovery policy.
@@ -96,6 +111,10 @@ Read-only accessors expose the findings; `into_inner()` returns `F` and discards
 the findings without more I/O.
 The cursor may reflect reader read-ahead: callers seek explicitly before subsequent
 reading or appending. The result has no unchecked public constructor.
+
+The `suffix_ends()` accessor borrows `&[LogFilePosition]`, without converting or
+copying the vector. The combined validator passes this typed slice directly to
+the index validator.
 
 The combined validator supplies the same original checkpoint-certified
 endpoint to both validation operations. The checkpoint certifies that the covered
@@ -163,8 +182,12 @@ power loss or failures at every filesystem operation.
 
 The scanner uses the production reader and releases payloads as it advances. The
 result retains at most 100,000 offsets (800,000 bytes of values, with vector capacity
-possibly larger). It moves that vector into the successful result without copying
-it and never retains the whole log. There are no recovery-performance measurements.
+possibly larger). `LogFilePosition` retains the `u64` representation, so typed
+suffix entries introduce no extra per-entry storage or conversion buffer. The
+validator moves that vector into the successful result without copying it and
+never retains the whole log. Removing the general rotation calculation and using
+typed bounds simplify the source; no runtime speedup has been measured. There
+are no recovery-performance measurements.
 
 Run:
 

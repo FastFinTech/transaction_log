@@ -6,6 +6,9 @@ This streams module owns typed logical file identities and record byte locations
 maps file-local record positions and provides inclusive file-ID iteration.
 `log_file_record_index_error.rs` and `log_file_id_range_error.rs` own its position
 and range errors.
+`log_file_position.rs` distinguishes a log byte offset from lengths, record counts
+and index-file offsets. It is used by the record endpoints and explicit file-range
+boundaries, index-entry values, and writer/recovery progress.
 `record_start_location.rs` and `record_end_location.rs` distinguish inclusive
 starts from exclusive ends. `record_range_location.rs` and its error validate
 endpoint relationships and lazily enumerate `log_file_range.rs` portions.
@@ -159,18 +162,53 @@ through Serde's format-independent traits, with no separate parser for JSON or
 a compatible binary format. These types establish numeric identity, not file
 existence, record validity or durability.
 
+## Log-file byte positions
+
+`LogFilePosition` is a private `u64` wrapper exposed from both `streams::location`
+and `streams`. Its infallible `new(u64)` constructor and read-only `get()` accessor
+preserve every raw value, including zero and `u64::MAX`. The associated constant
+`START` names byte zero, the start of any log file; it carries no file identity
+and performs no I/O. It distinguishes a log
+offset from an encoded record length, a record count, a file number or an offset
+into the index file. It carries no file identity or start/end role; enclosing
+location models own those meanings. Numeric ordering compares byte offsets only,
+so callers must establish a common file before interpreting it as file order.
+
+Construction and access perform no validation, allocation or I/O. An offset alone
+cannot prove a record boundary, readable extent or durability. Its transparent native
+layout is not an encoded representation. Raw extraction is explicit at I/O and
+encoding boundaries; no arithmetic traits or numeric conversion implementations
+are provided. Transparent Serde derives represent a position as a single `u64`,
+preserving the endpoint models' numeric JSON fields without additional validation.
+
+`advance(RecordLength)` and `retreat(RecordLength)` return new positions by adding
+or subtracting the total encoded record length; the original position is unchanged.
+Both are `const` methods with explicit overflow/underflow checks that panic in
+debug and release rather than wrapping. Retreating by exactly the current offset
+returns zero. They reuse the length type's protocol bounds without checking them
+again. These are operations within one file: they do not advance record IDs,
+discover record boundaries or rotate files. Callers supply the appropriate length
+and retain responsibility for interpreting the resulting position.
+
+`RecordStartLocation`, `RecordEndLocation` and `LogFileRange` use the primitive
+for their positions. `RecordRangeLocation` compares and propagates those typed
+positions, and its `InvalidByteSpan` error retains them. Writers, validators and
+the initializer preserve these typed values. Index-entry values are log positions;
+index-file byte addresses remain `u64`. File APIs and explicit index encoding
+extract the raw offset with `get()` at their boundaries.
+
 ## Record range locations
 
 Two distinct endpoint types describe a record's byte boundaries:
 
 - `RecordStartLocation` stores a `record_id: RecordId` and its inclusive byte
-  `position: u64` within that record's file.
+  `position: LogFilePosition` within that record's file.
 - `RecordEndLocation` stores a `record_id: RecordId` and its exclusive byte
-  `position: u64`, immediately after that record's CRC trailer in its file.
+  `position: LogFilePosition`, immediately after that record's CRC trailer in its file.
 
 Both expose read-only `record_id()` and `position()` copy getters, plus
 `log_file_id()` derived through `LogFileId::from_record_id`. Their
-`new(record_id, position)` constructors are infallible metadata constructors:
+`new(record_id, position: LogFilePosition)` constructors are infallible metadata constructors:
 they store the resolver's supplied values without inspecting files or adding
 partial numeric validation. A location alone does not prove that a record exists
 at that offset, is valid or is durable. Endpoint getters perform no validation.
@@ -184,7 +222,8 @@ the record identified by the start; numeric validity alone does not prove that
 relationship. No bytes are read or written, and the result certifies neither
 storage validity nor durability.
 
-The helper does not advance the record ID or reset the position at file rotation:
+The helper delegates byte arithmetic to `LogFilePosition::advance`. It does not
+advance the record ID or reset the position at file rotation:
 the last record's end stays in its own file. Byte-position addition panics on
 `u64` overflow in both debug and release, rather than wrapping malformed metadata.
 Valid resolved file positions cannot reach that overflow. The log-file validator
@@ -203,7 +242,7 @@ The enclosing field or chosen Rust type establishes the endpoint's role; the
 JSON has no start/end type tag. Distinct Rust types prevent swapped constructor
 arguments, but do not make arbitrary serialized bytes trustworthy.
 Deserialization delegates to `RecordId` and its validated identifier types,
-requires a `u64` position, and rejects missing, duplicate or unknown object fields
+decodes the position through its transparent `u64` representation, and rejects missing, duplicate or unknown object fields
 at either level. All `u64` positions are representable metadata, including zero
 and `u64::MAX`; storage validation must still establish real record boundaries.
 In particular, decoding a zero end does not make it a valid record end.
@@ -234,8 +273,7 @@ stays in the same stream; its position is the current end within a file, or zero
 at file rotation. Composition keeps the arithmetic and rotation rules in their
 existing helpers, including their panic contracts for byte-position overflow
 and sequence exhaustion. It performs no allocation, I/O or repeated length
-validation, and does not establish that the next record exists. Caller migration
-remains a separate step.
+validation, and does not establish that the next record exists.
 
 `RecordRangeLocation` stores only `start: RecordStartLocation` and
 `end: RecordEndLocation`, exposed through read-only copy getters. Distinct types
@@ -248,8 +286,8 @@ The two record IDs are **inclusive**. Equal IDs describe one complete record,
 so a separate complete-record `RecordLocation` type is unnecessary. An empty
 result is represented outside the range type, rather than reserving sequence
 zero or constructing an empty byte span. Single-file ranges can contain several
-records and exceed 65,535 bytes; positions and byte differences use `u64`, even
-though an individual encoded length fits `u16`.
+records and exceed 65,535 bytes; positions retain the full `u64` width through
+`LogFilePosition`, even though an individual encoded length fits `u16` on disk.
 
 Positions are relative to their respective log files. The final position can be
 smaller than the initial position when the range spans files; subtracting those
@@ -266,6 +304,12 @@ encoded sizes or readable file extents. These structural checks are not record
 validation; the future file/index resolver must establish agreement with storage.
 The value is location metadata, not proof of CRC validity or durable persistence.
 
+The comparisons stay in `LogFilePosition`, including the zero start of a later
+file's prefix. `RecordRangeLocationError::InvalidByteSpan` retains the affected
+file and both typed positions; error display extracts their numeric offsets to
+keep diagnostics readable. No conversion to raw integers is needed for range
+validation or enumeration.
+
 ### Iterating over files
 
 `iter()` owns a copy of the endpoints and lazily returns `(LogFileId, LogFileRange)`
@@ -277,6 +321,10 @@ items in ascending file-number order:
 | First of multiple files | `FilePostfix { start_position }` | From the explicit start through the file's validated record end. |
 | Intermediate file | `EntireFile` | From zero through the file's validated record end. |
 | Last of multiple files | `FilePrefix { end_position }` | From zero up to the explicit exclusive end. |
+
+Every explicit `start_position` or `end_position` is a `LogFilePosition`.
+The enum accepts supplied metadata without checking endpoint relationships;
+the range owner remains responsible for their validity.
 
 For example, a request from sequence 99,998 to 300,001 yields file zero's postfix,
 files one and two in their entirety, then file three's prefix. Two adjacent files
@@ -328,6 +376,12 @@ Range endpoints must not be substituted for a durability or validation checkpoin
 
 ## Verification
 
+`log_file_position.rs` tests full-width offset preservation, including values above
+4 GiB and the raw numeric limits. Arithmetic tests cover minimum/maximum record
+lengths, exact zero and `u64::MAX` results, unchanged originals, const use and
+overflow/underflow panics in both debug and release. Its Rustdoc examples show the
+public API and reject passing a `RecordLength` where a `LogFilePosition` is required.
+
 Same-file tests in `log_file_number.rs` cover raw construction/conversions, domain
 limits, rejected values, sequence grouping, numeric display/zero padding, native
 layout, integer JSON and checked successor exhaustion. Tests in `log_file_id.rs`
@@ -346,6 +400,8 @@ Their JSON tests cover literal field shapes and I/O round trips, zero and maximu
 numeric metadata, invalid stream IDs and numeric types, missing/duplicate/unknown
 fields, truncation and trailing garbage. Acceptance of raw offset limits protects
 the distinction between metadata decoding and actual storage validation.
+Those fixtures also verify that adopting `LogFilePosition` preserves the numeric
+JSON representation rather than nesting an object around each offset.
 
 `to_end()` tests cover minimum/maximum encoded lengths, nonzero offsets, positions
 above 4 GiB, both stream limits and the last/first records on either side of a file
@@ -356,7 +412,11 @@ lengths, offsets above 4 GiB and progression before, across and after a file
 boundary, preserving both stream limits. Expected endpoints use literal values
 rather than the helper composition being tested.
 
-`record_range_location.rs` tests the typed endpoint pair and `LogFileRange` enum contract:
+`log_file_range.rs` has Rustdoc examples for typed boundaries above 4 GiB and
+rejecting a record length in place of an offset. Its enum has no runtime behavior
+apart from storing the chosen variant and its positions.
+
+`record_range_location.rs` contains the combined endpoint and `LogFileRange` behavior tests:
 single records, partial single-file requests, every multi-file role, adjacent and
 exact file boundaries, independent offsets across files, positions above 4 GiB,
 stream limits, the terminal sequence/file and repeated iterator exhaustion.
@@ -364,6 +424,9 @@ Invalid stream/order/known byte-span metadata exercises each typed error.
 A full-domain test consumes only a few iterator items, protecting lazy enumeration
 without allocating or visiting the entire file range. Literal expected file numbers
 and enum values keep these tests independent of the iterator's implementation.
+`record_range_location_error.rs` checks that typed offsets still display as full-width
+decimal numbers. Run the same-file tests in debug and release using Cargo, and
+check Rustdoc examples using the stream documentation-test guidance below.
 
 `next_record_start()` tests use literal expectations for same-file offsets,
 file rotation, the last representable successor and exhaustion. They compare the

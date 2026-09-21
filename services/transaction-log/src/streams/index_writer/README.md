@@ -48,7 +48,7 @@ The API follows `RecordWriter`'s separate completion boundaries:
 | Method | Contract |
 | --- | --- |
 | `new(file)` | Own the file without I/O or an initial buffer allocation. |
-| `write(end_position: u64)` | Synchronously append eight little-endian bytes; no file I/O. |
+| `write(end_position: LogFilePosition)` | Synchronously append eight little-endian bytes; no file I/O. |
 | `flush_buffer().await` | Write the complete buffered batch, then clear it while retaining capacity. |
 | `flush().await` | Complete the file's own pending writes; do not send entries still in the local buffer. |
 | `sync_data().await` | Synchronize previously flushed file data; do not implicitly send or flush entries. |
@@ -56,11 +56,15 @@ The API follows `RecordWriter`'s separate completion boundaries:
 | `into_inner()` | Return file ownership and discard unsent entries without implicit I/O. |
 
 There is no index header, initial-zero entry, record ID or collection length in
-this encoding. The supplied integer is an absolute exclusive log offset. The
-writer preserves it exactly; it cannot establish agreement with records without
+this encoding. The supplied `LogFilePosition` is an absolute exclusive log offset,
+distinct from an encoded record length or an offset in the index file. The writer
+extracts its `u64` with `get()` only when encoding the eight bytes, preserving the
+existing file format. It cannot establish agreement with records without
 their identities and log contents. `IndexedLogWriter` determines correct offsets
 and enforces sequence/count policy. No partial validation of raw offsets or copy
-of that policy belongs in this lower layer.
+of that policy belongs in this lower layer. The position primitive accepts every
+`u64`; this type change adds no validation or I/O to the append path. See the
+[location specification](../location/README.md#log-file-byte-positions) for its contract.
 
 One `Vec<u8>` holds only pending entries. It grows on demand and is reused after
 output. There is no full-file allocation per open stream, retained index history,
@@ -90,10 +94,13 @@ validate offsets, retain a queryable index, publish checkpoints or schedule
 output. Historical index lookup and multi-file lifecycle coordination remain
 future application work; no speculative APIs for them belong in this layer.
 
+The `write` API, its callers and this component's tests use `LogFilePosition`.
+
 ## Verification
 
-`index_writer.rs` tests independent literal encodings, full-width offsets,
-allocation reuse, operation separation, empty output and inert unpolled futures.
+`index_writer.rs` tests typed positions against independent literal encodings,
+full-width offsets, allocation reuse, operation separation, empty output and
+inert unpolled futures.
 Scripted files cover short writes, repeated interruption, resumable pending I/O,
 zero progress, original errors, panic and cancellation at every incomplete byte
 prefix of two entries, including their boundary. They verify rejection without

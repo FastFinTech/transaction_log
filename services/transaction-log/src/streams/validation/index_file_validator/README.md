@@ -29,7 +29,8 @@ and test file; neither belongs exclusively to index recovery.
 ## API and recovery sequence
 
 `IndexFileValidator::validate<F: ValidationFile + AsyncWrite>(file, last_trusted, suffix_ends)`
-takes an already-open file, an optional `RecordEndLocation` and a borrowed `&[u64]`.
+takes an already-open file, an optional `RecordEndLocation` and a borrowed
+`&[LogFilePosition]`.
 Awaiting it returns `Result<F, IndexFileValidationError>`, preserving the input's
 concrete file type. Tokio files implement the bound directly; ordinary calls infer
 `F` without an explicit type argument. Controlled test files use the same operation.
@@ -56,12 +57,23 @@ The operation has one sequence:
 record accepted by log validation after the trusted endpoint. The caller establishes
 record validity and the meaning of those offsets; this component checks their
 count. An empty slice removes all entries and partial bytes after the trusted
-prefix. With no trusted prefix it leaves an empty file.
+prefix. With no trusted prefix it leaves an empty file. The typed slice from
+`ValidatedLogFile::suffix_ends()` passes directly to this operation; no conversion
+vector or repeated offset validation is needed. `IndexWriter::write` accepts each
+typed position and extracts its raw offset only for encoding.
 
 The private `read_index_at` helper reads the file length only when looking up a
-trusted entry. It returns `None` if the complete entry is absent. Seek/read failures
+trusted entry. It decodes the eight-byte value into `LogFilePosition` and returns
+`None` if the complete entry is absent. Seek/read failures
 remain I/O errors. An absent or unequal value returns `TrustedIndexMismatch` without
-changing the file. Neither the length nor the trusted count persists after the call.
+changing the file. `TrustedIndexMismatch` retains the typed expected position and
+optional actual position, while its message displays their numeric offsets.
+Neither the length nor the trusted count persists after the call.
+
+The stored values are log-file positions. The index file's own length, entry
+addresses and truncation boundary remain `u64` byte counts: using `LogFilePosition`
+for them would conflate two different files. The on-disk encoding remains eight
+little-endian bytes per entry, with no additional wrappers or validity checks.
 
 A caller can pass the returned file into a new call with the same checkpoint and
 offsets. The resulting bytes are identical; the suffix is replaced and synchronized
@@ -128,6 +140,9 @@ incomplete trusted-prefix length, mismatched trusted entries, original I/O error
 missing/partial/correct/wrong/excessive suffixes, trusted-prefix preservation,
 repeated calls with different suffix lengths, empty tails and whole-file replacement.
 Independent byte fixtures verify little-endian encoding and full-width offsets.
+Expected encoded bytes remain independent of the typed input fixtures. The error
+type's same-file test checks numeric formatting for large offsets and distinguishes
+an absent entry from a stored value.
 
 Boundary tests include empty, nearly full and full trusted prefixes, the exact
 100,000-entry limit, and rejection before mutation followed by reopening for a

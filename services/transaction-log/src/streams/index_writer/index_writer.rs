@@ -7,6 +7,7 @@ use tokio::{
 use transaction_log_exports::AsyncSyncData;
 
 use super::IndexWriteError;
+use crate::streams::LogFilePosition;
 
 // Dense index encoding, independent of native struct layout.
 pub(in crate::streams) const INDEX_ENTRY_LEN: usize = 8;
@@ -14,7 +15,8 @@ pub(in crate::streams) const INDEX_ENTRY_LEN: usize = 8;
 /// Buffered append-only encoding of dense index entries to an owned file.
 ///
 /// [`new`](Self::new) accepts an already-open [`File`]. Each synchronous
-/// [`write`](Self::write) buffers one little-endian `u64` exclusive log offset.
+/// [`write`](Self::write) accepts a [`LogFilePosition`] and buffers its exclusive
+/// log offset as one little-endian `u64`.
 /// Buffer output, file flushing and durable synchronization are separate,
 /// explicit operations, following `RecordWriter`'s completion boundaries.
 ///
@@ -63,16 +65,19 @@ impl<F> IndexWriter<F> {
     /// Synchronously buffers one absolute, exclusive record end in append order.
     ///
     /// Encodes exactly eight little-endian bytes, without I/O. The owner supplies
-    /// valid offsets for a contiguous record prefix. Range, increasing-position,
-    /// record-count and record-ID validation belong to that owner; checking raw
-    /// integers here could not establish agreement with the paired log.
+    /// valid log offsets for a contiguous record prefix. The position type keeps
+    /// offsets distinct from lengths; it does not establish record validity.
+    /// Range, increasing-position, record-count and record-ID validation belong
+    /// to that owner; checking raw integers here could not establish agreement
+    /// with the paired log.
     ///
     /// Capacity grows as needed and is retained after output. A previous I/O
     /// failure rejects the append without changing the buffer.
     #[inline]
-    pub fn write(&mut self, end_position: u64) -> Result<(), IndexWriteError> {
+    pub fn write(&mut self, end_position: LogFilePosition) -> Result<(), IndexWriteError> {
         self.check_usable()?;
-        self.buffer.extend_from_slice(&end_position.to_le_bytes());
+        self.buffer
+            .extend_from_slice(&end_position.get().to_le_bytes());
         Ok(())
     }
 
@@ -306,7 +311,7 @@ mod tests {
         // This encoder preserves all raw u64 values. Its owner, not this layer,
         // establishes whether an offset describes a valid record in a real log.
         for end in [0, 16, 0x0102_0304_0506_0708, u64::MAX] {
-            writer.write(end).unwrap();
+            writer.write(LogFilePosition::new(end)).unwrap();
         }
         let expected = [
             0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 255, 255, 255,
@@ -321,7 +326,7 @@ mod tests {
         assert!(writer.buffer.is_empty());
         assert_eq!(writer.buffer.as_ptr(), pointer);
         assert_eq!(writer.buffer.capacity(), capacity);
-        writer.write(35).unwrap();
+        writer.write(LogFilePosition::new(35)).unwrap();
         writer.flush_buffer().await.unwrap();
         assert_eq!(&observed.borrow().bytes[32..], &[35, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(writer.buffer.as_ptr(), pointer);
@@ -340,7 +345,7 @@ mod tests {
         ]);
         writer.flush_buffer().await.unwrap();
         assert!(observed.borrow().calls.is_empty());
-        writer.write(16).unwrap();
+        writer.write(LogFilePosition::new(16)).unwrap();
         drop(writer.flush_buffer());
         drop(writer.flush());
         drop(writer.sync_data());
@@ -382,8 +387,8 @@ mod tests {
             Step::Pending,
             Step::Write(usize::MAX),
         ]);
-        writer.write(16).unwrap();
-        writer.write(35).unwrap();
+        writer.write(LogFilePosition::new(16)).unwrap();
+        writer.write(LogFilePosition::new(35)).unwrap();
         let mut send = Box::pin(writer.flush_buffer());
         assert!(poll_once(send.as_mut()).is_pending());
         assert_eq!(observed.borrow().bytes, [16, 0, 0]);
@@ -414,12 +419,12 @@ mod tests {
                 for prefix in prefixes {
                     let (mut writer, observed) =
                         writer(&[Step::Write(usize::MAX), Step::Flush, Step::Sync]);
-                    writer.write(16).unwrap();
+                    writer.write(LogFilePosition::new(16)).unwrap();
                     writer.flush_buffer().await.unwrap();
                     writer.flush().await.unwrap();
                     writer.sync_data().await.unwrap();
-                    writer.write(35).unwrap();
-                    writer.write(52).unwrap();
+                    writer.write(LogFilePosition::new(35)).unwrap();
+                    writer.write(LogFilePosition::new(52)).unwrap();
                     let pending_bytes = writer.buffer.clone();
                     if prefix > 0 {
                         observed.borrow_mut().steps.push_back(Step::Write(prefix));
@@ -446,7 +451,10 @@ mod tests {
                     assert_eq!(writer.buffer, pending_bytes);
                     assert_eq!(&observed.borrow().bytes[8..], &pending_bytes[..prefix]);
                     let calls = observed.borrow().calls.len();
-                    assert!(matches!(writer.write(99), Err(IndexWriteError::Unusable)));
+                    assert!(matches!(
+                        writer.write(LogFilePosition::new(99)),
+                        Err(IndexWriteError::Unusable)
+                    ));
                     assert!(matches!(
                         writer.flush_buffer().await,
                         Err(IndexWriteError::Unusable)
@@ -476,15 +484,18 @@ mod tests {
                 vec![Step::Write(prefix), Step::Zero]
             };
             let (mut writer, observed) = writer(&steps);
-            writer.write(16).unwrap();
-            writer.write(35).unwrap();
+            writer.write(LogFilePosition::new(16)).unwrap();
+            writer.write(LogFilePosition::new(35)).unwrap();
             assert!(
                 matches!(writer.flush_buffer().await, Err(IndexWriteError::Io(error))
                 if error.kind() == io::ErrorKind::WriteZero)
             );
             assert_eq!(observed.borrow().bytes.len(), prefix);
             assert_eq!(writer.buffer.len(), 16);
-            assert!(matches!(writer.write(52), Err(IndexWriteError::Unusable)));
+            assert!(matches!(
+                writer.write(LogFilePosition::new(52)),
+                Err(IndexWriteError::Unusable)
+            ));
             assert!(matches!(
                 writer.flush_buffer().await,
                 Err(IndexWriteError::Unusable)
@@ -500,7 +511,7 @@ mod tests {
             (Operation::Sync, Step::Sync),
         ] {
             let (mut writer, observed) = writer(&[Step::Pending, completion]);
-            writer.write(16).unwrap();
+            writer.write(LogFilePosition::new(16)).unwrap();
             let mut future = Box::pin(perform(&mut writer, operation));
             assert!(poll_once(future.as_mut()).is_pending());
             assert!(matches!(poll_once(future.as_mut()), Poll::Ready(Ok(()))));
@@ -518,8 +529,8 @@ mod tests {
         let path = directory.path().join("index.idx");
         let file = File::create(&path).await.unwrap();
         let mut writer = IndexWriter::new(file);
-        writer.write(16).unwrap();
-        writer.write(35).unwrap();
+        writer.write(LogFilePosition::new(16)).unwrap();
+        writer.write(LogFilePosition::new(35)).unwrap();
         assert_eq!(writer.get_ref().metadata().await.unwrap().len(), 0);
         writer.flush_buffer().await.unwrap();
         writer.flush().await.unwrap();
@@ -528,7 +539,7 @@ mod tests {
             [16, 0, 0, 0, 0, 0, 0, 0, 35, 0, 0, 0, 0, 0, 0, 0]
         );
         writer.sync_data().await.unwrap();
-        writer.write(99).unwrap();
+        writer.write(LogFilePosition::new(99)).unwrap();
         drop(writer.into_inner());
 
         let file = tokio::fs::OpenOptions::new()
@@ -537,11 +548,11 @@ mod tests {
             .await
             .unwrap();
         let mut writer = IndexWriter::new(file);
-        writer.write(52).unwrap();
+        writer.write(LogFilePosition::new(52)).unwrap();
         writer.flush_buffer().await.unwrap();
         writer.flush().await.unwrap();
         writer.sync_data().await.unwrap();
-        writer.write(123).unwrap();
+        writer.write(LogFilePosition::new(123)).unwrap();
         drop(writer);
         assert_eq!(
             tokio::fs::read(&path).await.unwrap(),
@@ -559,14 +570,17 @@ mod tests {
             .await
             .unwrap();
         let mut writer = IndexWriter::new(File::open(&path).await.unwrap());
-        writer.write(35).unwrap();
+        writer.write(LogFilePosition::new(35)).unwrap();
         // Tokio can report the OS error at acceptance or at destination flush.
         let result = match writer.flush_buffer().await {
             Ok(()) => writer.flush().await,
             error => error,
         };
         assert!(matches!(result, Err(IndexWriteError::Io(_))));
-        assert!(matches!(writer.write(52), Err(IndexWriteError::Unusable)));
+        assert!(matches!(
+            writer.write(LogFilePosition::new(52)),
+            Err(IndexWriteError::Unusable)
+        ));
         assert!(matches!(
             writer.sync_data().await,
             Err(IndexWriteError::Unusable)

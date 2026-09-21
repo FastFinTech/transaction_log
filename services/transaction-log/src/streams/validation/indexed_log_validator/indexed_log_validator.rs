@@ -6,8 +6,9 @@ use super::{IndexedLogValidationError as Error, ValidatedFilePair};
 use crate::{
     storage::StorageProvider,
     streams::{
-        IndexFileValidationError, IndexFileValidator, LogFileId, LogFileValidationError,
-        LogFileValidator, RECORDS_PER_FILE, RecordEndLocation, index_writer::INDEX_ENTRY_LEN,
+        IndexFileValidationError, IndexFileValidator, LogFileId, LogFilePosition,
+        LogFileValidationError, LogFileValidator, RECORDS_PER_FILE, RecordEndLocation,
+        index_writer::INDEX_ENTRY_LEN,
     },
 };
 
@@ -63,7 +64,8 @@ impl IndexedLogValidator {
             }
             end => {
                 let mut log = validated_log.into_inner();
-                log.seek(SeekFrom::Start(end.map_or(0, |end| end.position())))
+                let log_end = end.map_or(LogFilePosition::START, |end| end.position());
+                log.seek(SeekFrom::Start(log_end.get()))
                     .await
                     .map_err(LogFileValidationError::from)?;
                 index
@@ -102,7 +104,7 @@ mod tests {
     fn end(stream_id: StreamId, sequence: u64, position: u64) -> RecordEndLocation {
         RecordEndLocation::new(
             RecordId::new(stream_id, SequenceNumber::new(sequence)),
-            position,
+            LogFilePosition::new(position),
         )
     }
 
@@ -333,7 +335,7 @@ mod tests {
             let trusted = (trusted_count != 0).then(|| {
                 RecordEndLocation::new(
                     file.record_id_at(trusted_count - 1).unwrap(),
-                    trusted_count * 16,
+                    LogFilePosition::new(trusted_count * 16),
                 )
             });
             store_pair(storage, file, &on_disk_log, Some(&stale_index)).await;
@@ -345,7 +347,10 @@ mod tests {
             };
             assert_eq!(
                 end,
-                RecordEndLocation::new(file.last_record_id(), RECORDS_PER_FILE * 16)
+                RecordEndLocation::new(
+                    file.last_record_id(),
+                    LogFilePosition::new(RECORDS_PER_FILE * 16)
+                )
             );
             assert_bytes(storage, file, &log_bytes, &index_bytes).await;
 
@@ -372,7 +377,10 @@ mod tests {
         let log_bytes = vec![0xff; count as usize * 16];
         let mut index_bytes = vec![0xff; count as usize * 8];
         index_bytes[count as usize * 8 - 8..].copy_from_slice(&(count * 16).to_le_bytes());
-        let trusted = RecordEndLocation::new(file.record_id_at(count - 1).unwrap(), count * 16);
+        let trusted = RecordEndLocation::new(
+            file.record_id_at(count - 1).unwrap(),
+            LogFilePosition::new(count * 16),
+        );
         store_pair(storage, file, &log_bytes, Some(&index_bytes)).await;
         let result = IndexedLogValidator::validate(storage, file, Some(trusted))
             .await
@@ -502,12 +510,12 @@ mod tests {
                 panic!("expected the original trusted-index error");
             };
             assert_eq!(entry_index, 0);
-            assert_eq!(expected_position, 16);
+            assert_eq!(expected_position, LogFilePosition::new(16));
             assert_eq!(
                 actual_position,
                 index_bytes
                     .filter(|bytes| bytes.len() >= 8)
-                    .map(|_| u64::MAX)
+                    .map(|_| LogFilePosition::new(u64::MAX))
             );
             assert_bytes(
                 storage,

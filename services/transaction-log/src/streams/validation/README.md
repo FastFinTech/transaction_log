@@ -19,6 +19,14 @@ one existing log/index pair through a borrowed `StorageProvider`. The
 validation, later-file cleanup, checkpoint advancement and active-pair preparation.
 Startup integration remains separate work.
 
+The log validator returns typed suffix offsets as `&[LogFilePosition]`, directly
+accepted by the index validator, and uses a typed log EOF position internally.
+The index validator also decodes stored log offsets into that type; its own
+index-file byte addresses remain raw `u64` values. The combined validator borrows
+the typed suffix directly and unwraps the accepted log end only when seeking.
+The stream initializer preserves these typed endpoints through checkpoint
+publication and active-pair handover.
+
 The focused log/index validators receive already-open files and domain values;
 the combined validator acquires those files through `StorageProvider`. Storage path
 selection and opening semantics remain in the provider; log-record decoding remains

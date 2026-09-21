@@ -3,8 +3,8 @@ use tokio::{fs::File, io::AsyncWrite};
 use transaction_log_exports::{AsyncSyncData, ExistingRecords, Record, RecordId, RecordWriter};
 
 use crate::streams::{
-    IndexWriter, InitializedStream, LogFileId, RECORDS_PER_FILE, RecordEndLocation,
-    RecordStartLocation,
+    IndexWriter, InitializedStream, LogFileId, LogFilePosition, RECORDS_PER_FILE,
+    RecordEndLocation, RecordStartLocation,
 };
 
 use super::{AppendOutcome, IndexedLogWriteError, indexed_log_writer_state::IndexedLogWriterState};
@@ -158,7 +158,9 @@ impl<L, I> IndexedLogWriter<L, I> {
         }
         let start = match self.buffered_end {
             Some(end) => end.next_record_start(),
-            None => RecordStartLocation::new(self.file_id.first_record_id(), 0),
+            None => {
+                RecordStartLocation::new(self.file_id.first_record_id(), LogFilePosition::START)
+            }
         };
         let end = start.to_end(record.length());
         let next_expected_record_id = expected.next();
@@ -533,7 +535,10 @@ mod tests {
         let mut outcomes = Vec::new();
         for (offset, (record, position)) in records.iter().zip([16, 35, 52]).enumerate() {
             let outcome = writer.write_record(record).unwrap();
-            assert_eq!(outcome.end(), RecordEndLocation::new(record.id(), position));
+            assert_eq!(
+                outcome.end(),
+                RecordEndLocation::new(record.id(), LogFilePosition::new(position))
+            );
             assert!(!outcome.file_full());
             assert_eq!(writer.expected_record_id(), id(42, 100_001 + offset as u64));
             outcomes.push(outcome);
@@ -541,9 +546,12 @@ mod tests {
         // Earlier outcomes remain snapshots after more records are accepted.
         assert_eq!(
             outcomes[0].end(),
-            RecordEndLocation::new(id(42, 100_000), 16)
+            RecordEndLocation::new(id(42, 100_000), LogFilePosition::new(16))
         );
-        let end = Some(RecordEndLocation::new(id(42, 100_002), 52));
+        let end = Some(RecordEndLocation::new(
+            id(42, 100_002),
+            LogFilePosition::new(52),
+        ));
         assert_eq!(writer.record_count(), 3);
         assert_eq!(writer.buffered_end(), end);
         assert_eq!(writer.flushed_end(), None);
@@ -702,7 +710,7 @@ mod tests {
         // A real prefix can exceed 4 GiB: 99,999 records can contain 6.55 GB.
         // Seed internal progress to test offset arithmetic without allocating
         // that prefix. Separate filesystem tests exercise the real handover.
-        let prefix = RecordEndLocation::new(id(3, 99_998), 4_294_967_300);
+        let prefix = RecordEndLocation::new(id(3, 99_998), LogFilePosition::new(4_294_967_300));
         let records = records(3, 99_999, &[65_519]).await;
         let (mut writer, observed) = writer(records[0].id());
         writer.record_count = 99_999;
@@ -721,13 +729,16 @@ mod tests {
         let outcome = writer.write_record(&records[0]).unwrap();
         assert_eq!(
             outcome.end(),
-            RecordEndLocation::new(id(3, 99_999), 4_295_032_835)
+            RecordEndLocation::new(id(3, 99_999), LogFilePosition::new(4_295_032_835))
         );
         assert!(outcome.file_full());
         assert_eq!(writer.expected_record_id(), id(3, 100_000));
         assert!(writer.is_full());
         writer.sync_data().await.unwrap();
-        assert_eq!(writer.synced_end().unwrap().position(), 4_295_032_835);
+        assert_eq!(
+            writer.synced_end().unwrap().position(),
+            LogFilePosition::new(4_295_032_835)
+        );
         assert_eq!(observed.borrow().index, [3, 0, 1, 0, 1, 0, 0, 0]);
         assert_eq!(observed.borrow().log, records[0].as_bytes().as_ref());
     }
@@ -744,7 +755,7 @@ mod tests {
             let outcome = writer.write_record(record).unwrap();
             assert_eq!(
                 outcome.end(),
-                RecordEndLocation::new(record.id(), (offset as u64 + 1) * 16)
+                RecordEndLocation::new(record.id(), LogFilePosition::new((offset as u64 + 1) * 16))
             );
             assert_eq!(outcome.file_full(), offset == 99_999);
         }
@@ -768,7 +779,10 @@ mod tests {
         writer.sync_data().await.unwrap();
         let calls = observed.borrow().calls.len();
         let end = writer.finalize().unwrap();
-        assert_eq!(end, RecordEndLocation::new(id(12, 99_999), 1_600_000));
+        assert_eq!(
+            end,
+            RecordEndLocation::new(id(12, 99_999), LogFilePosition::new(1_600_000))
+        );
         assert_eq!(observed.borrow().index.len(), 800_000);
         assert_eq!(
             &observed.borrow().index[799_992..],
@@ -870,7 +884,7 @@ mod tests {
                 );
                 assert_eq!(
                     writer.buffered_end(),
-                    Some(RecordEndLocation::new(id(0, 1), 33))
+                    Some(RecordEndLocation::new(id(0, 1), LogFilePosition::new(33)))
                 );
                 assert_eq!(writer.record_count(), 2);
                 assert_eq!(writer.expected_record_id(), id(0, 2));
@@ -1010,7 +1024,10 @@ mod tests {
         assert_eq!(log_reader.metadata().await.unwrap().len(), 16);
         assert_eq!(index_reader.metadata().await.unwrap().len(), 8);
         writer.flush().await.unwrap();
-        let appended_end = Some(RecordEndLocation::new(id(stream.get(), 1), 35));
+        let appended_end = Some(RecordEndLocation::new(
+            id(stream.get(), 1),
+            LogFilePosition::new(35),
+        ));
         assert_eq!(writer.flushed_end(), appended_end);
         assert_eq!(writer.synced_end(), end);
         writer.sync_data().await.unwrap();
@@ -1067,14 +1084,20 @@ mod tests {
 
             let records = records(stream.get(), 0, &[3]).await;
             let outcome = writer.write_record(&records[0]).unwrap();
-            assert_eq!(outcome.end(), RecordEndLocation::new(records[0].id(), 19));
+            assert_eq!(
+                outcome.end(),
+                RecordEndLocation::new(records[0].id(), LogFilePosition::new(19))
+            );
             assert!(!outcome.file_full());
             assert_eq!(writer.expected_record_id(), id(stream.get(), 1));
             writer.sync_data().await.unwrap();
             assert_eq!(writer.record_count(), 1);
             assert_eq!(
                 writer.synced_end(),
-                Some(RecordEndLocation::new(records[0].id(), 19))
+                Some(RecordEndLocation::new(
+                    records[0].id(),
+                    LogFilePosition::new(19)
+                ))
             );
             assert_eq!(
                 std::fs::read(provider.log_file_path(file_id)).unwrap(),
@@ -1121,7 +1144,10 @@ mod tests {
             let initialized = StreamInitializer::initialize(stream, provider)
                 .await
                 .unwrap();
-            let end = Some(RecordEndLocation::new(records[1].id(), 35));
+            let end = Some(RecordEndLocation::new(
+                records[1].id(),
+                LogFilePosition::new(35),
+            ));
             let mut writer = IndexedLogWriter::from(initialized);
             assert_eq!(writer.file_id(), file_id);
             assert_eq!(writer.record_count(), 2);
@@ -1137,14 +1163,20 @@ mod tests {
             assert_eq!(writer.synced_end(), end);
             assert_eq!(writer.expected_record_id(), records[2].id());
             let outcome = writer.write_record(&records[2]).unwrap();
-            assert_eq!(outcome.end(), RecordEndLocation::new(records[2].id(), 52));
+            assert_eq!(
+                outcome.end(),
+                RecordEndLocation::new(records[2].id(), LogFilePosition::new(52))
+            );
             assert!(!outcome.file_full());
             assert_eq!(
                 writer.expected_record_id(),
                 id(stream.get(), first_sequence + 3)
             );
             writer.flush().await.unwrap();
-            let appended_end = Some(RecordEndLocation::new(records[2].id(), 52));
+            let appended_end = Some(RecordEndLocation::new(
+                records[2].id(),
+                LogFilePosition::new(52),
+            ));
             assert_eq!(writer.record_count(), 3);
             assert_eq!(writer.buffered_end(), appended_end);
             assert_eq!(writer.flushed_end(), appended_end);
@@ -1205,14 +1237,20 @@ mod tests {
         assert!(!writer.is_full());
         let record = &records[100_000];
         let outcome = writer.write_record(record).unwrap();
-        assert_eq!(outcome.end(), RecordEndLocation::new(record.id(), 16));
+        assert_eq!(
+            outcome.end(),
+            RecordEndLocation::new(record.id(), LogFilePosition::new(16))
+        );
         assert!(!outcome.file_full());
         assert_eq!(writer.expected_record_id(), id(stream.get(), 100_001));
         writer.sync_data().await.unwrap();
         assert_eq!(writer.record_count(), 1);
         assert_eq!(
             writer.synced_end(),
-            Some(RecordEndLocation::new(record.id(), 16))
+            Some(RecordEndLocation::new(
+                record.id(),
+                LogFilePosition::new(16)
+            ))
         );
         assert_eq!(
             std::fs::read(provider.log_file_path(first.next())).unwrap(),
