@@ -432,23 +432,32 @@ impl StorageProvider {
     /// Opens the paired index for inspection and repair, creating it if missing.
     ///
     /// Existing bytes are preserved. Uses read/write access without append mode
-    /// so repair can replace an incorrect suffix. Parent directories must already
-    /// exist. Creating a missing empty index establishes no validated entries or
-    /// durable directory publication. Open the authoritative log successfully
-    /// first, so a missing log does not leave a newly created orphan index.
+    /// so repair can replace an incorrect suffix. The parent directory hierarchy
+    /// must already exist and be durably established. On Unix, synchronizes the
+    /// immediate parent after opening, including when the index already exists:
+    /// it may have been created by an interrupted recovery. Windows has no
+    /// directory-durability guarantee here. Index contents must still be validated
+    /// and synchronized by the caller before checkpoint publication.
+    ///
+    /// Open the authoritative log successfully first, so a missing log does not
+    /// leave a newly created orphan index. Errors/cancellation can leave a newly
+    /// created index; there is no rollback. Directory-sync failures retain the
+    /// directory path and original I/O cause.
     pub async fn open_index_for_repair(
         &self,
         id: LogFileId,
     ) -> Result<tokio::fs::File, StorageError> {
         let path = self.index_file_path(id);
-        tokio::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
             .await
-            .map_err(|source| StorageError::io(path, source))
+            .map_err(|source| StorageError::io(path.clone(), source))?;
+        sync_directory(path.parent().unwrap()).await?;
+        Ok(file)
     }
 
     /// Removes an inclusive range of log/index pairs from one stream.
@@ -500,15 +509,12 @@ impl StorageProvider {
         }
         #[cfg(unix)]
         for path in directories {
-            let directory = match tokio::fs::File::open(&path).await {
-                Ok(directory) => directory,
-                Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
-                Err(source) => return Err(StorageError::io(path, source)),
-            };
-            directory
-                .sync_all()
-                .await
-                .map_err(|source| StorageError::io(path, source))?;
+            match sync_directory(&path).await {
+                Ok(()) => {}
+                Err(StorageError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -626,16 +632,24 @@ async fn write_json_atomic<T: serde::Serialize + ?Sized>(
         .await
         .map_err(|source| StorageError::io(path.to_owned(), source))?;
 
+    sync_directory(path.parent().unwrap()).await?;
+    Ok(())
+}
+
+/// Synchronizes one directory through Tokio on Unix; a no-op on other platforms.
+///
+/// The caller selects an existing directory. No ancestors are synchronized and
+/// no entries are created. Missing-directory errors are preserved for the caller
+/// to interpret. Errors retain the directory path and original I/O cause.
+#[cfg_attr(not(unix), allow(unused_variables))]
+async fn sync_directory(path: &Path) -> Result<(), StorageError> {
     #[cfg(unix)]
-    {
-        let directory = path.parent().unwrap();
-        tokio::fs::File::open(directory)
-            .await
-            .map_err(|source| StorageError::io(directory.to_owned(), source))?
-            .sync_all()
-            .await
-            .map_err(|source| StorageError::io(directory.to_owned(), source))?;
-    }
+    tokio::fs::File::open(path)
+        .await
+        .map_err(|source| StorageError::io(path.to_owned(), source))?
+        .sync_all()
+        .await
+        .map_err(|source| StorageError::io(path.to_owned(), source))?;
     Ok(())
 }
 

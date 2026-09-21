@@ -7,8 +7,8 @@ and returns a trusted file-local endpoint. Partial files also return their handl
 positioned for appending. Complete files release both handles.
 
 The [stream initializer](../../stream_initializer/README.md) uses this component
-to validate successive pairs, clean up discarded pairs and prepare the active pair.
-Checkpoint advancement and startup integration remain unfinished there. This component
+to validate successive pairs, clean up discarded pairs, advance the checkpoint and
+prepare the active pair. Startup integration remains unfinished. This component
 does not enumerate files, create new logs, delete future files,
 load or publish checkpoints, or decide when a stream is ready.
 
@@ -62,7 +62,9 @@ An empty suffix still removes obsolete index entries after the trusted boundary.
 1. Borrow `StorageProvider` to open the existing log with read/write access, then
    open or create its index. Opening both precedes content recovery. A missing log
    returns the provider's path-bearing `NotFound` error without creating an index;
-   interpreting a file gap belongs to the caller.
+   interpreting a file gap belongs to the caller. On Unix, the provider synchronizes
+   the index's immediate parent before returning the handle, including when a
+   missing index is recreated.
 2. Validate the log, remove its corrupt tail and synchronize its data. Operational
    read failures remain errors rather than authorization to truncate.
 3. Check the trusted index entry, replace its entire following suffix with the
@@ -99,9 +101,11 @@ contract; there are no external-change guards or shared mutable validator state.
 
 Success requires log synchronization followed by index output, flushing and
 synchronization. Partial success additionally requires both final seeks. Complete
-results retain neither handle nor offsets. Directory entries are not synchronized
-here: a newly created index's directory durability and checkpoint publication remain
-the recovery owner's responsibility. File synchronization is not an atomic pair commit.
+results retain neither handle nor offsets. The provider's index-opening operation
+synchronizes the immediate parent on Unix. The recovery owner must supply a durably
+established directory hierarchy and owns checkpoint publication. Windows directory
+durability remains limited as described by storage. File synchronization is not an
+atomic pair commit.
 
 `IndexedLogValidationError` preserves storage errors (including paths), log
 errors and index errors. Final cursor errors use the corresponding log/index I/O

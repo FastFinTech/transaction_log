@@ -9,15 +9,14 @@ crate's `RecordWriter` rather than implementing either encoding/output layer.
 partial pair. Startup orchestration and writer construction remain separate work.
 `StreamCheckpoint` represents the certified local log/index boundary as a typed,
 Serde-enabled value; it does not itself load or publish checkpoint files.
-`StreamInitializer` is a compiled scaffold for startup recovery of one stream.
+`StreamInitializer` implements startup recovery of one stream.
 Its stateless entry point creates private state, loads the optional checkpoint,
 checks its stream ID and discovers the maximum log covering its file number. It
 validates successive pairs until a partial file or gap, retaining the recovered
-endpoint and partial pair, then removes the discarded range and prepares the active
-pair, creating an empty pair when needed without synchronizing the empty files.
-Final handover consumes
-the state and returns the pair; checkpoint advancement remains `todo!()`.
-Its owned `InitializedStream` result uses read-only
+endpoint and partial pair, then removes the discarded range, publishes changed
+recovered progress and prepares the active pair. It creates an empty pair when
+needed without synchronizing the empty files. Final handover consumes the state
+and returns the pair. Its owned `InitializedStream` result uses read-only
 getters. Startup integration remains unimplemented; the result contains files
 rather than a writer.
 
@@ -32,8 +31,8 @@ for validation uses the storage provider's named log/index opening methods.
 | Component | Responsibility |
 | --- | --- |
 | [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. |
-| [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write are implemented; initializer advancement is scaffolded. |
-| [Stream initializer](stream_initializer/README.md) | Checked checkpoint loading/discovery, sequential pair validation, later-file cleanup, active-pair preparation and final handover; checkpoint advancement remains `todo!()`. |
+| [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write and initializer advancement are implemented. |
+| [Stream initializer](stream_initializer/README.md) | Checked checkpoint loading/discovery, sequential pair validation, later-file cleanup, checkpoint advancement, active-pair preparation and final handover. |
 | [Indexed log writer](indexed_log_writer/README.md) | Append ordered records to a log/index pair; control flushing, synchronization, progress and finalization. Start here for normal output. |
 | [Indexed log validator](validation/indexed_log_validator/README.md) | Recover and synchronize one existing pair from a supplied trusted boundary. Return its endpoint and append-positioned files when partial. Start here for recovery. |
 | [Index writer](index_writer/README.md) | Encode offsets into a reusable buffer and send, flush or synchronize an owned file. Shared by the pair writer and validator. |
@@ -177,8 +176,8 @@ offsets are established. Synchronize the covered log data, then the index data,
 before durably publishing the checkpoint. It may lag this durable pair, but must
 never lead either file. Constructing the model establishes none of those facts.
 Storage implements checkpoint reading and publication. The initializer loads the
-checkpoint and checks its stream identity; advancement and startup integration
-remain future work. `IndexedLogValidator` accepts the explicitly supplied trusted endpoint; it
+checkpoint, checks its stream identity and advances it after validation and cleanup;
+startup integration remains future work. `IndexedLogValidator` accepts the explicitly supplied trusted endpoint; it
 does not load or choose the checkpoint itself. It checks prefix presence and the
 final certified index entry's agreement with that endpoint, without revalidating
 earlier records or index entries. It validates and repairs the suffix. A missing
@@ -262,7 +261,7 @@ file output, and `serde_json::from_slice::<StreamCheckpoint>(&bytes)` to decode
 them. The same traits also support `to_writer_pretty` and `from_reader` for
 synchronous `std::io` destinations/sources. These codecs do not flush, sync or
 atomically publish a checkpoint file. The storage provider implements
-publication; the planned initializer recovery steps must certify and synchronize the covered log/index
+publication; the initializer's recovery steps certify and synchronize the covered log/index
 prefix first. See the initializer and storage specifications for failure and
 platform-specific directory-durability contracts.
 

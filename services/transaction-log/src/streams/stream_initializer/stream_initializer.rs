@@ -14,24 +14,23 @@ use crate::{
 
 /// Stateless entry point for initializing one stream's active log/index pair.
 ///
-/// Loading, discovery, pair validation, cleanup and pair preparation are implemented.
-/// Final handover is implemented; checkpoint publication remains scaffolded.
-/// Startup does not call it.
+/// Recovers the stream, publishes its checkpoint and prepares the active pair.
+/// Application startup does not call it yet.
 pub struct StreamInitializer;
 
 impl StreamInitializer {
     /// Initializes one stream and returns its active files and file-local endpoint.
     ///
     /// Creates private state and runs checkpoint loading, discovery, validation,
-    /// cleanup, pair preparation and checkpoint advancement in that order. Each
+    /// cleanup, checkpoint advancement and pair preparation in that order. Each
     /// fallible step must succeed before the next starts. Finally consumes the
     /// state to return the active pair.
-    /// The caller must provide exclusive recovery access to this stream.
+    /// The caller must provide exclusive recovery access to this stream and an
+    /// existing, durably established directory hierarchy. Directory synchronization
+    /// follows the storage provider's platform guarantees.
     ///
-    /// # Panics
-    ///
-    /// Currently panics in checkpoint advancement after successful pair preparation
-    /// because checkpoint publication is still an unimplemented scaffold.
+    /// A later pair-creation failure can leave the recovered checkpoint published;
+    /// that checkpoint still certifies the recovered prefix. Recovery is not atomic.
     pub async fn initialize(
         stream_id: StreamId,
         storage_provider: &StorageProvider,
@@ -41,8 +40,8 @@ impl StreamInitializer {
         state.discover_log_files().await?;
         state.validate_files().await?;
         state.remove_later_files().await?;
-        state.prepare_active_pair().await?;
         state.advance_checkpoint().await?;
+        state.prepare_active_pair().await?;
         Ok(state.finish())
     }
 }
@@ -207,18 +206,37 @@ impl<'a> InitializationState<'a> {
         Ok(())
     }
 
+    /// Publishes recovered progress after validation and cleanup succeed.
+    ///
+    /// An empty stream or an unchanged checkpoint requires no publication. Uses
+    /// the stream-wide endpoint even when the retained active pair is empty.
+    /// Keeps the original checkpoint and all other recovery state unchanged.
+    /// Provider errors retain their path and cause; failed or cancelled publication
+    /// can leave staging or a published checkpoint, so quiesce I/O and reread
+    /// before retrying.
+    async fn advance_checkpoint(&mut self) -> Result<()> {
+        let Some(end) = self.recovered_end else {
+            return Ok(());
+        };
+        let checkpoint = StreamCheckpoint::new(end);
+        if self.checkpoint != Some(checkpoint) {
+            self.storage_provider.write_checkpoint(&checkpoint).await?;
+        }
+        Ok(())
+    }
+
     /// Retains the partial pair or creates an empty pair after a full or absent stream.
     ///
-    /// Validation and cleanup must succeed first. A retained pair is already
-    /// synchronized and positioned for appending. Otherwise, creates file zero or
+    /// Validation, cleanup and checkpoint advancement must succeed first. A retained
+    /// pair is already synchronized and positioned for appending. Otherwise, creates file zero or
     /// the successor of the recovered complete file. New empty files need no sync:
     /// they contain no records and are not covered by the recovered checkpoint.
     /// Installs the pair after creation succeeds, with no file-local endpoint,
     /// preserving the stream-wide recovered endpoint.
     ///
     /// Errors/cancellation can leave newly created files without updating state.
-    /// No rollback or automatic retry is provided. Durability of the recovered
-    /// prefix must be established before the following checkpoint publication step.
+    /// No rollback or automatic retry is provided. The already published checkpoint
+    /// remains valid even if creating the new empty pair fails.
     async fn prepare_active_pair(&mut self) -> Result<()> {
         if self.active_pair.is_some() {
             return Ok(());
@@ -238,17 +256,10 @@ impl<'a> InitializationState<'a> {
         Ok(())
     }
 
-    /// Synchronizes required directories and publishes the recovered stream endpoint.
-    ///
-    /// Awaits the provider's checkpoint publication after establishing pair durability.
-    async fn advance_checkpoint(&mut self) -> Result<()> {
-        todo!("publish the recovered checkpoint after cleanup and pair preparation")
-    }
-
     /// Consumes completed state and returns the active pair without additional I/O.
     ///
-    /// Called after checkpoint advancement succeeds. A missing prepared pair is
-    /// an internal initialization-order violation and panics.
+    /// Called after checkpoint advancement and pair preparation succeed. A missing
+    /// prepared pair is an internal initialization-order violation and panics.
     fn finish(self) -> InitializedStream {
         self.active_pair
             .expect("initialization must prepare an active pair before finishing")
@@ -262,7 +273,7 @@ mod tests {
     use tokio::io::AsyncSeekExt;
     use transaction_log_exports::{RecordId, RecordWriter, SequenceNumber, StreamId};
 
-    use super::InitializationState;
+    use super::{InitializationState, StreamInitializer};
     use crate::{
         storage::{
             StorageConfig, StorageError, StorageProvider,
@@ -1494,5 +1505,253 @@ mod tests {
         assert_eq!(state.maximum_log_file, None);
         assert_eq!(state.first_file_to_remove, None);
         assert!(!storage.checkpoint_file_path(stream_id).exists());
+    }
+
+    #[tokio::test]
+    async fn initialize_empty_or_entirely_corrupt_streams_without_publishing_a_checkpoint() {
+        for has_corrupt_log in [false, true] {
+            let fixture = storage_fixture().await;
+            let storage = fixture.provider();
+            let stream_id = fixture.stream_id();
+            let id = LogFileId::first(stream_id);
+            if has_corrupt_log {
+                store_pair(storage, id, &[3, 0, 0], Some(b"bad index"));
+                store_pair(storage, id.next(), b"discard", None);
+            }
+
+            let mut initialized = StreamInitializer::initialize(stream_id, storage)
+                .await
+                .unwrap();
+
+            assert_eq!(initialized.file_id(), id);
+            assert_eq!(initialized.end(), None);
+            assert_eq!(initialized.log.stream_position().await.unwrap(), 0);
+            assert_eq!(initialized.index.stream_position().await.unwrap(), 0);
+            assert_eq!(fs::read(storage.log_file_path(id)).unwrap(), b"");
+            assert_eq!(fs::read(storage.index_file_path(id)).unwrap(), b"");
+            assert!(!storage.log_file_path(id.next()).exists());
+            let checkpoint = storage.checkpoint_file_path(stream_id);
+            assert!(!checkpoint.exists());
+            assert!(!checkpoint.with_added_extension("pending").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_repairs_the_tail_cleans_up_and_publishes_recovered_progress() {
+        for has_checkpoint in [false, true] {
+            let fixture = storage_fixture().await;
+            let storage = fixture.provider();
+            let stream_id = fixture.stream_id();
+            let id = LogFileId::first(stream_id);
+            let mut accepted_log = record_fixture(stream_id, FIRST);
+            if has_checkpoint {
+                accepted_log.extend(record_fixture(stream_id, SECOND));
+                store_checkpoint(storage, RecordEndLocation::new(id.first_record_id(), 16));
+            }
+            let mut corrupt_log = accepted_log.clone();
+            corrupt_log.extend([3, 0, 0]);
+            store_pair(
+                storage,
+                id,
+                &corrupt_log,
+                has_checkpoint.then_some(&16_u64.to_le_bytes()[..]),
+            );
+            store_pair(storage, id.next(), b"discard", Some(b"discard"));
+            let end = RecordEndLocation::new(
+                RecordId::new(stream_id, SequenceNumber::new(u64::from(has_checkpoint))),
+                if has_checkpoint { 35 } else { 16 },
+            );
+            let expected_index: Vec<u8> = if has_checkpoint {
+                vec![16_u64, 35]
+            } else {
+                vec![16_u64]
+            }
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+
+            let mut initialized = StreamInitializer::initialize(stream_id, storage)
+                .await
+                .unwrap();
+
+            assert_eq!(initialized.file_id(), id);
+            assert_eq!(initialized.end(), Some(end));
+            assert_eq!(
+                initialized.log.stream_position().await.unwrap(),
+                end.position()
+            );
+            assert_eq!(
+                initialized.index.stream_position().await.unwrap(),
+                expected_index.len() as u64
+            );
+            assert_eq!(fs::read(storage.log_file_path(id)).unwrap(), accepted_log);
+            assert_eq!(
+                fs::read(storage.index_file_path(id)).unwrap(),
+                expected_index
+            );
+            assert!(!storage.log_file_path(id.next()).exists());
+            assert!(!storage.index_file_path(id.next()).exists());
+            assert_eq!(
+                storage.read_checkpoint(stream_id).await.unwrap(),
+                Some(StreamCheckpoint::new(end))
+            );
+
+            drop(initialized);
+            let reopened = StreamInitializer::initialize(stream_id, storage)
+                .await
+                .unwrap();
+            assert_eq!(reopened.end(), Some(end));
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_skips_publication_when_the_checkpoint_is_unchanged() {
+        let fixture = storage_fixture().await;
+        let storage = fixture.provider();
+        let stream_id = fixture.stream_id();
+        let id = LogFileId::first(stream_id);
+        let end = RecordEndLocation::new(id.first_record_id(), 16);
+        store_pair(
+            storage,
+            id,
+            &record_fixture(stream_id, FIRST),
+            Some(&16_u64.to_le_bytes()),
+        );
+        let mut original = store_checkpoint(storage, end);
+        original.push(b'\n');
+        let checkpoint_path = storage.checkpoint_file_path(stream_id);
+        fs::write(&checkpoint_path, &original).unwrap();
+        // Any attempted publication would fail opening this staging path.
+        let pending = checkpoint_path.with_added_extension("pending");
+        fs::create_dir(&pending).unwrap();
+        fs::write(pending.join("keep"), b"unchanged").unwrap();
+
+        let initialized = StreamInitializer::initialize(stream_id, storage)
+            .await
+            .unwrap();
+
+        assert_eq!(initialized.end(), Some(end));
+        assert_eq!(fs::read(checkpoint_path).unwrap(), original);
+        assert_eq!(fs::read(pending.join("keep")).unwrap(), b"unchanged");
+    }
+
+    #[tokio::test]
+    async fn initialize_checkpoints_complete_files_even_when_the_active_pair_is_empty() {
+        for successor in ["absent", "empty", "gap"] {
+            let fixture = storage_fixture().await;
+            let storage = fixture.provider();
+            let stream_id = fixture.stream_id();
+            let complete = file_id(stream_id, 999);
+            let log = encoded_records(complete, 0..100_000).await;
+            store_pair(storage, complete, &log, Some(&16_u64.to_le_bytes()));
+            store_checkpoint(
+                storage,
+                RecordEndLocation::new(complete.first_record_id(), 16),
+            );
+            let active = complete.next();
+            match successor {
+                "empty" => store_pair(storage, active, &[], None),
+                "gap" => {
+                    store_pair(storage, active.next(), b"discard", Some(b"discard"));
+                    fs::write(storage.index_file_path(active), b"orphan index").unwrap();
+                }
+                _ => {}
+            }
+            let end = RecordEndLocation::new(complete.last_record_id(), 1_600_000);
+
+            let mut initialized = StreamInitializer::initialize(stream_id, storage)
+                .await
+                .unwrap();
+
+            assert_eq!(initialized.file_id(), active);
+            assert_eq!(initialized.end(), None);
+            assert_eq!(initialized.log.stream_position().await.unwrap(), 0);
+            assert_eq!(initialized.index.stream_position().await.unwrap(), 0);
+            assert_eq!(fs::read(storage.log_file_path(active)).unwrap(), b"");
+            assert_eq!(fs::read(storage.index_file_path(active)).unwrap(), b"");
+            assert!(!storage.log_file_path(active.next()).exists());
+            assert!(!storage.index_file_path(active.next()).exists());
+            assert_eq!(
+                storage.read_checkpoint(stream_id).await.unwrap(),
+                Some(StreamCheckpoint::new(end))
+            );
+            assert_eq!(fs::read(storage.log_file_path(complete)).unwrap(), log);
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_publishes_before_creating_a_successor_and_stops_on_either_failure() {
+        for block_checkpoint in [true, false] {
+            let fixture = storage_fixture().await;
+            let storage = fixture.provider();
+            let stream_id = fixture.stream_id();
+            let complete = LogFileId::first(stream_id);
+            let log = encoded_records(complete, 0..100_000).await;
+            store_pair(storage, complete, &log, Some(&16_u64.to_le_bytes()));
+            let original = store_checkpoint(
+                storage,
+                RecordEndLocation::new(complete.first_record_id(), 16),
+            );
+            let active = complete.next();
+            let checkpoint_path = storage.checkpoint_file_path(stream_id);
+            let blocked_path = if block_checkpoint {
+                checkpoint_path.with_added_extension("pending")
+            } else {
+                storage.index_file_path(active)
+            };
+            fs::create_dir(&blocked_path).unwrap();
+            fs::write(blocked_path.join("keep"), b"preserve").unwrap();
+
+            let error = StreamInitializer::initialize(stream_id, storage)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error.downcast_ref::<StorageError>(),
+                Some(StorageError::Io { path, .. }) if path == &blocked_path));
+            assert_eq!(fs::read(blocked_path.join("keep")).unwrap(), b"preserve");
+            if block_checkpoint {
+                assert_eq!(fs::read(checkpoint_path).unwrap(), original);
+                assert!(!storage.log_file_path(active).exists());
+                assert!(!storage.index_file_path(active).exists());
+            } else {
+                let end = RecordEndLocation::new(complete.last_record_id(), 1_600_000);
+                assert_eq!(
+                    storage.read_checkpoint(stream_id).await.unwrap(),
+                    Some(StreamCheckpoint::new(end))
+                );
+                assert_eq!(fs::read(storage.log_file_path(active)).unwrap(), b"");
+            }
+            assert_eq!(fs::read(storage.log_file_path(complete)).unwrap(), log);
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_does_not_publish_recovered_progress_if_cleanup_fails() {
+        let fixture = storage_fixture().await;
+        let storage = fixture.provider();
+        let stream_id = fixture.stream_id();
+        let id = LogFileId::first(stream_id);
+        let mut log = record_fixture(stream_id, FIRST);
+        log.extend(record_fixture(stream_id, SECOND));
+        store_pair(storage, id, &log, Some(&16_u64.to_le_bytes()));
+        let original = store_checkpoint(storage, RecordEndLocation::new(id.first_record_id(), 16));
+        let blocked_path = storage.log_file_path(id.next());
+        fs::create_dir(&blocked_path).unwrap();
+        store_pair(storage, id.next().next(), b"discard later", None);
+
+        let error = StreamInitializer::initialize(stream_id, storage)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error.downcast_ref::<StorageError>(),
+            Some(StorageError::Io { path, .. }) if path == &blocked_path));
+        assert_eq!(
+            fs::read(storage.checkpoint_file_path(stream_id)).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read(storage.log_file_path(id.next().next())).unwrap(),
+            b"discard later"
+        );
     }
 }

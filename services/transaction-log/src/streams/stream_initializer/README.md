@@ -1,8 +1,8 @@
 # Stream initializer
 
-This module scaffolds startup recovery for **one stream**. `StreamInitializer` is
-an empty public type with one associated async method. It will own a private
-`InitializationState` for the duration of initialization and return an
+This module implements startup recovery for **one stream**. `StreamInitializer` is
+an empty public type with one associated async method. It owns a private
+`InitializationState` for the duration of initialization and returns an
 `InitializedStream` containing the active log/index files and their file-local end.
 Both public types are re-exported from `streams`.
 
@@ -14,14 +14,11 @@ Discovery records the highest existing log and rejects a maximum below the
 checkpoint's file, including absent logs when a checkpoint exists. Validation
 recovers successive pairs, retaining the first partial pair or marking a gap for
 later cleanup. Cleanup removes the marked range through the discovered maximum.
-Preparation retains the validated partial pair or creates an
-empty pair. Final handover consumes the state and returns that pair; only checkpoint
-advancement still has a `todo!()` body. The result uses `getset` getters without a
-manual impl. Polling `initialize`
-returns errors from the implemented steps, or reaches the unimplemented checkpoint
-advancement step and panics after successful pair preparation.
-Application startup does not call it. The previous
-implementation and its obsolete tests have been removed.
+Checkpoint advancement publishes the recovered endpoint when it differs from the
+original checkpoint. Preparation then retains the validated partial pair or creates
+an empty pair. Final handover consumes the state and returns that pair. All steps
+are implemented; the result uses `getset` getters without a manual impl.
+Application startup does not call the initializer yet.
 
 ## Source map
 
@@ -32,8 +29,8 @@ implementation and its obsolete tests have been removed.
   Its fields are accessible only within this component.
 - `mod.rs`: declarations, re-exports and this README's Rustdoc inclusion.
 
-The following distinguishes the implemented steps, including final handover, from
-the agreed contract for checkpoint advancement.
+The following describes the implemented per-stream operation. Startup-wide
+coordination, writer construction and live rotation remain separate work.
 
 ## Public API and result
 
@@ -58,8 +55,8 @@ async fn initialize_one(
 ```
 
 `initialize(stream_id, storage_provider)` returns `anyhow::Result<InitializedStream>`.
-This application-level result keeps the scaffold's error surface small while
-allowing concrete provider/validator errors to propagate during implementation.
+This application-level result preserves concrete provider/validator errors
+without duplicating their error variants in an orchestration-specific enum.
 The public initializer has no constructor, fields, lifetime parameter or reusable
 operation state. The provider is borrowed only during initialization.
 
@@ -94,8 +91,7 @@ selects a new active file when no records survived. No file list or completed-fi
 retained. The optional active pair holds at most one set of open files.
 
 The public operation creates state, calls these steps in order, then consumes it.
-Construction, checkpoint loading, discovery, validation, cleanup, pair preparation
-and final handover are implemented; checkpoint advancement remains a placeholder:
+Construction and every recovery step are implemented:
 
 | Private method | Return type | Intended responsibility |
 | --- | --- | --- |
@@ -104,16 +100,17 @@ and final handover are implemented; checkpoint advancement remains a placeholder
 | `async discover_log_files(&mut self)` | `Result<()>` | Implemented: find the maximum log and reject absence or a maximum below a checkpointed file. |
 | `async validate_files(&mut self)` | `Result<()>` | Implemented: recover successive pairs; continue through complete files and stop at a partial pair or missing uncheckpointed log. |
 | `async remove_later_files(&mut self)` | `Result<()>` | Implemented: remove discarded pairs through the discovered maximum. |
+| `async advance_checkpoint(&mut self)` | `Result<()>` | Implemented: publish the recovered stream endpoint when present and changed. |
 | `async prepare_active_pair(&mut self)` | `Result<()>` | Implemented: retain a partial pair or create an empty pair ready for appending. |
-| `async advance_checkpoint(&mut self)` | `Result<()>` | Complete required directory synchronization and publish the recovered stream endpoint. |
 | `finish(self)` | `InitializedStream` | Implemented: consume the state and transfer the prepared pair without more I/O. |
 
 Here `Result<T>` means `anyhow::Result<T>`. Checkpoint advancement is asynchronous
 to await `StorageProvider::write_checkpoint`, which owns checkpoint publication
-and synchronization of its immediate parent directory through Tokio. Its body
-remains a scaffold. Pair preparation precedes publication so
-fresh-file creation cannot fail after that final publication step. A successful
-step sequence must establish the state needed by the infallible `finish`.
+and synchronization of its immediate parent directory through Tokio. Publication
+precedes fresh-pair preparation because it certifies the recovered prefix,
+independently of the next empty pair. If creation later fails, the published
+checkpoint remains valid. The successful sequence establishes the state needed
+by the infallible `finish`.
 
 ## Checkpoint loading (implemented)
 
@@ -204,9 +201,36 @@ on success or failure, and never publishes a checkpoint. After outstanding I/O
 is quiescent and an obstruction is resolved, the same cleanup range can be
 repeated; already-absent files are accepted. There is no automatic retry or rollback.
 
+## Checkpoint advancement (implemented)
+
+After validation and cleanup succeed, `advance_checkpoint` wraps `recovered_end`
+in `StreamCheckpoint` and publishes it through `StorageProvider::write_checkpoint`.
+No recovered records means no checkpoint and no publication I/O. An endpoint equal
+to the original checkpoint also requires no write. The step uses stream-wide
+progress, so an empty retained active file does not erase the preceding complete
+file's endpoint. It preserves the original `checkpoint` field and other working
+state; there is no second mutable copy of the publication state.
+
+The owner excludes concurrent access, finishes earlier I/O and supplies an existing,
+durably established directory hierarchy. Index opening synchronizes its immediate
+parent on Unix, including indexes recreated during recovery. The validators
+synchronize accepted log data and then rebuilt index data; cleanup synchronizes
+its changed parent directories. Only after those operations succeed can checkpoint
+publication start. The provider writes and synchronizes staging JSON, renames it
+over the checkpoint, and synchronizes the checkpoint's immediate parent on Unix.
+No ancestor synchronization is added. Windows directory durability remains limited
+as described by [storage](../../storage/README.md#stream-checkpoints).
+
+A publication error preserves the concrete `StorageError` through `anyhow` and
+stops the public sequence before new-pair creation. Errors or cancellation can
+leave staging or an already published checkpoint; they do not imply rollback.
+Quiesce outstanding I/O and reread metadata before another recovery attempt.
+A subsequent pair-creation failure may leave this successfully published checkpoint
+in place, correctly certifying the recovered prefix.
+
 ## Active-pair preparation (implemented)
 
-After validation and cleanup succeed, `prepare_active_pair` retains an existing
+After checkpoint advancement succeeds, `prepare_active_pair` retains an existing
 `active_pair` without I/O: validation already synchronized its files and positioned
 their cursors for appending. This includes an empty partial file, whose file-local
 endpoint is `None` even when earlier complete files established `recovered_end`.
@@ -235,45 +259,22 @@ an interrupted operation. Calling preparation again after success simply retains
 the installed pair.
 
 The provider's creation operation can also serve eventual live rollover; this
-private step makes startup's reuse-or-create decision. Required directory-entry
-durability for the recovered prefix remains work for checkpoint advancement.
+private step makes startup's reuse-or-create decision. It publishes no checkpoint
+and does not change the certified recovered prefix.
 
 ## Final handover (implemented)
 
 `finish(self)` consumes the private state and moves its prepared `InitializedStream`
 to the caller. It preserves the owned file handles, cursor positions and file-local
 endpoint without further I/O. The public sequence calls it only after checkpoint
-advancement succeeds. A missing active pair is an internal ordering error and
+advancement and pair preparation succeed. A missing active pair is an internal ordering error and
 panics with a specific message; it is not a recoverable storage failure.
-
-## Checkpoint advancement (planned)
-
-Cleanup must complete before checkpoint publication. An empty stream publishes
-no checkpoint, while an empty active file after complete files preserves their
-recovered endpoint. Loading metadata alone never certifies stream readiness.
-
-The recovery owner excludes concurrent access and finishes earlier I/O before
-starting. File synchronization, directory-entry durability and checkpoint
-publication are separate guarantees. Synchronize covered pairs and required
-directories before publishing. The provider synchronizes Unix directories changed
-by checkpoint publication and range deletion, without traversing ancestors.
-It has no separate directory-sync helper; recovery must establish directory-entry
-durability for pairs covered by the recovered checkpoint before publication.
-A newly created empty successor is outside that checkpoint's covered prefix.
-Platform limitations remain as described by
-[storage](../../storage/README.md#stream-checkpoints).
-
-Errors or cancellation may follow partial repair or cleanup; the remaining steps
-can also fail after partial pair preparation or publication.
-Do not claim rollback or safe automatic replay; quiesce outstanding I/O and reread
-metadata after uncertain publication. No workers, locks, timers, startup wiring,
-cluster coordination or live rotation are part of this scaffold.
 
 ## Storage provider readiness
 
 Existing operations cover checkpoint read/write, maximum-log discovery, fresh-pair
-creation, log/index opening for recovery and pair removal. Checkpoint publication and range removal
-own their directory synchronization. File data synchronization is available on
+creation, log/index opening for recovery and pair removal. Index opening, checkpoint
+publication and range removal own their directory synchronization. File data synchronization is available on
 the returned Tokio files.
 
 `StorageProvider::create_log_and_index(id).await` now creates missing range
@@ -283,8 +284,10 @@ and reported as errors. Index-creation failure may leave a new empty log;
 interrupted creation must be inspected/recovered before retrying. The
 [storage contract](../../storage/README.md#fresh-logindex-pair-creation) owns the
 details. This operation creates files without synchronizing files or directories.
-`prepare_active_pair` uses those empty files directly. Required directory
-synchronization for recovered progress and checkpoint publication remain unimplemented.
+`prepare_active_pair` uses those empty files directly after checkpoint advancement.
+Storage and validators own the filesystem work; the initializer selects the prefix
+and orders those operations. No workers, locks, timers, startup wiring, cluster
+coordination or live rotation are part of this component.
 
 ## Validation and performance
 
@@ -309,8 +312,8 @@ The test that deliberately replaces a stream base with a file retains an isolate
 temporary provider because it damages the base layout. The other cases rely on
 the shared fixture. Production initialization and provider behavior are unchanged.
 
-Build and lint the declared signatures and compile the README example; do not
-execute the placeholder methods or add tests that merely assert `todo!()` panics.
+Build and lint the component, compile the README example and exercise the public
+initializer as well as the focused private-step tests.
 Same-file checkpoint-loading tests cover absent metadata, independent literal
 metadata (including sequence zero and a later file), wrong-stream metadata, JSON
 and I/O failures, retained state on errors, and unchanged storage. Discovery tests
@@ -340,8 +343,13 @@ a pair. Handover is exercised by these same fixtures: retained partial pairs and
 new empty successors keep their file-local endpoints and append positions after
 the state is consumed. These tests do not simulate power loss; detailed recovery
 synchronization failures remain covered by the validator suites.
-As each later step gains an implementation, add tests for publication ordering
-and operational failure. Preserve independent fixtures and
+End-to-end tests cover empty/corrupt streams, first publication including sequence
+zero, advancement from an existing checkpoint, tail/index repair, later-file
+cleanup, restart from the new checkpoint, and unchanged checkpoints without writes.
+Complete files followed by absent, empty or discarded successors retain the correct
+stream endpoint. Failure tests verify that cleanup blocks publication, publication
+failure blocks successor creation, and successor-creation failure preserves the
+new valid checkpoint. Preserve independent fixtures and
 observable file/checkpoint results. Recovery throughput has not been measured;
 this is startup work rather than a per-record hot path.
 

@@ -17,7 +17,7 @@ Provider implementation, root configuration and shared errors live directly in t
 | --- | --- |
 | `storage_error.rs` | Shared provider I/O/JSON failures and bounded-read limits, retaining paths and original causes. |
 | `storage_config.rs` | Immutable startup configuration and absolute root resolution. |
-| `storage_provider.rs` | All provider methods: configuration ownership, paths, directory initialization, maximum-log discovery, file acquisition and metadata I/O, with private JSON read/write helpers. |
+| `storage_provider.rs` | All provider methods: configuration ownership, paths, directory initialization, maximum-log discovery, file acquisition and metadata I/O, with private JSON read/write and directory-sync helpers. |
 | `test_support.rs` | Compiled only under `cfg(test)`: one shared initialized provider, a stream-ID allocator, and literal-record adaptation for filesystem tests. Its contracts and tests are covered by this README. |
 
 Storage policy belongs to the application, not the public record I/O exports
@@ -215,8 +215,12 @@ removing files changes their parent entries, not the existing directory hierarch
 Existing parents are synchronized even when their requested files were already
 absent, so repeating a range after an interrupted synchronization still establishes
 durability. Missing parents are skipped. The method retains one path per distinct
-parent, not a list of every file ID. Checkpoint publication and range removal own
-their directory synchronization; there are no separate directory-sync helpers. Tokio moves
+parent, not a list of every file ID. Index opening, JSON publication and range removal
+share the private `sync_directory(path)` helper. It synchronizes exactly the supplied
+directory through Tokio on Unix and performs no I/O on other platforms. It creates
+nothing, traverses no ancestors and preserves path-bearing errors; each caller
+decides whether a missing directory is acceptable. Range deletion tolerates missing
+parents; index opening and JSON publication propagate failures. Tokio moves
 filesystem work off the async executor; completion still awaits synchronization.
 Windows has no directory-durability guarantee here.
 
@@ -395,15 +399,22 @@ validator seeks to verified append boundaries before transferring these handles.
 `open_index_for_repair(id)` opens the index with read/write access, creating a
 missing empty index and preserving an existing one. It also avoids append mode,
 because repair must be able to replace a bad suffix. Parent directories must
-already exist. A validator opens the log successfully first, so a missing log
-does not create an orphan index. Neither method invents valid records or entries.
+already exist and their hierarchy must be durably established. A validator opens
+the log successfully first, so a missing log does not create an orphan index.
+After opening the index, Unix synchronizes its immediate parent before returning
+the handle. This also applies to an existing index, which may have been created
+by an interrupted recovery. Errors/cancellation can leave a created index; a
+directory-sync failure preserves the directory path and original I/O cause.
+Windows has no directory-durability guarantee here. The validator still must
+establish and synchronize the index contents before publishing a checkpoint.
+Neither method invents valid records or entries.
 
 `StorageError` preserves the requested path and concrete OS error. Returned
 handles belong to the caller; the provider keeps no cache, task or mutex. Default
 file sharing permits independent readers, but these methods do not coordinate
 them, acquire exclusive recovery locks, or make the pair queryable. The caller
-must exclude other writers and withhold recovering indexes from readers. Creating
-a file does not durably synchronize its parent directory or publish stream state.
+must exclude other writers and withhold recovering indexes from readers. Opening
+files and synchronizing an index's parent do not publish stream state.
 
 ## Fresh log/index pair creation
 
@@ -436,8 +447,9 @@ recovery owner must establish the required file and directory-entry durability
 for the prefix covered by that checkpoint. The initializer's `prepare_active_pair`
 uses the empty files without synchronizing them: they contain no records and are
 outside the recovered checkpoint's prefix. Future live-stream writes follow the
-owner's synchronization schedule. Directory-entry durability for recovered progress
-and checkpoint advancement remain unimplemented.
+owner's synchronization schedule. Recovery index opening establishes its immediate
+parent's directory durability on Unix; the initializer publishes recovered progress
+before preparing a new empty pair.
 
 Same-file tests use the shared stream fixtures. They cover unpolled creation,
 missing and reused directories, zero lengths/cursors, readable/writable/seekable
@@ -490,10 +502,13 @@ endpoint, plus append-positioned file handles when partial.
 Handle caching, coordination with independent readers, historical/sealed-file
 reads, startup integration and live file rotation remain unimplemented.
 Checkpoint persistence and fresh log/index-pair creation are implemented;
-per-stream checkpoint advancement remains scaffolded. `prepare_active_pair` retains
+the per-stream initializer advances recovered checkpoints after validation and
+cleanup, before preparing the active pair. `prepare_active_pair` retains
 a validated partial pair or creates a new empty pair through `create_log_and_index`
-without an initial file sync. Directory-entry durability for covered records must
-still be established before checkpoint publication. Interrupted creation requires
+without an initial file sync. Index opening synchronizes its immediate parent on
+Unix before validation, and checkpoint publication synchronizes its own parent
+after renaming. The caller supplies a durably established directory hierarchy;
+neither operation synchronizes ancestors. Interrupted creation requires
 recovery before retrying.
 Directory initialization alone grants no validation, durability or read readiness.
 

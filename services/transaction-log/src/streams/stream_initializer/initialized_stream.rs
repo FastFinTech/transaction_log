@@ -3,7 +3,7 @@ use tokio::fs::File;
 
 use crate::streams::{LogFileId, RecordEndLocation};
 
-/// Planned initialization result owning one stream's active log/index pair.
+/// Initialization result owning one stream's active log/index pair.
 ///
 /// `end` describes the returned file only. An empty file after a completed file
 /// has no local endpoint even though the stream checkpoint covers earlier records.

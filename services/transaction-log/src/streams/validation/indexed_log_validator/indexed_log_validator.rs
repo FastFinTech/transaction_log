@@ -39,8 +39,10 @@ impl IndexedLogValidator {
     /// Errors return no pair, but may follow index creation or completed repairs.
     /// Cancellation can also leave outstanding OS I/O; the caller must quiesce it
     /// before retrying. Recovery is not atomic across the two files. File data is
-    /// synchronized before success; directory-entry durability, checkpoint publication
-    /// and readiness of the whole stream remain the caller's responsibility.
+    /// synchronized before success; durability of ancestor directories,
+    /// checkpoint publication and readiness of the whole
+    /// stream remain the caller's responsibility. Index opening synchronizes its
+    /// immediate parent on Unix; Windows has no directory-durability guarantee.
     pub async fn validate(
         storage: &StorageProvider,
         file_id: LogFileId,
