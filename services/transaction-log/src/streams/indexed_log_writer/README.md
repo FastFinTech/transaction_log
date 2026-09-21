@@ -213,6 +213,22 @@ describes how future request owners use independent handles and choose flushed
 or durable read boundaries. Multi-file startup and lifecycle coordination remain
 future work.
 
+### Preparing the next pair ahead of rollover (planned)
+
+The future live-stream owner can create and open the immediate successor pair
+while the current pair is still accepting records. Holding that empty pair ready
+would move directory creation and file opening ahead of the rollover boundary,
+so the next file's first record need not wait for those operations. Preparation
+does not activate the successor: the current pair must still be completed,
+synchronized and finalized before writes switch to it.
+
+This belongs to the owner coordinating multiple pairs, using the storage provider's
+`create_log_and_index`, rather than to this single-pair writer. After a restart,
+startup recovery can retain an empty successor following a complete prefix, or
+discard it when an earlier partial file or gap ends that prefix. The scheduling,
+failure handling and handover are future work; no background preparation is
+implemented, and its latency benefit has not been measured.
+
 ## Verification
 
 Pair tests live in `indexed_log_writer.rs`. They use literal expected index bytes,

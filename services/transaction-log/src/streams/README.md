@@ -13,8 +13,11 @@ Serde-enabled value; it does not itself load or publish checkpoint files.
 Its stateless entry point creates private state, loads the optional checkpoint,
 checks its stream ID and discovers the maximum log covering its file number. It
 validates successive pairs until a partial file or gap, retaining the recovered
-endpoint and partial pair, then removes the discarded range. Fresh-pair preparation
-and checkpoint advancement remain `todo!()`. Its owned `InitializedStream` result uses read-only
+endpoint and partial pair, then removes the discarded range and prepares the active
+pair, creating an empty pair when needed without synchronizing the empty files.
+Final handover consumes
+the state and returns the pair; checkpoint advancement remains `todo!()`.
+Its owned `InitializedStream` result uses read-only
 getters. Startup integration remains unimplemented; the result contains files
 rather than a writer.
 
@@ -30,7 +33,7 @@ for validation uses the storage provider's named log/index opening methods.
 | --- | --- |
 | [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. |
 | [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write are implemented; initializer advancement is scaffolded. |
-| [Stream initializer](stream_initializer/README.md) | Checked checkpoint loading/discovery, sequential pair validation and later-file cleanup; fresh-pair preparation and publication remain `todo!()`. |
+| [Stream initializer](stream_initializer/README.md) | Checked checkpoint loading/discovery, sequential pair validation, later-file cleanup, active-pair preparation and final handover; checkpoint advancement remains `todo!()`. |
 | [Indexed log writer](indexed_log_writer/README.md) | Append ordered records to a log/index pair; control flushing, synchronization, progress and finalization. Start here for normal output. |
 | [Indexed log validator](validation/indexed_log_validator/README.md) | Recover and synchronize one existing pair from a supplied trusted boundary. Return its endpoint and append-positioned files when partial. Start here for recovery. |
 | [Index writer](index_writer/README.md) | Encode offsets into a reusable buffer and send, flush or synchronize an owned file. Shared by the pair writer and validator. |

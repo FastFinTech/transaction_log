@@ -3,7 +3,7 @@
 This application module groups storage types for log, index and other file types.
 It implements immutable startup configuration, asynchronous construction of the
 root and stream directories, and deterministic log/index/checkpoint paths.
-The provider also opens existing logs and their repairable indexes. The sibling
+The provider creates fresh log/index pairs and opens existing files for repair. The sibling
 [streams module](../streams/README.md) implements indexed appends, validation from
 a supplied trusted boundary, index repair and explicit invalid-tail recovery.
 Stored clustering configuration read/write operations are also
@@ -405,6 +405,48 @@ them, acquire exclusive recovery locks, or make the pair queryable. The caller
 must exclude other writers and withhold recovering indexes from readers. Creating
 a file does not durably synchronize its parent directory or publish stream state.
 
+## Fresh log/index pair creation
+
+`create_log_and_index(id).await` returns `Result<(tokio::fs::File, tokio::fs::File),
+StorageError>`, ordered `(log, index)`. It creates any missing parent directories
+using Tokio's `create_dir_all`, then creates the log followed by the index. Both
+handles are empty, readable/writable and positioned at byte zero. Append mode is
+not enabled, so subsequent seeks control where writes land. The caller owns the
+handles and must exclude concurrent access to the pair and its directory tree.
+
+Both opens use `create_new(true)`. An existing log, including an empty one, is an
+error before the index is touched. An existing orphan index is also an error;
+it is preserved rather than silently discarded or adopted. This keeps recovery
+decisions with the recovery owner. No existence precheck is needed: each create
+operation itself refuses an existing destination, including a dangling file link.
+
+The two creations are not atomic. A directory-creation failure can leave some
+parents created; an index-creation failure leaves the newly created empty log.
+For example, an orphan index remains unchanged alongside that empty log. A direct
+retry then fails at the existing log. There is no rollback or automatic retry:
+quiesce outstanding I/O and inspect/recover partial creation before another
+attempt. Cancelling a polled future can leave directories, one file or both files;
+an unpolled future performs no I/O. Failures use the existing `StorageError::Io`,
+retaining the requested directory or file path and the underlying OS error.
+
+Success establishes open empty files, not durability or a validated stream
+boundary. This method does not synchronize files or directories, choose the
+next file ID, or publish a checkpoint. Before publishing recovered progress, the
+recovery owner must establish the required file and directory-entry durability
+for the prefix covered by that checkpoint. The initializer's `prepare_active_pair`
+uses the empty files without synchronizing them: they contain no records and are
+outside the recovered checkpoint's prefix. Future live-stream writes follow the
+owner's synchronization schedule. Directory-entry durability for recovered progress
+and checkpoint advancement remain unimplemented.
+
+Same-file tests use the shared stream fixtures. They cover unpolled creation,
+missing and reused directories, zero lengths/cursors, readable/writable/seekable
+handles, preserved neighbors/checkpoints, existing empty/nonempty logs, orphan
+indexes, partial creation and retry, and directory obstructions at each range
+level and either file path. Unix tests additionally cover dangling file links.
+Tests check paths and concrete I/O causes, but do not simulate power loss or
+cancellation during kernel I/O. Pair creation has no throughput measurement.
+
 ## Stream-directory initialization and failures
 
 `StorageProvider::new(config).await` performs directory initialization. It uses
@@ -418,7 +460,7 @@ check-then-create race.
 Construction is safe to repeat for an existing root. Existing files and directory
 contents are left intact; construction does not scan, validate, truncate, overwrite
 or clean them up. The four deeper range directories and actual log/index/checkpoint files are
-not created. Future file creation will ensure those parents only as needed.
+not created. `create_log_and_index` creates those parents only as needed.
 
 The first creation failure stops construction without returning a provider.
 `StorageError::path()` identifies the full stream-directory path requested; the actual obstacle may be
@@ -447,12 +489,12 @@ endpoint, plus append-positioned file handles when partial.
 
 Handle caching, coordination with independent readers, historical/sealed-file
 reads, startup integration and live file rotation remain unimplemented.
-Checkpoint persistence is implemented; per-stream recovery advancement remains
-scaffolded. The initializer needs a provider operation for fresh log/index-pair
-creation, including deeper range directories. Existing log acquisition never
-creates a log, and index acquisition requires an existing parent directory.
-Fresh-pair creation must avoid overwriting an existing log and define handling
-for orphan indexes and interrupted creation. This operation is not implemented.
+Checkpoint persistence and fresh log/index-pair creation are implemented;
+per-stream checkpoint advancement remains scaffolded. `prepare_active_pair` retains
+a validated partial pair or creates a new empty pair through `create_log_and_index`
+without an initial file sync. Directory-entry durability for covered records must
+still be established before checkpoint publication. Interrupted creation requires
+recovery before retrying.
 Directory initialization alone grants no validation, durability or read readiness.
 
 Read the [record specification](../../../transaction-log-exports/src/record/README.md)

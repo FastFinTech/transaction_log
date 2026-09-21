@@ -40,6 +40,13 @@ impl LogFileId {
         }
     }
 
+    /// Returns file zero for the given stream, whose first assigned sequence is zero.
+    ///
+    /// This constructs a logical identity; it does not search for the first existing file.
+    pub const fn first(stream_id: StreamId) -> Self {
+        Self::new(stream_id, LogFileNumber::MIN)
+    }
+
     /// Finds the file range assigned to a record, without I/O or validation.
     ///
     /// Every representable record ID maps to a valid file ID. This does not prove

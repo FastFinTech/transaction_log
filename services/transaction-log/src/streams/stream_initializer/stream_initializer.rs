@@ -7,15 +7,16 @@ use super::InitializedStream;
 use crate::{
     storage::{StorageError, StorageProvider},
     streams::{
-        IndexedLogValidationError, IndexedLogValidator, LogFileId, LogFileNumber,
-        RecordEndLocation, StreamCheckpoint, ValidatedFilePair,
+        IndexedLogValidationError, IndexedLogValidator, LogFileId, RecordEndLocation,
+        StreamCheckpoint, ValidatedFilePair,
     },
 };
 
 /// Stateless entry point for initializing one stream's active log/index pair.
 ///
-/// Loading, discovery, pair validation and later-file cleanup are implemented.
-/// Pair preparation and checkpoint publication remain scaffolds. Startup does not call it.
+/// Loading, discovery, pair validation, cleanup and pair preparation are implemented.
+/// Final handover is implemented; checkpoint publication remains scaffolded.
+/// Startup does not call it.
 pub struct StreamInitializer;
 
 impl StreamInitializer {
@@ -29,8 +30,8 @@ impl StreamInitializer {
     ///
     /// # Panics
     ///
-    /// Currently panics in active-pair preparation after successful cleanup because
-    /// the subsequent steps are still unimplemented scaffolds.
+    /// Currently panics in checkpoint advancement after successful pair preparation
+    /// because checkpoint publication is still an unimplemented scaffold.
     pub async fn initialize(
         stream_id: StreamId,
         storage_provider: &StorageProvider,
@@ -47,7 +48,6 @@ impl StreamInitializer {
 }
 
 /// Private working state owned by a single initialization operation.
-#[allow(dead_code)] // Fields will be read as the recovery steps are implemented.
 struct InitializationState<'a> {
     /// Stream selected by the public entry point.
     stream_id: StreamId,
@@ -151,10 +151,8 @@ impl<'a> InitializationState<'a> {
             return Ok(());
         };
         let checkpoint_end = self.checkpoint.map(|checkpoint| checkpoint.end());
-        let first = checkpoint_end.map_or_else(
-            || LogFileId::new(self.stream_id, LogFileNumber::MIN),
-            |end| end.log_file_id(),
-        );
+        let first =
+            checkpoint_end.map_or(LogFileId::first(self.stream_id), |end| end.log_file_id());
 
         for file_id in first.iter_to(maximum)? {
             let last_trusted = checkpoint_end.filter(|end| end.log_file_id() == file_id);
@@ -210,8 +208,34 @@ impl<'a> InitializationState<'a> {
     }
 
     /// Retains the partial pair or creates an empty pair after a full or absent stream.
+    ///
+    /// Validation and cleanup must succeed first. A retained pair is already
+    /// synchronized and positioned for appending. Otherwise, creates file zero or
+    /// the successor of the recovered complete file. New empty files need no sync:
+    /// they contain no records and are not covered by the recovered checkpoint.
+    /// Installs the pair after creation succeeds, with no file-local endpoint,
+    /// preserving the stream-wide recovered endpoint.
+    ///
+    /// Errors/cancellation can leave newly created files without updating state.
+    /// No rollback or automatic retry is provided. Durability of the recovered
+    /// prefix must be established before the following checkpoint publication step.
     async fn prepare_active_pair(&mut self) -> Result<()> {
-        todo!("prepare synchronized files positioned for appending")
+        if self.active_pair.is_some() {
+            return Ok(());
+        }
+        let file_id = self
+            .recovered_end
+            .map_or(LogFileId::first(self.stream_id), |end| {
+                end.log_file_id().next()
+            });
+        let (log, index) = self.storage_provider.create_log_and_index(file_id).await?;
+        self.active_pair = Some(InitializedStream {
+            file_id,
+            log,
+            index,
+            end: None,
+        });
+        Ok(())
     }
 
     /// Synchronizes required directories and publishes the recovered stream endpoint.
@@ -222,8 +246,12 @@ impl<'a> InitializationState<'a> {
     }
 
     /// Consumes completed state and returns the active pair without additional I/O.
+    ///
+    /// Called after checkpoint advancement succeeds. A missing prepared pair is
+    /// an internal initialization-order violation and panics.
     fn finish(self) -> InitializedStream {
-        todo!("return the initialized stream's active pair")
+        self.active_pair
+            .expect("initialization must prepare an active pair before finishing")
     }
 }
 
@@ -1282,5 +1310,189 @@ mod tests {
                 checkpoint_bytes
             );
         }
+    }
+
+    #[tokio::test]
+    async fn preparation_creates_file_zero_for_empty_storage_or_a_gap_before_any_records() {
+        for has_later_log in [false, true] {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            if has_later_log {
+                store_pair(storage, file_id(stream_id, 2), b"discard", Some(b"discard"));
+            }
+            let mut state = validation_state(stream_id, storage).await;
+            state.validate_files().await.unwrap();
+            state.remove_later_files().await.unwrap();
+            let active_id = file_id(stream_id, 0);
+
+            // Merely creating and dropping the future performs no file operations.
+            drop(state.prepare_active_pair());
+            assert!(state.active_pair.is_none());
+            assert!(!storage.log_file_path(active_id).exists());
+            assert!(!storage.index_file_path(active_id).exists());
+
+            state.prepare_active_pair().await.unwrap();
+
+            let pair = state.active_pair.as_mut().unwrap();
+            assert_eq!(pair.file_id(), active_id);
+            assert_eq!(pair.end(), None);
+            assert_eq!(pair.log.metadata().await.unwrap().len(), 0);
+            assert_eq!(pair.index.metadata().await.unwrap().len(), 0);
+            assert_eq!(pair.log.stream_position().await.unwrap(), 0);
+            assert_eq!(pair.index.stream_position().await.unwrap(), 0);
+            assert_eq!(state.recovered_end, None);
+            assert_eq!(state.checkpoint, None);
+            assert!(!storage.checkpoint_file_path(stream_id).exists());
+            assert!(!storage.log_file_path(file_id(stream_id, 1)).exists());
+            assert!(!storage.log_file_path(file_id(stream_id, 2)).exists());
+
+            // An installed pair is retained, even when preparation is called again.
+            state.prepare_active_pair().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_and_handover_retain_validated_empty_and_nonempty_partial_pairs() {
+        for has_records in [false, true] {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let active_id = file_id(stream_id, 0);
+            let log_bytes = if has_records {
+                record_fixture(stream_id, FIRST)
+            } else {
+                Vec::new()
+            };
+            store_pair(storage, active_id, &log_bytes, None);
+            let mut state = validation_state(stream_id, storage).await;
+            state.validate_files().await.unwrap();
+            state.remove_later_files().await.unwrap();
+            let expected_end =
+                has_records.then(|| RecordEndLocation::new(active_id.first_record_id(), 16));
+            let index_bytes = if has_records {
+                16_u64.to_le_bytes().to_vec()
+            } else {
+                Vec::new()
+            };
+
+            state.prepare_active_pair().await.unwrap();
+
+            assert_eq!(state.recovered_end, expected_end);
+            let mut pair = state.finish();
+            assert_eq!(pair.file_id(), active_id);
+            assert_eq!(pair.end(), expected_end);
+            assert_eq!(
+                pair.log.stream_position().await.unwrap(),
+                log_bytes.len() as u64
+            );
+            assert_eq!(
+                pair.index.stream_position().await.unwrap(),
+                index_bytes.len() as u64
+            );
+            assert_eq!(
+                fs::read(storage.log_file_path(active_id)).unwrap(),
+                log_bytes
+            );
+            assert_eq!(
+                fs::read(storage.index_file_path(active_id)).unwrap(),
+                index_bytes
+            );
+            assert!(!storage.log_file_path(active_id.next()).exists());
+            assert!(!storage.index_file_path(active_id.next()).exists());
+            assert!(!storage.checkpoint_file_path(stream_id).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_and_handover_return_the_recovered_complete_files_successor() {
+        // Exercise file zero, a range-directory carry, and a discarded later maximum.
+        for (number, has_gap) in [(0, false), (999, false), (999, true)] {
+            let test_stream = storage_fixture().await;
+            let storage = test_stream.provider();
+            let stream_id = test_stream.stream_id();
+            let complete_id = file_id(stream_id, number);
+            let log_bytes = encoded_records(complete_id, 0..100_000).await;
+            let index_bytes: Vec<u8> = (1..=100_000_u64)
+                .flat_map(|count| (count * 16).to_le_bytes())
+                .collect();
+            store_pair(storage, complete_id, &log_bytes, Some(&index_bytes));
+            let trusted = RecordEndLocation::new(complete_id.last_record_id(), 1_600_000);
+            let checkpoint_bytes = store_checkpoint(storage, trusted);
+            let active_id = complete_id.next();
+            let maximum = if has_gap {
+                let later_id = active_id.next();
+                store_pair(storage, later_id, b"discard", Some(b"discard"));
+                fs::write(storage.index_file_path(active_id), b"orphan index").unwrap();
+                later_id
+            } else {
+                complete_id
+            };
+            let mut state = validation_state(stream_id, storage).await;
+            state.validate_files().await.unwrap();
+            state.remove_later_files().await.unwrap();
+            assert!(state.active_pair.is_none());
+
+            state.prepare_active_pair().await.unwrap();
+
+            assert_eq!(state.recovered_end, Some(trusted));
+            assert_eq!(state.checkpoint.unwrap().end(), trusted);
+            assert_eq!(state.maximum_log_file, Some(maximum));
+            assert_eq!(state.first_file_to_remove, has_gap.then_some(active_id));
+            let mut pair = state.finish();
+            assert_eq!(pair.file_id(), active_id);
+            assert_eq!(pair.end(), None);
+            assert_eq!(pair.log.metadata().await.unwrap().len(), 0);
+            assert_eq!(pair.index.metadata().await.unwrap().len(), 0);
+            assert_eq!(pair.log.stream_position().await.unwrap(), 0);
+            assert_eq!(pair.index.stream_position().await.unwrap(), 0);
+            assert_eq!(
+                fs::read(storage.log_file_path(complete_id)).unwrap(),
+                log_bytes
+            );
+            assert_eq!(
+                fs::read(storage.index_file_path(complete_id)).unwrap(),
+                index_bytes
+            );
+            assert_eq!(
+                fs::read(storage.checkpoint_file_path(stream_id)).unwrap(),
+                checkpoint_bytes
+            );
+            assert!(!storage.log_file_path(active_id.next()).exists());
+            assert!(!storage.index_file_path(active_id.next()).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_preserves_orphan_indexes_and_reports_partial_creation() {
+        let test_stream = storage_fixture().await;
+        let storage = test_stream.provider();
+        let stream_id = test_stream.stream_id();
+        let active_id = file_id(stream_id, 0);
+        let index_path = storage.index_file_path(active_id);
+        fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        fs::write(&index_path, b"orphan index").unwrap();
+        let mut state = validation_state(stream_id, storage).await;
+        state.validate_files().await.unwrap();
+        state.remove_later_files().await.unwrap();
+
+        let error = state.prepare_active_pair().await.unwrap_err();
+
+        assert!(matches!(error.downcast_ref::<StorageError>(),
+            Some(StorageError::Io { path, source })
+                if path == &index_path && source.kind() == io::ErrorKind::AlreadyExists));
+        assert_eq!(fs::read(&index_path).unwrap(), b"orphan index");
+        assert_eq!(
+            fs::metadata(storage.log_file_path(active_id))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(state.active_pair.is_none());
+        assert_eq!(state.recovered_end, None);
+        assert_eq!(state.checkpoint, None);
+        assert_eq!(state.maximum_log_file, None);
+        assert_eq!(state.first_file_to_remove, None);
+        assert!(!storage.checkpoint_file_path(stream_id).exists());
     }
 }

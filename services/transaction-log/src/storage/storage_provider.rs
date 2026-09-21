@@ -13,9 +13,9 @@ use transaction_log_exports::StreamId;
 /// Paths follow the fixed decimal layout documented in this module's README.
 /// Async construction ensures the root and all stream base directories exist.
 /// Path queries are synchronous and perform no filesystem access.
-/// Validation opens existing logs and opens or creates their repairable indexes.
-/// The caller owns returned handles; deeper directory creation and file rotation
-/// remain owner responsibilities. The provider does not cache open handles.
+/// Creates fresh log/index pairs and opens existing files for validation or repair.
+/// The caller owns returned handles, file rotation and recovery coordination.
+/// The provider does not cache open handles.
 /// Established clustering configuration is loaded/published directly through
 /// Serde. UUID assignment and deployment-configuration comparison belong to
 /// application lifecycle policy, not these storage operations.
@@ -363,6 +363,53 @@ impl StorageProvider {
         Ok(None)
     }
 
+    /// Creates a new empty log/index pair and any missing parent directories.
+    ///
+    /// Returns `(log, index)`, both readable/writable and positioned at byte zero,
+    /// without append mode. Creates the log first, then the index, using
+    /// `create_new` for each: existing files, even empty ones or orphan indexes,
+    /// are never opened, truncated or removed. The caller must exclude concurrent
+    /// access to this pair; creating two files is not an atomic operation.
+    ///
+    /// Errors or cancellation can leave directories and a newly created log,
+    /// or both files. There is no rollback or automatic retry. Quiesce outstanding
+    /// I/O and inspect/recover partial creation before another attempt.
+    /// This operation does not synchronize files or directory entries, publish a
+    /// checkpoint, or establish stream continuity. Those remain caller duties.
+    /// An unpolled future performs no I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Io`] with the requested parent directory, log path
+    /// or index path and the original filesystem error for the failed operation.
+    pub async fn create_log_and_index(
+        &self,
+        id: LogFileId,
+    ) -> Result<(tokio::fs::File, tokio::fs::File), StorageError> {
+        let log_path = self.log_file_path(id);
+        let index_path = self.index_file_path(id);
+        let directory = log_path.parent().unwrap();
+        tokio::fs::create_dir_all(directory)
+            .await
+            .map_err(|source| StorageError::io(directory.to_owned(), source))?;
+
+        let log = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&log_path)
+            .await
+            .map_err(|source| StorageError::io(log_path, source))?;
+        let index = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&index_path)
+            .await
+            .map_err(|source| StorageError::io(index_path, source))?;
+        Ok((log, index))
+    }
+
     /// Opens an existing log for validation and explicitly requested tail repair.
     ///
     /// Uses read/write access without creating, truncating or append mode. The
@@ -598,6 +645,8 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::Path;
+
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
     use crate::{
         storage::test_support::storage_fixture,
@@ -1025,6 +1074,218 @@ mod tests {
         let error = provider.maximum_log_file(StreamId::MAX).await.unwrap_err();
         assert_eq!(error.path(), obstructed);
         assert!(matches!(error, super::StorageError::Io { .. }));
+    }
+
+    #[tokio::test]
+    async fn unpolled_pair_creation_leaves_the_stream_empty() {
+        let fixture = storage_fixture().await;
+        let provider = fixture.provider();
+        let id = LogFileId::new(fixture.stream_id(), LogFileNumber::MIN);
+        let creation = provider.create_log_and_index(id);
+        drop(creation);
+        assert_eq!(
+            provider
+                .stream_directory(id.stream_id())
+                .read_dir()
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_creation_returns_empty_seekable_read_write_files_and_preserves_neighbors() {
+        let fixture = storage_fixture().await;
+        let other = storage_fixture().await;
+        let provider = fixture.provider();
+        let checkpoint = provider.checkpoint_file_path(fixture.stream_id());
+        let other_checkpoint = provider.checkpoint_file_path(other.stream_id());
+        fs::write(&checkpoint, b"existing checkpoint").unwrap();
+        fs::write(&other_checkpoint, b"other stream").unwrap();
+
+        // Reuse a leaf, cross its boundary, and create all deeper range levels.
+        for number in [0, 999, 1_000, 1_000_000_000_000] {
+            let id = LogFileId::new(fixture.stream_id(), LogFileNumber::new(number).unwrap());
+            let (mut log, mut index) = provider.create_log_and_index(id).await.unwrap();
+            for (file, path) in [
+                (&mut log, provider.log_file_path(id)),
+                (&mut index, provider.index_file_path(id)),
+            ] {
+                assert_eq!(file.metadata().await.unwrap().len(), 0);
+                assert_eq!(file.stream_position().await.unwrap(), 0);
+                file.write_all(b"abc").await.unwrap();
+                file.flush().await.unwrap();
+                file.seek(io::SeekFrom::Start(1)).await.unwrap();
+                file.write_all(b"X").await.unwrap();
+                file.flush().await.unwrap();
+                file.seek(io::SeekFrom::Start(0)).await.unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, b"aXc"); // Seeking really controls writes, not append mode.
+                assert_eq!(fs::read(path).unwrap(), b"aXc");
+            }
+        }
+        for number in [0, 999, 1_000, 1_000_000_000_000] {
+            let id = LogFileId::new(fixture.stream_id(), LogFileNumber::new(number).unwrap());
+            assert_eq!(fs::read(provider.log_file_path(id)).unwrap(), b"aXc");
+            assert_eq!(fs::read(provider.index_file_path(id)).unwrap(), b"aXc");
+        }
+        assert_eq!(fs::read(checkpoint).unwrap(), b"existing checkpoint");
+        assert_eq!(fs::read(other_checkpoint).unwrap(), b"other stream");
+    }
+
+    #[tokio::test]
+    async fn pair_creation_preserves_existing_logs_and_never_touches_their_indexes() {
+        for bytes in [b"".as_slice(), b"existing log"] {
+            for has_index in [false, true] {
+                let fixture = storage_fixture().await;
+                let provider = fixture.provider();
+                let id = LogFileId::new(fixture.stream_id(), LogFileNumber::MIN);
+                let log = provider.log_file_path(id);
+                let index = provider.index_file_path(id);
+                fs::create_dir_all(log.parent().unwrap()).unwrap();
+                fs::write(&log, bytes).unwrap();
+                if has_index {
+                    fs::write(&index, b"existing index").unwrap();
+                }
+
+                let error = provider.create_log_and_index(id).await.unwrap_err();
+                assert_eq!(error.path(), log);
+                assert_eq!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<io::Error>()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::AlreadyExists
+                );
+                assert_eq!(fs::read(log).unwrap(), bytes);
+                if has_index {
+                    assert_eq!(fs::read(index).unwrap(), b"existing index");
+                } else {
+                    assert!(!index.exists());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_creation_preserves_orphan_indexes_and_leaves_partial_creation_for_recovery() {
+        for bytes in [b"".as_slice(), b"orphan index"] {
+            let fixture = storage_fixture().await;
+            let provider = fixture.provider();
+            let id = LogFileId::new(fixture.stream_id(), LogFileNumber::MIN);
+            let log = provider.log_file_path(id);
+            let index = provider.index_file_path(id);
+            fs::create_dir_all(index.parent().unwrap()).unwrap();
+            fs::write(&index, bytes).unwrap();
+
+            let error = provider.create_log_and_index(id).await.unwrap_err();
+            assert_eq!(error.path(), index);
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<io::Error>()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(fs::read(&log).unwrap(), b"");
+            assert_eq!(fs::read(&index).unwrap(), bytes);
+
+            // A retry must not silently adopt or overwrite the incomplete pair.
+            let error = provider.create_log_and_index(id).await.unwrap_err();
+            assert_eq!(error.path(), log);
+            assert_eq!(fs::read(log).unwrap(), b"");
+            assert_eq!(fs::read(index).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_creation_reports_parent_obstructions_without_modifying_them() {
+        for depth in 0..4 {
+            let fixture = storage_fixture().await;
+            let provider = fixture.provider();
+            let id = LogFileId::new(fixture.stream_id(), LogFileNumber::MIN);
+            let mut blocked = provider.stream_directory(id.stream_id());
+            for _ in 0..=depth {
+                blocked.push("000");
+            }
+            fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+            fs::write(&blocked, b"not a directory").unwrap();
+            let log = provider.log_file_path(id);
+
+            let error = provider.create_log_and_index(id).await.unwrap_err();
+            assert_eq!(error.path(), log.parent().unwrap());
+            assert!(error.source().unwrap().is::<io::Error>());
+            assert_eq!(fs::read(blocked).unwrap(), b"not a directory");
+            assert!(!log.exists());
+            assert!(!provider.index_file_path(id).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_creation_preserves_directory_collisions_at_either_file_path() {
+        for block_index in [false, true] {
+            let fixture = storage_fixture().await;
+            let provider = fixture.provider();
+            let id = LogFileId::new(fixture.stream_id(), LogFileNumber::MIN);
+            let log = provider.log_file_path(id);
+            let index = provider.index_file_path(id);
+            let blocked = if block_index { &index } else { &log };
+            fs::create_dir_all(blocked).unwrap();
+            let sentinel = blocked.join("keep");
+            fs::write(&sentinel, b"preserve me").unwrap();
+
+            let error = provider.create_log_and_index(id).await.unwrap_err();
+            assert_eq!(error.path(), blocked);
+            assert!(error.source().unwrap().is::<io::Error>());
+            assert_eq!(fs::read(sentinel).unwrap(), b"preserve me");
+            if block_index {
+                assert_eq!(fs::read(log).unwrap(), b"");
+            } else {
+                assert!(!index.exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_creation_rejects_dangling_file_links_without_creating_their_targets() {
+        for link_index in [false, true] {
+            let fixture = storage_fixture().await;
+            let provider = fixture.provider();
+            let id = LogFileId::new(fixture.stream_id(), LogFileNumber::MIN);
+            let log = provider.log_file_path(id);
+            let index = provider.index_file_path(id);
+            let linked = if link_index { &index } else { &log };
+            fs::create_dir_all(linked.parent().unwrap()).unwrap();
+            let target = provider
+                .stream_directory(id.stream_id())
+                .join("must-not-create");
+            std::os::unix::fs::symlink(&target, linked).unwrap();
+
+            let error = provider.create_log_and_index(id).await.unwrap_err();
+            assert_eq!(error.path(), linked);
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<io::Error>()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(fs::read_link(linked).unwrap(), target);
+            assert!(!target.exists());
+            if link_index {
+                assert_eq!(fs::read(log).unwrap(), b"");
+            } else {
+                assert!(!index.exists());
+            }
+        }
     }
 
     #[tokio::test]

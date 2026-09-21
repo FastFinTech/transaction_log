@@ -7,8 +7,8 @@ and returns a trusted file-local endpoint. Partial files also return their handl
 positioned for appending. Complete files release both handles.
 
 The [stream initializer](../../stream_initializer/README.md) uses this component
-to validate successive pairs and then cleans up discarded pairs. Fresh-pair
-preparation, checkpoint advancement and startup integration remain unfinished there. This component
+to validate successive pairs, clean up discarded pairs and prepare the active pair.
+Checkpoint advancement and startup integration remain unfinished there. This component
 does not enumerate files, create new logs, delete future files,
 load or publish checkpoints, or decide when a stream is ready.
 

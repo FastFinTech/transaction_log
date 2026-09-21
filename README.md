@@ -228,7 +228,7 @@ failure handling, comparison rules and integration commands.
 - [x] Explicit async buffer output, destination flushing and optional file data synchronization.
 - [x] Single-threaded object-pool utility with unused-object reclamation.
 - [x] Reusable async Serde message I/O with bounded, length-prefixed Postcard frames; application messages and connection integration remain pending.
-- [x] Storage provider with owned startup configuration, async construction that creates the root and stream directories, and deterministic log/index/checkpoint paths.
+- [x] Storage provider with owned startup configuration, async directory initialization, fresh log/index-pair creation and deterministic log/index/checkpoint paths.
 - [x] Typed, validated log-file numbers and identities, with arithmetic mapping from record IDs to file ranges.
 - [x] Typed record start/end locations and a range model with lazy enumeration of bounded, postfix, whole-file and prefix reads.
 - [x] Stream-owned file identities, record endpoints/ranges and checkpoint model, with validated Serde metadata and checkpoint persistence; stream initialization implements step orchestration, checkpoint loading with stream-ID checking, and maximum-log discovery checked against the checkpoint's file number.
@@ -241,7 +241,7 @@ failure handling, comparison rules and integration commands.
 - [ ] Stream routing, ingestion queues, admission control and periodic progress/status messages.
 - [ ] Client ingestion rejection/disconnection.
 - [ ] Multi-file lifecycle coordination and stream-specific index queries.
-- [ ] Complete per-stream recovery: checkpoint loading, discovery, sequential pair validation and later-file cleanup are implemented; fresh-pair preparation and checkpoint advancement remain `todo!()`.
+- [ ] Complete per-stream recovery: checkpoint loading, discovery, sequential pair validation, later-file cleanup, active-pair preparation and final handover are implemented; checkpoint advancement remains `todo!()`.
 - [ ] Active-writer preparation, durable flush scheduling and startup-wide recovery orchestration.
 - [ ] Replication and cluster coordination.
 - [x] Raw and validated single/cluster configuration with fixed node slots and derived DNS hostnames; storage supports configuration read/write, while startup integration remains deferred.
@@ -254,7 +254,8 @@ schedule, live file rotation and startup integration remain to be implemented.
 Pair recovery and storage-level checkpoint publication are implemented. The
 stream initializer loads checkpoint metadata, checks discovery bounds and validates
 successive pairs through the first partial file or gap, then removes the discarded
-range. Fresh-pair preparation and checkpoint advancement remain unimplemented.
+range and prepares the active pair. Final handover is implemented; checkpoint
+advancement remains unimplemented.
 
 ## Workspace and development
 

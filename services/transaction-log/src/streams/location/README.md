@@ -102,6 +102,9 @@ an exception to the completion rule or claim that this terminal file is sealed.
   Exhaustion is a programming error, consistent with `RecordId::next()`.
 - `LogFileId::new(stream_id: StreamId, file_number: LogFileNumber)` combines already
   valid identifiers and returns `Self`. It needs no validation or error type.
+- `LogFileId::first(stream_id)` is a `const` constructor for file zero in the given
+  stream, beginning at sequence zero. It constructs the logical first file ID;
+  it does not find the earliest file currently present in storage.
 - `LogFileId::from_record_id(record_id)` delegates grouping to `LogFileNumber` and
   preserves the validated stream ID, without another validation pass.
 - `LogFileId::record_count_through(record_id)` returns the one-based inclusive

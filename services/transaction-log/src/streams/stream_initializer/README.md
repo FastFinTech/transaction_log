@@ -14,10 +14,12 @@ Discovery records the highest existing log and rejects a maximum below the
 checkpoint's file, including absent logs when a checkpoint exists. Validation
 recovers successive pairs, retaining the first partial pair or marking a gap for
 later cleanup. Cleanup removes the marked range through the discovered maximum.
-Fresh-pair preparation, checkpoint advancement and the final handover still have
-`todo!()` bodies. The result uses `getset` getters without a manual impl. Polling
-`initialize` returns loading/discovery/validation/cleanup errors, or reaches the
-unimplemented pair-preparation step and panics after successful cleanup.
+Preparation retains the validated partial pair or creates an
+empty pair. Final handover consumes the state and returns that pair; only checkpoint
+advancement still has a `todo!()` body. The result uses `getset` getters without a
+manual impl. Polling `initialize`
+returns errors from the implemented steps, or reaches the unimplemented checkpoint
+advancement step and panics after successful pair preparation.
 Application startup does not call it. The previous
 implementation and its obsolete tests have been removed.
 
@@ -30,8 +32,8 @@ implementation and its obsolete tests have been removed.
   Its fields are accessible only within this component.
 - `mod.rs`: declarations, re-exports and this README's Rustdoc inclusion.
 
-The following distinguishes implemented loading, discovery, validation and cleanup from
-the agreed contracts for later recovery steps.
+The following distinguishes the implemented steps, including final handover, from
+the agreed contract for checkpoint advancement.
 
 ## Public API and result
 
@@ -69,8 +71,9 @@ The result owns `file_id: LogFileId`, `log: tokio::fs::File`,
 - `log(&self) -> &File` borrows the owned log handle.
 - `index(&self) -> &File` borrows the owned index handle.
 
-Successful initialization will establish synchronized files positioned for
-appending, with no invalid log bytes or index entries after their accepted ends.
+Successful initialization will return files positioned for appending, with no
+invalid log bytes or index entries after their accepted ends. Recovered records
+are synchronized; freshly created empty pairs require no initial synchronization.
 The pair has room for another record: a completed final file requires preparing
 its successor. No writer is constructed here.
 
@@ -86,12 +89,13 @@ record ID; sequence zero remains a valid first record.
 original checkpoint, discovered maximum file, latest recovered stream endpoint,
 optional active pair and first file to discard. The original checkpoint remains
 available throughout recovery. The first file to inspect is derived from it, or
-from file zero without a checkpoint. No file list or completed-file collection is
+from `LogFileId::first(stream_id)` (file zero) without a checkpoint. The same helper
+selects a new active file when no records survived. No file list or completed-file collection is
 retained. The optional active pair holds at most one set of open files.
 
 The public operation creates state, calls these steps in order, then consumes it.
-Construction, checkpoint loading, discovery, validation and cleanup are implemented;
-the remaining private methods are `todo!()` placeholders:
+Construction, checkpoint loading, discovery, validation, cleanup, pair preparation
+and final handover are implemented; checkpoint advancement remains a placeholder:
 
 | Private method | Return type | Intended responsibility |
 | --- | --- | --- |
@@ -100,9 +104,9 @@ the remaining private methods are `todo!()` placeholders:
 | `async discover_log_files(&mut self)` | `Result<()>` | Implemented: find the maximum log and reject absence or a maximum below a checkpointed file. |
 | `async validate_files(&mut self)` | `Result<()>` | Implemented: recover successive pairs; continue through complete files and stop at a partial pair or missing uncheckpointed log. |
 | `async remove_later_files(&mut self)` | `Result<()>` | Implemented: remove discarded pairs through the discovered maximum. |
-| `async prepare_active_pair(&mut self)` | `Result<()>` | Retain a partial pair or create a synchronized empty pair. |
+| `async prepare_active_pair(&mut self)` | `Result<()>` | Implemented: retain a partial pair or create an empty pair ready for appending. |
 | `async advance_checkpoint(&mut self)` | `Result<()>` | Complete required directory synchronization and publish the recovered stream endpoint. |
-| `finish(self)` | `InitializedStream` | Transfer the prepared pair without more I/O. |
+| `finish(self)` | `InitializedStream` | Implemented: consume the state and transfer the prepared pair without more I/O. |
 
 Here `Result<T>` means `anyhow::Result<T>`. Checkpoint advancement is asynchronous
 to await `StorageProvider::write_checkpoint`, which owns checkpoint publication
@@ -200,7 +204,49 @@ on success or failure, and never publishes a checkpoint. After outstanding I/O
 is quiescent and an obstruction is resolved, the same cleanup range can be
 repeated; already-absent files are accepted. There is no automatic retry or rollback.
 
-## Remaining recovery steps (planned)
+## Active-pair preparation (implemented)
+
+After validation and cleanup succeed, `prepare_active_pair` retains an existing
+`active_pair` without I/O: validation already synchronized its files and positioned
+their cursors for appending. This includes an empty partial file, whose file-local
+endpoint is `None` even when earlier complete files established `recovered_end`.
+
+Without a retained pair, preparation chooses file zero when no records survived,
+or the successor of the recovered complete file. It derives that choice from the
+recovered prefix, not the discovered maximum: files beyond a gap have already been
+discarded. `StorageProvider::create_log_and_index` creates the pair and any missing
+range directories. Preparation installs the returned pair without synchronizing
+the empty files. Both cursors are at byte zero and
+`end == None`; the original checkpoint and stream-wide `recovered_end` are preserved.
+
+There are no records to make durable in a new empty pair, and the recovered
+checkpoint covers only the preceding prefix. Losing the empty pair on a crash
+loses no records; absent files can be recreated. Once records are appended, the
+live stream owner's synchronization schedule establishes their durability.
+That scheduling remains future work. Recovery repairs still synchronize accepted
+records and indexes before their progress can be checkpointed.
+
+Creation errors preserve their concrete `StorageError`, path
+and I/O cause through `anyhow`. State is updated only after success, but failure or
+cancellation can leave directories and one or both files on disk. There is no
+rollback or automatic retry; existing destinations are preserved and rejected by
+creation. Quiesce outstanding I/O and recover existing files before retrying after
+an interrupted operation. Calling preparation again after success simply retains
+the installed pair.
+
+The provider's creation operation can also serve eventual live rollover; this
+private step makes startup's reuse-or-create decision. Required directory-entry
+durability for the recovered prefix remains work for checkpoint advancement.
+
+## Final handover (implemented)
+
+`finish(self)` consumes the private state and moves its prepared `InitializedStream`
+to the caller. It preserves the owned file handles, cursor positions and file-local
+endpoint without further I/O. The public sequence calls it only after checkpoint
+advancement succeeds. A missing active pair is an internal ordering error and
+panics with a specific message; it is not a recoverable storage failure.
+
+## Checkpoint advancement (planned)
 
 Cleanup must complete before checkpoint publication. An empty stream publishes
 no checkpoint, while an empty active file after complete files preserves their
@@ -212,7 +258,8 @@ publication are separate guarantees. Synchronize covered pairs and required
 directories before publishing. The provider synchronizes Unix directories changed
 by checkpoint publication and range deletion, without traversing ancestors.
 It has no separate directory-sync helper; recovery must establish directory-entry
-durability for new or repaired pairs before checkpoint advancement.
+durability for pairs covered by the recovered checkpoint before publication.
+A newly created empty successor is outside that checkpoint's covered prefix.
 Platform limitations remain as described by
 [storage](../../storage/README.md#stream-checkpoints).
 
@@ -224,20 +271,20 @@ cluster coordination or live rotation are part of this scaffold.
 
 ## Storage provider readiness
 
-Existing operations cover checkpoint read/write, maximum-log discovery, log/index
-opening for recovery and pair removal. Checkpoint publication and range removal
+Existing operations cover checkpoint read/write, maximum-log discovery, fresh-pair
+creation, log/index opening for recovery and pair removal. Checkpoint publication and range removal
 own their directory synchronization. File data synchronization is available on
 the returned Tokio files.
 
-One operation is still missing: **creating a fresh log/index pair and its deeper
-range directories**. `open_log_for_validation` only opens an existing log;
-`open_index_for_repair` may create an index but requires its parent directory to
-exist. `StorageProvider::new(config).await` creates stream bases, not range directories
-or log files. Add a purpose-specific provider operation when implementing
-`prepare_active_pair`; it must avoid overwriting an existing log and define how
-an existing orphan index or interrupted creation is handled. Range-based pair
-removal with asynchronous directory synchronization is implemented; fresh-pair
-creation remains deferred.
+`StorageProvider::create_log_and_index(id).await` now creates missing range
+directories and returns an empty `(log, index)` pair with read/write handles at
+byte zero. Both files must be new: existing logs or orphan indexes are preserved
+and reported as errors. Index-creation failure may leave a new empty log;
+interrupted creation must be inspected/recovered before retrying. The
+[storage contract](../../storage/README.md#fresh-logindex-pair-creation) owns the
+details. This operation creates files without synchronizing files or directories.
+`prepare_active_pair` uses those empty files directly. Required directory
+synchronization for recovered progress and checkpoint publication remain unimplemented.
 
 ## Validation and performance
 
@@ -284,8 +331,17 @@ of retained/earlier/other-stream files and checkpoints, and repeatable cleanup.
 Log and index deletion failures verify partial progress, stopping before later
 pairs and preserved concrete errors. These tests do not simulate power loss or
 cancel in-flight filesystem deletion.
-As each later step gains an implementation, add tests for fresh-pair preparation,
-publication ordering and operational failure. Preserve independent fixtures and
+Preparation tests cover unpolled work, empty storage, gaps before any records,
+retained empty/nonempty partial pairs, repeated preparation, completed-file
+successors, range-directory boundaries and gaps beyond a recovered complete file.
+They check append positions, empty new files, preserved recovered endpoints and
+checkpoints, and orphan-index errors that leave partial creation without installing
+a pair. Handover is exercised by these same fixtures: retained partial pairs and
+new empty successors keep their file-local endpoints and append positions after
+the state is consumed. These tests do not simulate power loss; detailed recovery
+synchronization failures remain covered by the validator suites.
+As each later step gains an implementation, add tests for publication ordering
+and operational failure. Preserve independent fixtures and
 observable file/checkpoint results. Recovery throughput has not been measured;
 this is startup work rather than a per-record hot path.
 
@@ -297,5 +353,4 @@ cargo doc -p transaction-log --no-deps --locked
 ```
 
 Follow the [streams validation guidance](../README.md#verification-and-performance)
-to compile documentation examples for this binary crate. The scaffold's narrowly
-scoped unused-code allowances can be removed as its state and methods gain bodies.
+to compile documentation examples for this binary crate.

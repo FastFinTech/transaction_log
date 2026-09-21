@@ -7,8 +7,9 @@ use crate::streams::{LogFileId, RecordEndLocation};
 ///
 /// `end` describes the returned file only. An empty file after a completed file
 /// has no local endpoint even though the stream checkpoint covers earlier records.
-/// The initializer will establish synchronized contents and append-positioned
-/// handles before returning this value. There is no public unchecked constructor.
+/// Recovered records are synchronized, and handles are positioned for appending.
+/// Newly created empty files are not explicitly synchronized; later writes follow
+/// the stream owner's durability schedule. There is no public unchecked constructor.
 #[derive(Debug, CopyGetters, Getters)]
 pub struct InitializedStream {
     /// Identity of the returned files, including when no record exists in them.
