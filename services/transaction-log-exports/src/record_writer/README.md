@@ -1,96 +1,145 @@
 # Record writing
 
-This is the common middle layer for record output to sockets, files and test
-destinations. `RecordWriter<W, Mode>` owns an already-open `AsyncWrite` destination
-and one reusable buffer. Its constructor selects either serialization of new
-records or copying existing records; the type system prevents mixing those append
-APIs on one writer. Record appends are synchronous; the caller explicitly sends
-the accumulated batch with async `flush_buffer()`. Destination flushing is a
-separate operation. The caller chooses batch boundaries, scheduling, durable
-synchronization and shutdown.
+Build or copy transaction-log records into a reusable batch, then send that batch
+to an owned async socket, file or other destination. Appends are synchronous in
+both modes; the caller chooses when to send, flush and synchronize output.
 
-This README is the maintained specification for the writer module and is included
-in Rustdoc. It explains requirements and their reasons; API comments and inline
-safety proofs explain how the code upholds them. The
-[record specification](../record/README.md) owns framing, limits and CRC coverage;
-keep both specifications consistent.
+## Types and modules
 
-## Where to read and maintain the design
-
-| File | Responsibility |
+| Type | Responsibility |
 | --- | --- |
-| `record_writer.rs` | Define the two zero-sized public mode types at the top, then own the destination and batch; invoke callbacks; send, flush and conditionally sync; enforce terminal I/O state. Includes writer and file/synchronization integration tests. |
-| `record_builder.rs` | Build one record in borrowed spare capacity, finalize header/CRC, and roll back unfinished construction. Contains the raw-pointer safety proofs and builder tests. |
-| `async_sync_data.rs` | Define optional data synchronization and adapt Tokio's file method. The generic writer consumes this capability; it is not a new file or socket abstraction. |
-| `record_build_error.rs`, `record_write_error.rs`, `record_output_error.rs` | Distinguish rejected payload construction, callback failure and terminal destination I/O failure. |
-| `mod.rs` | Include this specification and re-export public items; keep implementation out of this entry point. |
+| [`RecordWriter<W, Mode>`](RecordWriter) | Own the destination and batch, append complete records, and track output failures. |
+| [`SerializeRecords`] | Select synchronous payload construction through `write(id, callback)`. |
+| [`ExistingRecords`] | Select synchronous copying through `write_record(&record)`. |
+| [`RecordBuilder`] | Lend a `std::io::Write` destination for one payload and finalize its framing after the callback succeeds. |
+| [`AsyncSyncData`] | Expose optional destination data synchronization, including for Tokio files. |
+| [`RecordBuildError`] | Identify a payload that exceeds the format's size limit. |
+| [`RecordWriteError<E>`](RecordWriteError) | Preserve construction, callback or prior output failures during serialization. |
+| [`RecordOutputError`] | Report destination I/O errors and subsequent use of an unusable writer. |
 
-Start with the ownership and lifecycle contracts below, then read the writer.
-The two mode markers intentionally live beside `RecordWriter` in its source file,
-as an exception to the usual one-type-per-file convention: they only select its
-append API and are easiest to read alongside the implementations they select.
-Read the builder and shared protocol together before changing serialization or
-unsafe storage access. Keep errors and test expectations consistent with the
-stage at which a failure occurs. Do not add independent format constants here.
+The sibling [`record`](crate::record) module owns the wire format, limits and CRC
+contract. [`record_reader`](crate::record_reader) validates incoming encodings and
+returns immutable records suitable for the existing-record mode.
 
-## Why these boundaries exist
+## Usage
 
-The expected producer serializes many fields into a record on a busy executor.
-A record can contain an entire application transaction, but the writer treats
-its body as opaque bytes. The application owns event types, serializers and IDs.
+Choose serialization mode, append a payload, then explicitly send the batch:
 
-| Decision | Reason and tradeoff |
-| --- | --- |
-| Serialize synchronously into an owned `BytesMut` | The final length is unknown until the callback completes, yet it appears first in the encoding. Buffering permits in-place header/CRC finalization and rollback before any incomplete record reaches the destination. |
-| Lend a concrete temporary builder | Serializers can write field by field with static dispatch, without queuing boxed event objects or allocating their own payload vector. |
-| Reuse one batch allocation | Avoid per-record buffer replacement, splitting, reference-count handoffs and pool lookup. Batches can grow; sending one borrows the writer until completion. |
-| Select the append API through the constructor | A writer either serializes new records or copies existing encodings. Separate concrete implementations prevent accidental mixing at compile time, without mode branches or a dispatch trait on the hot path. |
-| Copy existing records into an owned batch | Existing-record appends stay synchronous, preserve order and release the record borrow immediately. This intentionally spends a copy to give callers one explicit sending boundary. |
-| Keep send, flush and durable sync separate | Applications can choose different cadences for batching, destination flushing and persistence. A synchronous append must not incur I/O latency. |
-| Offer synchronization through an optional trait | Files and custom storage can expose persistence without pretending that every socket or byte buffer can provide it. The capability is selected at compile time. |
-| Stop after incomplete destination I/O | Replaying a partially accepted batch can duplicate a prefix; failed synchronization leaves durability unknown. Recovery requires application context this layer does not have. |
+```rust
+use std::io::{self, Write};
+use transaction_log_exports::{RecordId, RecordWriter, SequenceNumber, StreamId};
 
-## Ownership and public API
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut writer = RecordWriter::for_serialization(Vec::<u8>::new());
+let id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
+writer.write(id, |body| {
+    body.write_all(&42_u64.to_le_bytes())?;
+    body.write_all(b"opaque application payload")?;
+    Ok::<_, io::Error>(())
+})?;
+assert!(writer.get_ref().is_empty()); // The record is still in the writer's batch.
 
-`RecordWriter::for_serialization(destination)` and
-`RecordWriter::for_records(destination)` take the destination by value. For a socket,
-the application establishes the connection and completes its handshake first.
-For a file, the application chooses creation/append mode and file position.
-Construction reserves a single 65,535-byte `BytesMut` and performs no I/O.
-The buffer grows as records accumulate and keeps its capacity after output.
-The protocol size limit applies to individual records, not the whole batch.
-In serialization mode, each builder reserves room for a maximum additional record
-before taking its pointer; even a small record can trigger growth if the remaining
-spare capacity is insufficient. Building allocates nothing only when enough
-capacity exists. Existing-record mode appends the known encoded length without a
-builder. Capacity is not readable initialized length.
+writer.flush_buffer().await?;
+writer.flush().await?;
+let encoded = writer.into_inner();
+assert_eq!(encoded.len(), 16 + 8 + b"opaque application payload".len());
+# Ok(())
+# }
+```
 
-### Constructor-selected modes
+Several appends can precede one `flush_buffer`. Its success means the destination
+accepted the bytes; destination flushing and file synchronization remain separate.
 
-| Constructor | Inferred type | Only append method |
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Copying an existing record.** The record already contains its final header,
+payload and CRC. Copying that encoding into the batch ends the source borrow
+immediately, so the record can be released before any output begins:
+
+```rust
+use transaction_log_exports::{Record, RecordOutputError, RecordWriter};
+
+async fn copy_record(record: Record) -> Result<Vec<u8>, RecordOutputError> {
+    let mut writer = RecordWriter::for_records(Vec::<u8>::new());
+    writer.write_record(&record)?; // Synchronous; no destination I/O.
+    drop(record);
+    writer.flush_buffer().await?;
+    writer.flush().await?;
+    Ok(writer.into_inner())
+}
+```
+
+An existing record needs no construction buffer, but direct output to an async
+destination would make each `write_record` asynchronous and retain its borrow
+until output completes. The deliberate copy preserves synchronous appends,
+releases source storage promptly and combines records into a caller-chosen batch.
+Both modes therefore share the same explicit sending boundary.
+
+**Synchronizing a file.** A Tokio file also exposes `sync_data`. To include all
+pending records, send the writer's batch, flush the destination, then synchronize:
+
+```rust
+use std::io::Write;
+use transaction_log_exports::{RecordId, RecordWriter, SequenceNumber, StreamId};
+
+async fn write_file(file: tokio::fs::File) -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = RecordWriter::for_serialization(file);
+    writer.write(RecordId::new(StreamId::MIN, SequenceNumber::MIN), |body| {
+        body.write_all(b"file payload")
+    })?;
+    writer.flush_buffer().await?;
+    writer.flush().await?;
+    writer.sync_data().await?;
+    Ok(())
+}
+```
+
+Those cadences can differ: previously sent and flushed data can be synchronized
+while newer records remain in the writer's batch. A successful sync covers the
+destination's completed data-sync operation under its storage/platform guarantees;
+it does not establish remote replication or necessarily synchronize all metadata.
+
+</details>
+
+## Behavior and guarantees
+
+### Modes, ownership and batching
+
+The constructor takes the destination by value and fixes the append API:
+
+| Constructor | Writer type | Append method |
 | --- | --- | --- |
-| `RecordWriter::for_serialization(destination)` | `RecordWriter<W, SerializeRecords>` | `write(id, callback)` |
-| `RecordWriter::for_records(destination)` | `RecordWriter<W, ExistingRecords>` | `write_record(&record)` |
+| [`for_serialization(destination)`](RecordWriter::for_serialization) | `RecordWriter<W, SerializeRecords>` | `write(id, callback)` |
+| [`for_records(destination)`](RecordWriter::for_records) | `RecordWriter<W, ExistingRecords>` | `write_record(&record)` |
 
-Both constructors work with sockets, files and test destinations. The mode selects
-how records enter the buffer, not the application role, destination kind, stream ID,
-or output policy. A batch may contain multiple stream IDs in either mode. The
-transaction-log application's eventual file-ingestion path may manage received
-records itself; this API does not require that application to use this writer.
+Both modes preserve append order and buffer complete records without I/O. Output
+requires Tokio `AsyncWrite + Unpin`. The destination is already initialized:
+connection setup or file opening and positioning happen before ownership passes
+to the writer. One writer can contain records from multiple streams; sequence
+continuity and application payload validity belong to the caller.
 
-The two marker types are public and re-exported from the crate root so callers can
-name a stored writer's full type. Local variables infer the mode from the named
-constructor. There is deliberately no default mode, ambiguous `new` constructor,
-or conversion that changes an existing writer's append API.
+Each writer initially reserves 65,535 bytes. Batches can grow beyond one record's
+size limit, and capacity is retained after sending. There is no automatic send or
+batch-size limit, so the caller's chosen batch boundaries control latency and
+retained memory. Pending output exclusively borrows the writer; another append
+must wait until that operation completes.
 
-`SerializeRecords` and `ExistingRecords` contain no data. A private marker field
-adds zero bytes for either mode and is never inspected. Mode-specific inherent
-implementations expose the appropriate constructor and append method. Shared
-generic implementations own initialization, I/O, failure tracking and destination
-access. There is no mode trait, vtable, runtime enum or extra mode check. Private
-fields and a private common constructor prevent constructing arbitrary modes.
+<details>
+<summary>Design and maintenance notes</summary>
 
-The following examples must fail because the other append method does not exist:
+**Compile-time API separation.** The public mode markers let callers name a stored
+writer's full type, while local variables infer it from the constructor. They
+contain no data, add no storage and are never inspected. Mode-specific inherent
+implementations expose the append methods; shared implementations own allocation,
+output, failure tracking and destination access. Private fields and construction
+prevent arbitrary modes. There is no default mode or conversion between modes.
+
+The markers live beside the writer struct because their sole purpose is to
+select its API. Keeping them together makes that relationship visible without
+introducing a mode trait, runtime branch or virtual dispatch. The other mode's
+append method is unavailable:
 
 ```compile_fail,E0599
 use transaction_log_exports::{Record, RecordWriter};
@@ -108,277 +157,91 @@ let id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
 writer.write(id, |body| body.write_all(b"payload")).unwrap();
 ```
 
-### Buffering and output shared by both modes
+**Capacity and execution.** Serialization reserves room for one maximum additional
+record before lending the builder. Even a small record can cause growth if less
+than that amount remains. Existing-record mode appends only the known encoded
+length. Allocation failure follows normal `BytesMut` behavior; it has no
+recoverable writer error variant. Large batches can leave large allocations
+resident because successful output clears length without trimming capacity.
 
-There is no automatic submission, batch size limit or capacity trimming. Callers
-choose batch boundaries and therefore control both latency and retained memory.
-A large batch can leave a large allocation resident for later reuse. Allocation
-failure follows normal `BytesMut` behavior, not a recoverable writer error.
+Async output runs where its caller polls it. Runtime requirements come from the
+destination; an in-memory destination can be used without a Tokio runtime. The
+writer imposes no `Send` bound, and ordinary auto traits govern executor use.
+Its exclusive ownership needs no internal lock, queue or worker. A higher layer
+that continues producing while a batch is being sent needs its own storage and
+handoff strategy, because this writer has one exclusively borrowed batch. Such a
+wrapper and its Crossfire-versus-Tokio comparison remain deferred.
 
-Output requires `W: tokio::io::AsyncWrite + Unpin`. Static dispatch is retained
-for concrete destinations. There is no Send requirement, task spawn, runtime
-creation, channel, pool, lock or timer in the writer. Async output runs wherever
-the caller polls it. The supplied destination determines runtime requirements;
-an in-memory implementation can be polled without a Tokio runtime or LocalSet.
-Rust's ordinary auto-trait rules govern moving the writer and its futures;
-single-owner use does not mean the type is forcibly `!Send`. The temporary builder
-is non-Send because it retains a raw pointer only during serialization.
-A trait-generic synchronization future is not promised to be Send.
+</details>
 
-| Method | Contract |
+### Construction and existing records
+
+`write` invokes a concrete callback exactly once on a usable writer. The callback
+can make multiple `std::io::Write` calls into one payload; the writer derives
+length and CRC after it succeeds. Payloads can be empty or contain up to 65,519
+bytes, following the shared [`record` format](crate::record).
+
+Construction errors and callback unwinding discard only the current record.
+Previously buffered records remain available, and the writer remains usable.
+Callback side effects outside the builder do not roll back.
+
+`write_record` copies the complete immutable encoding, preserving its ID, length,
+payload and CRC. It neither clones the record's byte handle, revalidates its
+contents nor recalculates the checksum. Its borrow ends on return.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Building before publication.** The encoded length comes before the payload,
+but is unknown until serialization finishes. Reserving the complete record region
+lets the builder finalize framing in place and abandon incomplete construction
+without exposing any partial record to the destination:
+
+1. Construction remembers the original buffer length, reserves 65,535 additional
+   bytes, and captures a pointer into the full spare region. Header, payload and
+   trailer storage are uninitialized; the readable length remains unchanged.
+2. Each accepted body write initializes bytes after the reserved header and
+   advances only the local payload count. The prefix of earlier records remains
+   untouched, and no byte view into the new record escapes.
+3. After callback success, finalization checks retained errors, derives total
+   length, initializes the header, calculates CRC over header and body, and
+   initializes the trailer. One `set_len` publishes the complete record.
+4. Finalization consumes the builder. The record stays in the same allocation
+   without a split, payload move or conversion into an owning `Record`. Dropping
+   an unfinished builder restores the original length and preserves capacity.
+
+Each callback gets a fresh builder, so one record's error cannot contaminate the
+next. A successful append retains the batch; successful buffer output clears it
+for reuse. Typed IDs already establish their raw-value validity. The writer uses
+the supplied ID without advancing its sequence number or interpreting the payload.
+
+**Error retention.** `write` and `write_all` accept the whole supplied slice or
+return an error without changing the payload or count. Empty writes are valid,
+including at the size limit, unless an earlier write failed. `write_vectored`
+retains the trait's default behavior, so its returned count remains significant.
+
+The first `PayloadTooLarge` error is retained and prevents later writes, builder
+flushes and finalization from succeeding. `Write` wraps it in `io::Error` with
+kind `InvalidInput`. A serializer that ignores or wraps a failed write cannot
+cause publication of a silently truncated record: the retained build error takes
+precedence over its callback result. The writer separately checks callback errors
+that never reached the builder. `RecordBuilder::flush` only reports retained
+errors; it cannot finalize framing or perform I/O.
+
+| `RecordWriteError` variant | Meaning |
 | --- | --- |
-| `for_serialization(destination)` | Take ownership and allocate capacity for one maximum record; select `SerializeRecords`. |
-| `for_records(destination)` | Take ownership and allocate capacity for one maximum record; select `ExistingRecords`. |
-| `write(id, callback)` | Serialization mode only: synchronously serialize and append one complete record, including its header and CRC. No I/O. |
-| `write_record(&record)` | Existing-record mode only: synchronously copy a record's encoding into the batch without repeated validation or checksum calculation. No I/O. |
-| `flush_buffer().await` | Send all buffered bytes, then clear the buffer while retaining capacity. An empty buffer requires no I/O. |
-| `flush().await` | Flush only the destination's own buffering; does not send the writer's buffered records. |
-| `sync_data().await` | Synchronize previously flushed data when `W` also implements `AsyncSyncData`; does not send or flush buffered records. |
-| `get_ref()` | Borrow the destination for observation or destination-specific operations, such as file synchronization. |
-| `into_inner()` | Return destination ownership and discard any unsent records, without implicit flush or shutdown. |
+| `Build` | The builder rejected a payload write, even if the callback ignored the error. |
+| `Serialize(E)` | The callback failed with its original concrete error. |
+| `Output` | Earlier I/O made the writer unusable; the callback was not invoked. |
 
-```rust
-use std::io::{self, Write};
-use transaction_log_exports::{RecordId, RecordWriter, SequenceNumber, StreamId};
+Unfinished construction remains outside the buffer's readable extent. Drop
+normally needs no length change, but truncation enforces rollback during errors
+and unwinding. Successful publication disarms rollback. Panics propagate; process
+abort does not run destructor cleanup.
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let mut writer = RecordWriter::for_serialization(Vec::<u8>::new());
-let id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
-writer.write(id, |body| {
-    body.write_all(&42_u64.to_le_bytes())?;
-    body.write_all(b"opaque application payload")?;
-    Ok::<_, io::Error>(())
-})?;
-assert!(writer.get_ref().is_empty()); // Still entirely in the writer's buffer.
-writer.flush_buffer().await?;
-writer.flush().await?;
-let encoded = writer.into_inner();
-assert_eq!(encoded.len(), 16 + 8 + b"opaque application payload".len());
-# Ok(())
-# }
-```
-
-The body-writing callback receives a concrete `&mut RecordBuilder`, not a trait
-object. It may capture local application state and return its own error type.
-A usable writer invokes it exactly once, immediately inside the synchronous
-`write` call. Success publishes a complete record into the buffer; it says nothing
-about destination acceptance. Repeated calls to the selected mode's append method
-can build one batch before the caller awaits `flush_buffer`. Both modes expose
-that explicit sending operation because both append synchronously into a buffer.
-
-The mutable writer borrow serializes operations. Each builder is consumed before
-`write` returns, so no cached pointer survives into asynchronous output or a
-later reservation. Records stay in the same buffer until complete output succeeds.
-The allocation is then cleared for reuse. There is no spare-buffer lookup, split,
-replacement buffer or second staging buffer in the writer.
-
-Synchronous writes do not wait on the destination. However, this single-buffer
-writer cannot construct the next record while `flush_buffer` is in progress.
-A higher layer needing concurrent production and output must provide its own
-ownership and handoff strategy. Do not add mandatory worker threads or timers
-to this middle layer to satisfy only one destination's policy.
-
-## Existing records and validation boundaries
-
-Existing-record mode accepts immutable, already-validated `Record` values.
-`write_record` copies `record.as_bytes()` into its batch, preserving append order,
-length, ID, payload and CRC exactly. It neither creates a builder, clones the
-`Bytes` handle, revalidates the record nor recalculates CRC. Its borrow ends on
-return; the original record may be dropped before the batch is sent. The writer
-cannot also serialize new records through a callback.
-
-```rust
-use transaction_log_exports::{Record, RecordOutputError, RecordWriter};
-
-async fn copy_record(record: &Record) -> Result<Vec<u8>, RecordOutputError> {
-    let mut writer = RecordWriter::for_records(Vec::new());
-    writer.write_record(record)?;
-    writer.flush_buffer().await?;
-    writer.flush().await?;
-    Ok(writer.into_inner())
-}
-```
-
-This copy is intentional: the append remains synchronous, records retain their
-order, and `flush_buffer` is the sole point that sends records in either mode.
-There is no direct-output bypass. Destination implementations may also copy into
-their own buffering and OS buffers; this is not zero-copy networking or storage.
-
-Typed IDs are already validated, and the reader establishes immutable record
-validity. The writer does not repeat those checks, enforce sequence continuity,
-authorize stream IDs or interpret the body. Those decisions belong to ingestion,
-replay and application code.
-
-## Completion, errors and cancellation
-
-There are three separate completion boundaries after a successful append:
-
-1. `flush_buffer().await` means the destination's `AsyncWrite` accepted all
-   encoded bytes. Its own buffers or internal I/O may still be pending.
-2. `flush().await` means the destination's flush operation completed. It does
-   not read the writer's `BytesMut`, even when that buffer contains newer records.
-3. `sync_data().await` means a supporting destination completed its data-sync
-   operation under its storage/platform guarantees. It does not implicitly
-   perform either preceding step or establish remote replication.
-
-To include every pending record in file synchronization, perform all three in
-that order. Their cadences can differ: data already sent and flushed can be synced
-while newer records remain buffered. No method tracks an acknowledgement,
-replication position or last-durable sequence number. A serializer calling
-`RecordBuilder::flush` reaches none of these boundaries; that `io::Write`
-operation only checks the builder's retained error.
-
-### Partial output and the usability flag
-
-`flush_buffer` advances a borrowed slice through bytes accepted by the destination.
-It retries `Interrupted` at the same position and treats zero progress as
-`WriteZero`. The `BytesMut` retains the entire batch; only the output future
-holds the cursor. Once every byte is accepted, clearing the buffer preserves
-capacity for the next batch. An empty buffer triggers no I/O. Destination flush
-and sync still call their destination methods when our buffer is empty, because
-earlier accepted bytes may need completion.
-
-The `usable` flag is permission to continue, not a statement that the buffer is
-empty, records were received, or data is durable. Each I/O operation sets it false
-before invoking the destination, restoring it only on success. During a pending
-operation, its exclusive mutable borrow prevents other writer calls. Dropping that
-future, unwinding, or returning an I/O error leaves the flag false.
-
-| Outcome | Buffered records and subsequent use |
-| --- | --- |
-| Callback error, sticky builder error or callback panic | Roll back only the current record. Earlier complete records and capacity remain; the writer is still usable. |
-| Successful buffer output | Clear the batch and retain capacity. The writer remains usable; downstream flushing and persistence are separate. |
-| Pending future polled again | Continue the same operation. A send retains its current byte cursor and never restarts at zero. |
-| Unpolled I/O future dropped | No effect; no destination call or state transition has occurred. |
-| Failed, panicking or cancelled send | Some prefix may already be accepted. The whole batch remains buffered but must not be replayed; the writer is unusable. |
-| Failed, panicking or cancelled destination flush or sync | Downstream completion or durability is uncertain. Local buffered records are unchanged; the writer is unusable. |
-| Any write, send, flush or sync after unusability | Return `Unusable` before invoking a callback or touching the destination, including for an empty buffer. |
-
-This is deliberately conservative: cancelling after a pending poll forbids reuse
-even if that destination has not accepted any bytes yet. Cancellation is not an
-ordinary retry path. A fresh `flush_buffer` future would have lost the previous
-cursor, and an async destination may keep doing internal work after its future is
-dropped. There is no reset, cursor reconstruction or automatic recovery here.
-
-The first I/O error is returned intact as `RecordOutputError::Io(io::Error)`.
-Only terminal state is stored; errors are not cloned into a shared slot. Later
-calls return `Unusable`, not the original error. Construction uses
-`RecordWriteError<E>`: `Build` identifies a retained payload-size error,
-`Serialize(E)` preserves the callback's own error, and `Output` reports a writer
-already made unusable by previous I/O. A sticky build error takes precedence over
-a callback error, including when the serializer wraps or ignores a failed write.
-Callback panics are not caught, and side effects outside the builder do not roll back.
-
-### Ownership recovery and shutdown
-
-Dropping a writer or calling `into_inner` discards unsent records without sending,
-flushing, synchronizing or shutting down the destination. If those records must
-be sent, explicitly complete the appropriate operations first. `into_inner`
-remains available after failure so the owner can close or recover its destination;
-extracting it, or putting it in a new writer, does not repair partial framing or
-establish the previous durability boundary.
-
-`get_ref` exposes destination-specific operations such as a file's `sync_all`.
-Those operations bypass the writer's usability checks and failure tracking.
-Callers must handle their errors and preserve ordering if a destination supports
-writing, seeking or cloning a handle through a shared reference. Prefer the
-writer's own `sync_data` when data synchronization is sufficient.
-
-## Optional data synchronization
-
-`AsyncSyncData` is a public capability trait in `async_sync_data.rs`, re-exported
-from this module and the crate root. It is implemented for `tokio::fs::File` by
-delegating to the file's inherent `sync_data` method. The writer exposes
-`sync_data(&mut self)` only when `W: AsyncWrite + AsyncSyncData + Unpin`.
-
-```rust
-use std::io::Write;
-use transaction_log_exports::{RecordId, RecordWriter, SequenceNumber, StreamId};
-
-# async fn example(file: tokio::fs::File) -> Result<(), Box<dyn std::error::Error>> {
-let mut writer = RecordWriter::for_serialization(file);
-writer.write(RecordId::new(StreamId::MIN, SequenceNumber::MIN), |body| {
-    body.write_all(b"file payload")
-})?;
-writer.flush_buffer().await?;
-writer.flush().await?;
-writer.sync_data().await?;
-# Ok(())
-# }
-```
-
-These remain three distinct operations. Calling `sync_data` while our buffer is
-nonempty leaves its records untouched; calling it before destination flushing
-does not promise that downstream buffered records are durable. Implementations
-must synchronize previously flushed data without implicitly draining a wrapper's
-pending write buffer. They should defer I/O until polled and propagate I/O errors.
-The file implementation delegates to Tokio's inherent method, preserving its
-runtime requirements, I/O scheduling, error and platform behavior. It can omit
-metadata and may behave like `sync_all` on some platforms. This adapter adds no
-thread, timer or extra `AsyncWrite::flush` call. Tokio's `fs` feature is a normal
-dependency feature so downstream users can use this implementation outside tests.
-
-Custom storage wrappers and test destinations can implement the trait. It takes
-exclusive mutable access so wrappers may maintain local state. Its return type
-is an implementation-specific future without a `Send` bound; no boxed future,
-`async-trait` dependency or runtime capability check is required. Implementors
-can write a native `async fn` to satisfy that signature. The trait does not
-promise allocation-free internals for every implementation, nor can generic
-callers assume its future can be passed to `tokio::spawn`.
-Exclusive `&mut self` supports wrappers with mutable state and matches the writer's
-serialized operation order; Tokio's file adapter can pass that as a shared borrow
-to the underlying file method. This adds no fields, branches or synchronization
-to record construction.
-
-The capability is not inferred from `AsyncWrite` or automatically forwarded
-through wrappers such as `BufWriter<File>`. Only Tokio files have a production
-implementation here. A custom storage wrapper must implement its own capability
-and keep its pending buffer separate from synchronization. An implementation must
-await actual sync completion and return failures; reporting success after merely
-scheduling work would violate the contract. Test destinations may simulate that
-completion, but passing their tests does not prove physical durability.
-
-In-memory byte buffers and sockets do not expose this method:
-
-```compile_fail,E0599
-use transaction_log_exports::RecordWriter;
-let mut writer = RecordWriter::for_serialization(Vec::<u8>::new());
-let _ = writer.sync_data();
-```
-
-Synchronization follows the terminal I/O lifecycle described above. Even after
-complete writes, uncertain persistence is an application recovery decision.
-The trait itself has no shared error state; the writer owns that lifecycle policy.
-
-## Construction lifecycle
-
-Each builder constructs exactly one complete record. It exclusively borrows a
-writer-owned `BytesMut` and preserves the prefix of previously buffered records.
-One callback constructs one record; many callbacks can contribute to a batch.
-The temporary builder has no reset cycle or owned allocation. Only explicit,
-successful buffer output clears the allocation for reuse.
-
-1. `new(buffer)` remembers the original length, reserves 65,535 additional bytes,
-   and captures a pointer covering the whole spare record region. Header, payload,
-   and trailer storage remain uninitialized. `payload_len` starts at zero and the
-   buffer's readable length stays unchanged.
-2. `std::io::Write` calls append payload bytes directly after the reserved header.
-   Many writes may contribute to one record. Each accepted append advances only
-   the cached payload count, bounded to 65,519 bytes.
-3. After serialization succeeds, `finish(self, id)` checks retained errors and
-   derives total length. The protocol's `write::header` initializes the header;
-   `write::crc` calculates CRC-32C over the header and body and initializes the
-   trailer. One `set_len` then publishes the complete initialized record.
-4. The completed bytes remain in the same buffer without a split, payload move,
-   padding, or conversion into an owning `Record`. Finishing consumes the builder.
-   Dropping it unfinished preserves the prefix and buffer capacity.
-
-The supplied `RecordId` provides the stream ID and sequence number. Length and
-CRC come from the bytes written; callers do not provide them. Typed stream IDs
-already satisfy their range restriction. The builder does not revalidate IDs,
-check sequence continuity, or advance a sequence number.
-
-Callers can name the builder type but cannot construct or finish one themselves.
+**Builder access.** A concrete, generic callback gives serializers static dispatch
+through `Write` without an intermediate payload vector or a custom serialization
+trait. Callers can name the builder type but cannot construct or finish one:
 
 ```compile_fail,E0624
 use bytes::BytesMut;
@@ -394,102 +257,155 @@ fn finalize(builder: RecordBuilder<'_>, id: RecordId) {
 }
 ```
 
-The body is opaque. Transactions, event types, inner headers, type/version IDs,
-and serializer selection belong to the caller's application. The builder never
-interprets or patches inner headers. The writer exposes a scoped concrete builder
-through a synchronous, generic, unboxed callback.
-Application code does not need its own intermediate serialized byte vector or
-an implementation of a library-specific serialization trait.
+Its exclusive buffer borrow prevents concurrent construction or external byte
+views. The cached `NonNull<u8>` makes the builder neither `Send` nor `Sync`; it is
+consumed on the producer's thread before async output or another reservation.
 
-## Errors, publication, and ownership
+</details>
 
-`write` and `write_all` accept their entire input or return an error without
-changing the payload or its count. Empty writes are valid, including at the
-payload limit. `write_vectored` retains the trait's default behavior, so callers
-must honor its returned byte count.
+### Completion and failures
 
-`RecordBuildError::PayloadTooLarge` is sticky: the first failed write prevents
-further successful writes, flushes, or finalization, including empty writes.
-`Write` methods wrap the typed error in `io::Error` with kind `InvalidInput`.
-`check_error()` inspects this retained state; it does not validate framing or CRC.
-A fresh builder starts with no error. Allocation failure follows normal
-Rust/BytesMut behavior and is not a recoverable build-error variant.
+| Operation | Completion guarantee |
+| --- | --- |
+| [`flush_buffer().await`](RecordWriter::flush_buffer) | The destination accepted every buffered byte. Clear the batch while retaining capacity; an empty batch performs no I/O. |
+| [`flush().await`](RecordWriter::flush) | The destination's own flush completed. Records still in the writer's batch are untouched. |
+| [`sync_data().await`](RecordWriter::sync_data) | A destination implementing `AsyncSyncData` completed data synchronization. This does not send or flush either layer's pending buffers. |
+| [`get_ref()`](RecordWriter::get_ref) | Borrow the destination; operations through this reference bypass the writer's failure tracking. |
+| [`into_inner()`](RecordWriter::into_inner) or drop | Discard unsent records without implicit sending, flushing, synchronization or shutdown. `into_inner` returns destination ownership. |
 
-`finish` rejects retained errors even if a serializer ignores a failed write.
-The caller must independently check the serializer's own result before invoking
-`finish`; failures that never reach the builder's methods cannot be inferred.
-Drop the builder when serialization fails. `flush()` reports retained errors
-only: it performs no I/O and does not finish a record.
+To synchronize all pending file output, call `flush_buffer`, `flush`, then
+`sync_data`, in that order. Destination flush and sync still call the destination
+when the writer's batch is empty. None of these methods establishes remote
+acknowledgement or maintains a last-durable record ID.
 
-An unfinished builder's drop truncates to the original buffer length, including
-after rejected finalization and during unwind. Before publication, incomplete
-bytes lie outside that readable extent, so this normally changes no length.
-Successful finalization disarms rollback. Earlier records and current buffer
-capacity survive; callback side effects elsewhere do not roll back. Process
-abort does not run destructor cleanup.
+**Failed, panicking or cancelled I/O makes the writer unusable.** A prefix may
+already have been accepted, so retrying the batch could duplicate bytes. Later
+appends and output operations return `Unusable`. Dropping an unpolled future has
+no effect; retaining and polling the same pending future continues its operation.
 
-The exclusive buffer borrow prevents another record or external byte view from
-accessing the region under construction. The builder stays on the producer's
-thread during synchronous serialization. Its cached `NonNull<u8>` makes it
-neither `Send` nor `Sync`, and it has no manual implementations of those traits.
-The builder is consumed before asynchronous output begins. The writer retains
-the allocation across that output, then clears it for reuse. Finalization
-establishes neither remote receipt nor replication nor durability.
+<details>
+<summary>Design and maintenance notes</summary>
 
-## Hot-path design and safety
+**Partial output.** The send future advances a borrowed slice as bytes are
+accepted. It retries `Interrupted` at the same position and treats zero progress
+as `WriteZero`. The buffer retains the entire batch until every byte is accepted;
+only the future holds the progress cursor. Successful output clears the buffer.
 
-Reservation happens once per record, before deriving the cached pointer. Body
-writes and finalization cannot grow, split, reclaim, or otherwise relocate the
-allocation. With sufficient spare capacity, builder construction allocates
-nothing. Growth between records can allocate and move earlier buffered bytes;
-the pointer is captured only after reservation completes. The writer always
-holds a buffer before creating the builder.
+Before invoking destination I/O, the writer sets `usable` to false. It restores
+the flag only on success. An error, unwind or cancellation therefore leaves a
+terminal state without needing a drop guard. The exclusive mutable borrow
+prevents other calls while the operation is pending. This flag grants permission
+to continue; it does not certify receipt, an empty buffer or durability.
 
-`payload_len` excludes the header, trailer, and earlier records. The write guard
-compares incoming length with `MAX_PAYLOAD_LEN - payload_len`, avoiding overflow
-for rejected input. Accepted writes perform a direct copy into
-`record_start + HEADER_LEN + payload_len` and advance only the local count.
-They do not obtain a fresh buffer view, inspect capacity, update `BytesMut` length,
-synchronize, perform I/O, or allocate auxiliary storage. Error conversion may
-allocate on the failure path.
+| Outcome | Retained state and consequence |
+| --- | --- |
+| Pending send polled again | Continue from its cursor, including across record boundaries. |
+| Failed, panicking or cancelled send | Retain the whole batch, but forbid replay and further output. |
+| Failed, panicking or cancelled flush or sync | Leave newer buffered records unchanged; destination completion is uncertain and further output is forbidden. |
+| Any append, send, flush or sync after failure | Reject before invoking a callback or touching the destination, even for an empty batch. |
 
-The cached pointer is derived from the full spare region, allowing it to address
-header, body, and trailer. The exclusive borrow and reservation keep that region
-alive and stationary. No destination view escapes to the serializer, so its
-source slice cannot overlap it. Copying initializes bytes before the count is
-advanced. The readable buffer length remains at its original value until finish.
+Cancelling after a pending poll forbids reuse even if no bytes have yet been
+accepted. A replacement future would have lost the old cursor, and a destination
+may continue internal I/O after its future is dropped. The writer provides no
+reset or automatic recovery. The first I/O error is returned intact through
+`RecordOutputError::Io`; subsequent calls return `Unusable` because only terminal
+state, rather than a cloned error, is retained.
 
-The protocol helpers own encoded offsets, unaligned little-endian stores, CRC
-coverage, and trailer placement. `write::header` accepts uninitialized storage and
-initializes every header byte. `write::crc` reads only the initialized header and
-body, then writes the uninitialized trailer after that shared view ends. The
-builder establishes their capacity, initialization, and exclusive-access
-preconditions, then publishes the total length. It never uses the cached pointer
-after publication. Keep the local unsafe proofs and protocol contracts together.
+`into_inner` remains available after failure so the owner can close or recover
+the destination. Extracting it or placing it in a fresh writer does not repair
+partial framing or establish durability. Destination-specific operations through
+`get_ref`, such as `sync_all`, require the caller to handle errors and preserve
+ordering when shared references permit writing, seeking or handle cloning.
 
-Serialized bytes are not prefilled, shifted, or copied into a second record buffer.
-Existing records are copied once into the batch by `write_record`. The fixed
-payload bound proves that adding 16 framing bytes fits in both `usize` and `u16`,
-so finish need not repeat range validation. Builder and writer tests exercise
-prefix preservation across successful appends, rejected records and unwinding.
+**Optional synchronization.** `AsyncSyncData` separates persistence capability
+from byte acceptance. Its Tokio file implementation delegates to the inherent
+`sync_data` method, preserving its scheduling and platform guarantees without
+adding a destination flush. Metadata can be omitted, and some platforms may
+provide the same behavior as `sync_all`.
 
-Pinning is unnecessary: the pointer addresses a separate heap allocation, and
-moving the builder does not move that allocation. Preventing buffer relocation
-while the pointer is live is the actual requirement. Pinning a `BytesMut` handle
-would not establish it.
+A custom wrapper's implementation must await actual sync completion and return
+its error, without implicitly draining that wrapper's pending write buffer. Work
+is deferred until the future is polled. Merely scheduling a sync cannot establish
+success. Simulated test destinations can establish ordering and error handling,
+but cannot prove physical durability.
 
-Keep the constructor and write path inline. The callback receives the concrete
-builder, so this API introduces no virtual `Write` call. A serializer can still
-choose to erase its destination type internally. Variable-sized writes retain
-necessary bounds checks unless the compiler proves them redundant. No queue,
-task, or shared-state borrow occurs inside the serialization callback. The enclosing
-`write` checks its local usability flag before serialization but performs no
-I/O. `flush_buffer`, destination `flush` and `sync_data` set the flag false before
-I/O and restore it only after success.
+The trait takes exclusive mutable access so wrappers can track local state and
+participate in the writer's serialized operation order. Its implementation-specific
+future needs no boxing or virtual dispatch and has no `Send` bound. A native
+`async fn` can implement it; generic callers cannot assume that future can be
+spawned on another thread or that every implementation allocates nothing.
+The trait itself has no shared failure state; the writer owns that policy.
 
-The following measurements motivate the retained builder implementation. Its
-construction, append, and finalization algorithms are unchanged by this buffered
-output integration. These measurements are not current end-to-end throughput claims.
+Only Tokio files have a production implementation here. The capability is not
+automatically forwarded through wrappers such as `BufWriter<File>`, and byte
+buffers and sockets do not acquire it from `AsyncWrite`:
+
+```compile_fail,E0599
+use transaction_log_exports::RecordWriter;
+let mut writer = RecordWriter::for_serialization(Vec::<u8>::new());
+let _ = writer.sync_data();
+```
+
+**Ordering log and index output.** The service's
+[indexed log writer](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/streams/indexed_log_writer/README.md)
+combines existing-record mode with an index writer. It completes log sending and
+destination flushing before sending the matching index entries, because a Tokio
+file may accept bytes before its underlying write finishes. This prevents index
+output from preceding the log data it describes. The pair's `sync_data` includes
+pending output; this general writer's `sync_data` remains destination-only.
+
+</details>
+
+## Performance
+
+Serialization writes payload chunks into their final batch storage, then
+initializes the header and CRC in place. Existing-record mode copies each encoding
+once into that batch. Both reuse capacity after sending; growth between records
+can allocate and move buffered bytes. Destinations and the operating system may
+perform further copies.
+
+The [benchmark suite](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log-exports/benches/README.md)
+measures serialization and existing-record copying separately. Its writer target
+uses a raw byte drain; the combined target uses the production reader and validates
+each record. These TCP workloads do not measure durable storage or application
+response latency.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Work per field and per record.** One upfront reservation per record establishes
+stable storage for all body writes and finalization. No operation can grow, split
+or relocate the allocation while the cached pointer is live. Growth happens before
+the pointer is derived, so it may move earlier records safely. Sufficient spare
+capacity avoids that allocation.
+
+Each body write checks the retained error and compares its length with
+`MAX_PAYLOAD_LEN - payload_len`, avoiding overflow on rejected input. It copies
+directly to `record_start + HEADER_LEN + payload_len`, then advances the local
+count. It performs no capacity lookup, buffer-length update, I/O or auxiliary
+allocation. Error conversion may allocate on the failure path. The constructor
+and write path are inline so generic callbacks expose these operations to the
+optimizer; a serializer can still choose to erase its destination type internally.
+Variable-sized writes retain bounds checks unless the compiler proves them
+redundant.
+
+**Pointer and initialization proof.** The pointer derives from the full spare
+region and can address header, body and trailer. Reservation and exclusive access
+keep the allocation live and stationary; no destination view escapes, so the
+source slice cannot overlap it. Copies initialize bytes before advancing the
+payload count. The buffer's readable length stays at its original value until
+finalization.
+
+The shared protocol helpers own offsets, unaligned little-endian stores, CRC
+coverage and trailer placement. Header initialization establishes every header
+byte. CRC reads only the initialized header and payload, then writes the trailer
+after that shared view ends. Only then can `set_len` expose the entire record;
+the pointer is never used after publication. The payload bound already proves
+that adding the 16 framing bytes fits both `usize` and `u16`.
+
+Moving the builder does not move its separate heap allocation. Preventing buffer
+relocation during construction is the required guarantee; pinning the `BytesMut`
+handle alone would not establish it.
 
 ### Cached pointer measurement and selection
 
@@ -518,12 +434,12 @@ these inputs, not end-to-end throughput or an isolated measure of pointer cachin
 The cached pointer and deferred length were selected because many small writes
 are the expected hot path: they improved both measured small-write workloads,
 with a much larger saving for direct writes than for the Postcard sample.
-Real command-handler transaction types are not yet available. This is the best
-measured choice for those workloads, not a guarantee for every serializer or
-payload. Recheck with actual transactions when they become available.
+Real command-handler transaction types are not yet available, so applicability
+to those workloads remains unmeasured. These results support the choice for the
+tested inputs without establishing a gain for every serializer or payload.
 Local experimental sources, pinned dependencies, checks, and raw results are
 under `target/record-builder-pointer-bench/`; those ignored artifacts may be
-removed by a clean build. Preserve these conditions with any new measurement.
+removed by a clean build.
 
 ### Finalization code generation
 
@@ -601,103 +517,69 @@ This is code-generation evidence for two fixed workloads, not a measurement of
 async I/O latency or overall throughput. Pending destinations and real serializers
 can produce different code and costs. Earlier `target/record_writer_*probe.*`
 artifacts may use removed APIs; all these ignored files can disappear on a clean
-build. Preserve compiler, target and measurement conditions with new evidence.
+build.
 
-## Higher layers and deferred work
+</details>
 
-The command-handler application decides event types, transaction serialization,
-sequence numbers, connection setup, acknowledgements, admission policy and any
-background output workers. The transaction-log application decides stream/file
-routing, append position, batching, index updates, durable sync cadence, recovery
-and worker sharing across files. Neither application layer is implemented here.
+## Validation
 
-The transaction-log application's [indexed log writer](../../../transaction-log/src/streams/indexed_log_writer/README.md)
-now composes the existing-record mode with its file-only `IndexWriter`. It enforces a
-file's sequence range and completes log output and destination flushing before
-writing index entries. Its pair-level `sync_data` includes pending output;
-this general writer's `sync_data` remains the separate destination-only operation.
-
-A high-throughput background wrapper must manage multiple buffers if its producer
-continues while output is pending. The current middle layer owns one buffer and
-appends records synchronously, then sends a batch when explicitly asked. The
-requested Crossfire-versus-Tokio benchmark remains deferred until the surrounding
-output design is reviewed; neither channel
-crate is needed by this implementation.
-
-The opt-in [benchmark suite](../../benches/README.md) distinguishes reader-only,
-writer-only and combined TCP paths. Writer targets separately measure synchronous
-serialization and copying existing records. The writer-only receiver drains raw
-bytes, avoiding timed reader work; the combined receiver validates every record.
-Socket completion remains distinct from buffered file output, durable
-synchronization and command-response latency. Long performance runs stay opt-in;
-the benchmark README records workload, conditions and measured results.
-
-## Verification and maintenance
-
-Builder tests remain in `record_builder.rs`. They cover many small writes,
-prefix preservation, reservation from insufficient capacity, stable storage,
-deferred publication, empty/maximum payloads, atomic rejection, sticky errors
-and rollback. Golden frames, independent CRC expectations, arbitrary byte
-offsets and guard bytes protect the protocol and unsafe initialization.
-The real-reader integration test compares the decoded `RecordLength` with a
-typed expected length derived from the input payload and the independently
-specified 16-byte overhead, including empty and maximum payloads.
-
-Writer tests are in `record_writer.rs`. They cover owned non-Send sinks without
-a runtime, immediate callbacks without I/O, batches exceeding one record's limit,
-append order in each mode, allocation reuse, construction errors/unwind,
-partial writes, interruption, zero progress, I/O errors, cancellation before and
-after partial output, unpolled futures, destination panic, empty buffer output,
-separate buffer/destination flushing, discarded unsent records, ownership recovery
-and rejection of output after failure. Synchronization tests cover explicit
-ordering, no implicit output or destination flush, non-Send pending futures,
-original errors, cancellation, panic, and rejection after prior I/O failures.
-The same-file edge-case coverage also includes:
-
-| Boundary | What the tests establish |
-| --- | --- |
-| Every incomplete byte prefix of an existing-record batch | I/O errors, zero progress, cancellation and panic retain the batch, reject all later operations, and never replay bytes when ownership is extracted or dropped. This includes record boundaries and CRC bytes. |
-| Mode-specific failure rejection | Both modes preserve the batch and reject appends after zero progress or a partial I/O error. Serialization callbacks are never invoked after terminal output, flush or sync failures. |
-| Repeated `Interrupted` and `Pending` results after progress | The same send future resumes at the correct cursor across records and completes after the last byte without an extra destination call. |
-| Destination flush lifecycle | Dropping an unpolled future has no effect; pending flushes can resume; errors, cancellation and panic preserve newer unsent records and forbid further output. |
-| Buffered destination failure | Partial failure while flushing an actual `BufWriter` does not send the writer's newer batch or replay the earlier accepted prefix. |
-| Maximum existing records | Repeated copies can exceed one record's size limit in aggregate, preserve caller-supplied IDs even at `u64::MAX`, and reuse the allocation for a shorter later batch without leaking old bytes. |
-| Callback failure after filling the maximum payload | Both error and unwinding roll back after buffer growth; subsequent shorter records reuse the initialized spare storage without exposing abandoned bytes. |
-| Failure after a previous successful sync | The earlier durable boundary does not mask later errors, cancellation or panic; the same terminal policy applies to initial and later sync attempts. |
-
-Scripted destinations make failure timing deterministic without sleeps or network
-races. Scripts reject unexpected additional writes, so cursor/retry regressions
-fail the test instead of silently succeeding against an always-ready sink.
-File integration exercises both modes, including durable synchronization, and
-handshake-complete socket integration exercises serialization mode. Their bytes
-pass through the real reader. Temporary-file tests do not simulate power loss.
-Compile-fail examples enforce the absence of the other mode's append method,
-builder privacy and the absence of data synchronization without the capability.
-
-For behavioral changes, run workspace tests in debug and release, formatting,
-Clippy and Rustdoc with warnings denied:
+From the workspace root, documentation examples and generated API links can be
+checked with:
 
 ```powershell
 cargo fmt --all --check
+cargo test --workspace --doc --locked
+cargo rustdoc -p transaction-log-exports --locked -- -D warnings
+```
+
+Behavioral checks cover construction, both append modes and destination failures:
+
+```powershell
 cargo test --workspace --locked
 cargo test --workspace --release --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-$env:RUSTDOCFLAGS = '-D warnings'
-cargo doc --workspace --no-deps --locked
 ```
 
-For documentation-only changes, compile documentation examples with
-`cargo test --workspace --doc --locked` and build Rustdoc with warnings denied;
-formatting and checking links/contracts are still necessary. Do not claim a new
-performance result from documentation changes.
+Independent encoded fixtures and CRC expectations protect the format; scripted
+destinations exercise partial progress and cancellation deterministically.
 
-Recheck optimized callback code generation when changing serialization, its
-generic call boundary or pointer/reservation bookkeeping. Preserve compiler,
-target, workload and measurement limits with new evidence. Long throughput
-benchmarks remain opt-in; routine tests do not run them.
+<details>
+<summary>Design and maintenance notes</summary>
 
-Maintain API comments, inline invariants, this README and the record specification
-together. When changing batching or adding a wrapper, recheck all three completion
-boundaries, append order in each mode and compile-time API separation. When
-changing error handling, recheck callback rollback separately from partial I/O and synchronization
-uncertainty. Keep protocol expectations independent of production encoders.
+**Construction and encoding.** Builder tests cover many small writes, prefix
+preservation, insufficient initial capacity, stable storage, deferred publication,
+empty/maximum payloads, atomic rejection, sticky errors and rollback. Golden
+frames, independent CRC values, arbitrary byte offsets and guard bytes establish
+encoding and initialization boundaries. Real-reader integration compares decoded
+typed lengths with payload length plus an independently specified 16-byte overhead.
+
+**Output and ownership.** Writer tests establish immediate callbacks without I/O,
+owned non-Send sinks without a runtime, batches larger than a record, append order,
+allocation reuse, empty output, discarded unsent records and destination recovery.
+The critical failure cases are:
+
+| Boundary | What the tests establish |
+| --- | --- |
+| Every incomplete byte prefix of an existing-record batch | I/O errors, zero progress, cancellation and panic retain the batch, reject later operations, and never replay bytes on extraction or drop, including at record boundaries and within CRC bytes. |
+| Mode-specific failure rejection | Both modes preserve the batch and reject appends after zero progress or a partial I/O error; serialization callbacks are not invoked after terminal send, flush or sync failure. |
+| Repeated `Interrupted` and `Pending` after progress | The same future resumes at its cursor across records and completes without an extra destination call. |
+| Unpolled and cancelled operations | Unpolled futures are inert; cancellation before or after partial acceptance makes polled I/O terminal. |
+| Destination flush lifecycle | Pending flushes can resume; errors, cancellation and panic preserve newer unsent records and forbid further output. |
+| Actual `BufWriter` partial failure | Flushing downstream bytes neither sends the writer's newer batch nor replays the already accepted prefix. |
+| Maximum existing records | Repeated copies exceed one record's limit in aggregate, preserve IDs including `u64::MAX`, and reuse capacity for a shorter later batch without leaking old bytes. |
+| Callback failure after filling the maximum payload | Error and unwinding roll back after growth; shorter later records reuse spare storage without exposing abandoned bytes. |
+| Separate synchronization | Sync performs no implicit sending or flushing, supports non-Send pending futures, preserves original errors and rejects use after prior I/O failure. |
+| Failure after a successful sync | An earlier durable boundary does not mask later errors, cancellation or panic. |
+
+Scripted destinations reject unexpected additional writes, so retry/cursor defects
+fail instead of silently succeeding against an always-ready sink. File integration
+exercises both modes and synchronization; handshake-complete socket integration
+exercises serialization. Their bytes pass through the real reader. Temporary-file
+tests establish API behavior, not resilience to power loss.
+
+Compile-fail examples establish mode separation, builder privacy and synchronization
+capability restrictions. The opt-in benchmarks measure performance separately
+from these correctness checks; historical assembly observations describe their
+specific compiler and workload rather than portable instruction-count guarantees.
+
+</details>
