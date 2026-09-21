@@ -366,7 +366,7 @@ async fn drain_records(
         batches += 1;
         while let Some(record) = reader.try_read_next()? {
             records += 1;
-            bytes += u64::from(record.length());
+            bytes += record.length().get();
             consume(black_box(record));
         }
     }

@@ -9,7 +9,7 @@ mod stream_initializer;
 pub mod validation;
 
 pub use index_writer::{IndexWriteError, IndexWriter};
-pub use indexed_log_writer::{IndexedLogWriteError, IndexedLogWriter};
+pub use indexed_log_writer::{AppendOutcome, IndexedLogWriteError, IndexedLogWriter};
 pub use location::{
     LogFileId, LogFileIdRangeError, LogFileNumber, LogFileNumberError, LogFileRange,
     RECORDS_PER_FILE, RecordEndLocation, RecordRangeLocation, RecordRangeLocationError,

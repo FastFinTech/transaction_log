@@ -207,6 +207,10 @@ The measured read interval includes:
   immediately dropping records or maintaining the requested retention window.
 - EOF detection. No clocks, output, or payload copies are added per record.
 
+Byte accounting adds `record.length().get()` to a `u64` total. The returned
+`RecordLength` covers the complete encoded record; reading its value does not
+repeat validation or count only the payload.
+
 Worker joins and reporting do not determine the finish timestamps. A reader's
 remaining retained records are inspected and destroyed after its own timestamp
 and after dropping its `RecordReader`. In concurrent runs that cleanup can overlap

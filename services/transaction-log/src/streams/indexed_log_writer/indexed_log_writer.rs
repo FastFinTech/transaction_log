@@ -1,11 +1,13 @@
 use getset::CopyGetters;
 use tokio::{fs::File, io::AsyncWrite};
-use transaction_log_exports::{AsyncSyncData, ExistingRecords, Record, RecordWriter};
+use transaction_log_exports::{AsyncSyncData, ExistingRecords, Record, RecordId, RecordWriter};
 
-use crate::streams::{LogFileId, RECORDS_PER_FILE, RecordEndLocation, RecordStartLocation};
+use crate::streams::{
+    IndexWriter, InitializedStream, LogFileId, RECORDS_PER_FILE, RecordEndLocation,
+    RecordStartLocation,
+};
 
-use super::{IndexedLogWriteError, indexed_log_writer_state::IndexedLogWriterState};
-use crate::streams::IndexWriter;
+use super::{AppendOutcome, IndexedLogWriteError, indexed_log_writer_state::IndexedLogWriterState};
 
 /// Appends ordered records and their dense index to one owned output pair.
 ///
@@ -14,7 +16,8 @@ use crate::streams::IndexWriter;
 /// their owner. This component never opens, reads, seeks, renames or deletes files.
 /// Public construction takes an owned Tokio index file; the default `I = File`
 /// keeps ordinary use as `IndexedLogWriter<L>`. Other index types support internal
-/// scripted tests through the application-private handover.
+/// scripted tests. Consume an [`InitializedStream`] with [`Self::from`] to resume
+/// its recovered pair while preserving its synchronized progress.
 ///
 /// [`write_record`](Self::write_record) buffers synchronously. Owner-driven
 /// [`flush`](Self::flush) completes log output and its destination flush before
@@ -36,6 +39,13 @@ pub struct IndexedLogWriter<L, I = File> {
     /// File whose stream and assigned sequence range govern every append.
     #[getset(get_copy = "pub")]
     file_id: LogFileId,
+    /// Required ID for the next append, advanced only after both buffers accept a record.
+    ///
+    /// Starts at the file's first assigned ID or the recovered end's successor.
+    /// After the last slot it points into the next file, but this writer remains
+    /// full and rejects further appends. Rejections and output operations leave it unchanged.
+    #[getset(get_copy = "pub")]
+    expected_record_id: RecordId,
     /// Records in the existing validated prefix plus successful buffered appends.
     #[getset(get_copy = "pub")]
     record_count: u64,
@@ -50,8 +60,8 @@ pub struct IndexedLogWriter<L, I = File> {
     flushed_end: Option<RecordEndLocation>,
     /// Last complete record covered by a successful synchronization of both outputs.
     ///
-    /// Starts as `None`, including on resumption: construction does not record
-    /// earlier synchronization. After an I/O failure, this remains the last known success.
+    /// Starts at the recovered endpoint when consuming an initialized stream,
+    /// or `None` for an empty pair. After an I/O failure, this remains the last known success.
     #[getset(get_copy = "pub")]
     synced_end: Option<RecordEndLocation>,
     log: RecordWriter<L, ExistingRecords>,
@@ -69,56 +79,54 @@ impl<L> IndexedLogWriter<L> {
     /// constructor performs no I/O or file inspection. A new nonzero-numbered
     /// file starts at its assigned first record ID, not sequence zero.
     pub fn new(file_id: LogFileId, log: L, index: File) -> Self {
-        Self::from_validated(file_id, log, index, None)
+        Self {
+            file_id,
+            expected_record_id: file_id.first_record_id(),
+            record_count: 0,
+            buffered_end: None,
+            flushed_end: None,
+            synced_end: None,
+            log: RecordWriter::for_records(log),
+            index: IndexWriter::new(index),
+            state: IndexedLogWriterState::Open,
+        }
+    }
+}
+
+impl From<InitializedStream> for IndexedLogWriter<File> {
+    /// Consumes an initialized stream's active pair, preserving recovered durability.
+    ///
+    /// The initializer has repaired and synchronized any recovered records and
+    /// positioned both files for appending. All three progress endpoints start
+    /// at that file-local end; an empty active pair starts with all three absent,
+    /// even if the stream checkpoint covers a preceding completed file.
+    ///
+    /// Moves the existing handles without reopening, seeking, validation or I/O.
+    /// The owner must preserve the initializer's exclusive-write contract through
+    /// handover. Fresh empty files require no initial synchronization here.
+    fn from(initialized: InitializedStream) -> Self {
+        let InitializedStream {
+            file_id,
+            log,
+            index,
+            end,
+        } = initialized;
+        Self {
+            file_id,
+            expected_record_id: end
+                .map_or_else(|| file_id.first_record_id(), |end| end.record_id().next()),
+            record_count: end.map_or(0, |end| LogFileId::record_count_through(end.record_id())),
+            buffered_end: end,
+            flushed_end: end,
+            synced_end: end,
+            log: RecordWriter::for_records(log),
+            index: IndexWriter::new(index),
+            state: IndexedLogWriterState::Open,
+        }
     }
 }
 
 impl<L, I> IndexedLogWriter<L, I> {
-    /// Takes ownership at the end of an empty or validated contiguous file prefix.
-    ///
-    /// Application-internal handover for a recovery owner after repair. `end` must belong
-    /// to `file_id`, follow its last complete record, and cover a contiguous prefix
-    /// starting at the file's first assigned ID. The index must have exactly one
-    /// correct entry per record. Invalid tails must already have been repaired.
-    ///
-    /// Both destinations must be ready to append: log at `end.position()` (zero
-    /// when absent), index at `record_count * 8`. Buffered read-ahead must not be
-    /// mistaken for that logical end. Prefix writes, including rebuilt index
-    /// entries, must already have finished destination flushing. No validation
-    /// or seeking happens here.
-    /// Restricting this entry point avoids exposing a public partial validator.
-    /// The identity assertion detects an inconsistent internal handover only.
-    pub(crate) fn from_validated(
-        file_id: LogFileId,
-        log: L,
-        index: I,
-        end: Option<RecordEndLocation>,
-    ) -> Self {
-        let record_count = match end {
-            Some(end) => {
-                assert_eq!(
-                    end.log_file_id(),
-                    file_id,
-                    "validated endpoint belongs to another file"
-                );
-                end.record_id().sequence_number().get()
-                    - file_id.first_record_id().sequence_number().get()
-                    + 1
-            }
-            None => 0,
-        };
-        Self {
-            file_id,
-            record_count,
-            buffered_end: end,
-            flushed_end: end,
-            synced_end: None,
-            log: RecordWriter::for_records(log),
-            index: IndexWriter::with_file(index),
-            state: IndexedLogWriterState::Open,
-        }
-    }
-
     /// Whether all assigned record positions have been accepted, even if buffered.
     pub fn is_full(&self) -> bool {
         self.record_count == RECORDS_PER_FILE
@@ -134,21 +142,26 @@ impl<L, I> IndexedLogWriter<L, I> {
     /// index bytes. It does not retain the source handle, serialize a payload,
     /// perform I/O or publish read visibility. The owner controls batch size and
     /// retained capacity by deciding when to flush.
-    pub fn write_record(&mut self, record: &Record) -> Result<(), IndexedLogWriteError> {
+    ///
+    /// Success returns the accepted endpoint and whether this record filled the
+    /// file. Neither is a flush or durability acknowledgement. The cached expected
+    /// ID advances only after both appends succeed; all existing guards remain.
+    pub fn write_record(&mut self, record: &Record) -> Result<AppendOutcome, IndexedLogWriteError> {
         self.check_open()?;
         if self.is_full() {
             return Err(IndexedLogWriteError::Full);
+        }
+        let expected = self.expected_record_id;
+        let actual = record.id();
+        if actual != expected {
+            return Err(IndexedLogWriteError::UnexpectedRecordId { expected, actual });
         }
         let start = match self.buffered_end {
             Some(end) => end.next_record_start(),
             None => RecordStartLocation::new(self.file_id.first_record_id(), 0),
         };
-        let expected = start.record_id();
-        let actual = record.id();
-        if actual != expected {
-            return Err(IndexedLogWriteError::UnexpectedRecordId { expected, actual });
-        }
-        let position = start.position() + u64::from(record.length());
+        let end = start.to_end(record.length());
+        let next_expected_record_id = expected.next();
         // The two appends are one logical acceptance. If either unexpectedly
         // fails or unwinds, do not allow a partly updated pair to continue.
         self.state = IndexedLogWriterState::Unusable;
@@ -156,12 +169,16 @@ impl<L, I> IndexedLogWriter<L, I> {
             .write_record(record)
             .map_err(IndexedLogWriteError::Log)?;
         self.index
-            .write(position)
+            .write(end.position())
             .map_err(IndexedLogWriteError::Index)?;
         self.record_count += 1;
-        self.buffered_end = Some(RecordEndLocation::new(actual, position));
+        self.buffered_end = Some(end);
+        self.expected_record_id = next_expected_record_id;
         self.state = IndexedLogWriterState::Open;
-        Ok(())
+        Ok(AppendOutcome {
+            end,
+            file_full: self.is_full(),
+        })
     }
 
     /// Ends appending once the full pair has completed durable synchronization.
@@ -260,8 +277,8 @@ impl<L: AsyncWrite + AsyncSyncData + Unpin, I: AsyncWrite + AsyncSyncData + Unpi
     /// on only one file's success. Failure, panic or cancellation makes the pair
     /// unusable; the last successful boundaries remain available for observation.
     ///
-    /// With no new records, still synchronizes both outputs, including a validated
-    /// starting prefix whose durability has not yet been established here.
+    /// With no new records, still synchronizes both outputs, even when recovery
+    /// already established the starting prefix's durability.
     pub async fn sync_data(&mut self) -> Result<(), IndexedLogWriteError> {
         self.flush().await?;
         self.state = IndexedLogWriterState::Unusable;
@@ -291,13 +308,16 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
     use transaction_log_exports::{
         RecordId, RecordOutputError, RecordReader, SequenceNumber, StreamId,
     };
 
     use super::*;
-    use crate::streams::IndexWriteError;
+    use crate::{
+        storage::test_support::storage_fixture,
+        streams::{IndexWriteError, StreamCheckpoint, StreamInitializer},
+    };
 
     // Deterministic destinations distinguish accepted bytes from flushed bytes.
     // Rc also proves that the writer does not impose Send on outputs or futures.
@@ -459,7 +479,17 @@ mod tests {
             is_index: true,
         };
         (
-            IndexedLogWriter::from_validated(LogFileId::from_record_id(first), log, index, None),
+            IndexedLogWriter {
+                file_id: LogFileId::from_record_id(first),
+                expected_record_id: LogFileId::from_record_id(first).first_record_id(),
+                record_count: 0,
+                buffered_end: None,
+                flushed_end: None,
+                synced_end: None,
+                log: RecordWriter::for_records(log),
+                index: IndexWriter::with_file(index),
+                state: IndexedLogWriterState::Open,
+            },
             observed,
         )
     }
@@ -499,9 +529,20 @@ mod tests {
         assert_eq!(writer.file_id(), LogFileId::from_record_id(records[0].id()));
         assert_eq!(writer.record_count(), 0);
         assert_eq!(writer.buffered_end(), None);
-        for record in &records {
-            writer.write_record(record).unwrap();
+        assert_eq!(writer.expected_record_id(), id(42, 100_000));
+        let mut outcomes = Vec::new();
+        for (offset, (record, position)) in records.iter().zip([16, 35, 52]).enumerate() {
+            let outcome = writer.write_record(record).unwrap();
+            assert_eq!(outcome.end(), RecordEndLocation::new(record.id(), position));
+            assert!(!outcome.file_full());
+            assert_eq!(writer.expected_record_id(), id(42, 100_001 + offset as u64));
+            outcomes.push(outcome);
         }
+        // Earlier outcomes remain snapshots after more records are accepted.
+        assert_eq!(
+            outcomes[0].end(),
+            RecordEndLocation::new(id(42, 100_000), 16)
+        );
         let end = Some(RecordEndLocation::new(id(42, 100_002), 52));
         assert_eq!(writer.record_count(), 3);
         assert_eq!(writer.buffered_end(), end);
@@ -541,6 +582,7 @@ mod tests {
         }
         writer.sync_data().await.unwrap();
         assert_eq!(writer.synced_end(), end);
+        assert_eq!(writer.expected_record_id(), id(42, 100_003));
         assert!(
             observed
                 .borrow()
@@ -567,21 +609,67 @@ mod tests {
                     if expected == valid[0].id() && actual == invalid.id()));
             assert_eq!(writer.record_count(), 0);
             assert_eq!(writer.buffered_end(), None);
+            assert_eq!(writer.expected_record_id(), valid[0].id());
         }
         writer.write_record(&valid[0]).unwrap();
+        assert_eq!(writer.expected_record_id(), valid[1].id());
         let end = writer.buffered_end();
         assert!(matches!(writer.write_record(&valid[0]),
             Err(IndexedLogWriteError::UnexpectedRecordId { expected, actual })
                 if expected == valid[1].id() && actual == valid[0].id()));
         assert_eq!(writer.record_count(), 1);
         assert_eq!(writer.buffered_end(), end);
+        assert_eq!(writer.expected_record_id(), valid[1].id());
         writer.write_record(&valid[1]).unwrap();
+        assert_eq!(writer.expected_record_id(), id(7, 100_002));
         writer.flush().await.unwrap();
         assert_eq!(observed.borrow().log.len(), 35);
         assert_eq!(
             observed.borrow().index,
             [17, 0, 0, 0, 0, 0, 0, 0, 35, 0, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_inner_append_does_not_advance_expected_id_or_report_acceptance() {
+        let records = records(0, 0, &[0]).await;
+        for stage in [Stage::LogFlush, Stage::IndexFlush] {
+            let (mut writer, observed) = writer(records[0].id());
+            // Exercise either lower writer refusing its append, without adding
+            // test-specific hooks to the pair's synchronous buffering path.
+            observed.borrow_mut().fault = Some((stage, Fault::Error));
+            match stage {
+                Stage::LogFlush => {
+                    writer.log.flush().await.unwrap_err();
+                }
+                Stage::IndexFlush => {
+                    writer.index.flush().await.unwrap_err();
+                }
+                _ => unreachable!(),
+            }
+            observed.borrow_mut().fault = None;
+            let calls = observed.borrow().calls.len();
+            match writer.write_record(&records[0]).unwrap_err() {
+                IndexedLogWriteError::Log(RecordOutputError::Unusable) => {
+                    assert_eq!(stage, Stage::LogFlush)
+                }
+                IndexedLogWriteError::Index(IndexWriteError::Unusable) => {
+                    assert_eq!(stage, Stage::IndexFlush)
+                }
+                error => panic!("unexpected append failure: {error:?}"),
+            }
+            assert_eq!(writer.expected_record_id(), id(0, 0));
+            assert_eq!(writer.record_count(), 0);
+            assert_eq!(writer.buffered_end(), None);
+            assert_eq!(writer.flushed_end(), None);
+            assert_eq!(writer.synced_end(), None);
+            assert!(matches!(
+                writer.write_record(&records[0]),
+                Err(IndexedLogWriteError::Unusable)
+            ));
+            assert_eq!(writer.expected_record_id(), id(0, 0));
+            assert_eq!(observed.borrow().calls.len(), calls);
+        }
     }
 
     #[tokio::test]
@@ -599,6 +687,7 @@ mod tests {
         drop(writer.sync_data());
         assert!(observed.borrow().calls.is_empty());
         assert!(writer.check_open().is_ok());
+        assert_eq!(writer.expected_record_id(), id(0, 1));
         drop(writer.into_inner());
         assert!(observed.borrow().calls.is_empty());
 
@@ -609,40 +698,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resumed_prefix_uses_absolute_offsets_and_requires_its_own_sync() {
+    async fn appending_after_a_large_prefix_preserves_absolute_offsets() {
         // A real prefix can exceed 4 GiB: 99,999 records can contain 6.55 GB.
-        // No prefix allocation is needed to test the validated handover contract.
+        // Seed internal progress to test offset arithmetic without allocating
+        // that prefix. Separate filesystem tests exercise the real handover.
         let prefix = RecordEndLocation::new(id(3, 99_998), 4_294_967_300);
         let records = records(3, 99_999, &[65_519]).await;
-        let (empty, observed) = writer(records[0].id());
-        let (log, index) = empty.into_inner();
-        let mut writer =
-            IndexedLogWriter::from_validated(prefix.log_file_id(), log, index, Some(prefix));
+        let (mut writer, observed) = writer(records[0].id());
+        writer.record_count = 99_999;
+        writer.expected_record_id = id(3, 99_999);
+        writer.buffered_end = Some(prefix);
+        writer.flushed_end = Some(prefix);
+        writer.synced_end = Some(prefix);
         assert_eq!(writer.record_count(), 99_999);
         assert_eq!(writer.flushed_end(), Some(prefix));
         assert_eq!(writer.buffered_end(), Some(prefix));
-        assert_eq!(writer.synced_end(), None);
+        assert_eq!(writer.synced_end(), Some(prefix));
         writer.flush().await.unwrap();
         assert!(observed.borrow().calls.is_empty());
         writer.sync_data().await.unwrap();
         assert_eq!(writer.synced_end(), Some(prefix));
-        writer.write_record(&records[0]).unwrap();
+        let outcome = writer.write_record(&records[0]).unwrap();
+        assert_eq!(
+            outcome.end(),
+            RecordEndLocation::new(id(3, 99_999), 4_295_032_835)
+        );
+        assert!(outcome.file_full());
+        assert_eq!(writer.expected_record_id(), id(3, 100_000));
         assert!(writer.is_full());
         writer.sync_data().await.unwrap();
         assert_eq!(writer.synced_end().unwrap().position(), 4_295_032_835);
         assert_eq!(observed.borrow().index, [3, 0, 1, 0, 1, 0, 0, 0]);
         assert_eq!(observed.borrow().log, records[0].as_bytes().as_ref());
-    }
-
-    #[test]
-    #[should_panic(expected = "validated endpoint belongs to another file")]
-    fn rejects_inconsistent_internal_handover() {
-        IndexedLogWriter::from_validated(
-            LogFileId::from_record_id(id(0, 0)),
-            Vec::<u8>::new(),
-            Vec::<u8>::new(),
-            Some(RecordEndLocation::new(id(1, 0), 16)),
-        );
     }
 
     #[tokio::test]
@@ -653,15 +740,22 @@ mod tests {
             Err(IndexedLogWriteError::NotFull { record_count: 0 })
         ));
         let records = records(12, 0, &vec![0; 100_001]).await;
-        for record in &records[..100_000] {
-            writer.write_record(record).unwrap();
+        for (offset, record) in records[..100_000].iter().enumerate() {
+            let outcome = writer.write_record(record).unwrap();
+            assert_eq!(
+                outcome.end(),
+                RecordEndLocation::new(record.id(), (offset as u64 + 1) * 16)
+            );
+            assert_eq!(outcome.file_full(), offset == 99_999);
         }
         assert!(writer.is_full());
         assert_eq!(writer.record_count(), 100_000);
+        assert_eq!(writer.expected_record_id(), id(12, 100_000));
         assert!(matches!(
             writer.write_record(&records[100_000]),
             Err(IndexedLogWriteError::Full)
         ));
+        assert_eq!(writer.expected_record_id(), id(12, 100_000));
         assert!(matches!(
             writer.finalize(),
             Err(IndexedLogWriteError::NotSynchronized)
@@ -694,6 +788,7 @@ mod tests {
             writer.write_record(&records[0]),
             Err(IndexedLogWriteError::Finalized)
         ));
+        assert_eq!(writer.expected_record_id(), id(12, 100_000));
         assert!(matches!(
             writer.flush().await,
             Err(IndexedLogWriteError::Finalized)
@@ -778,6 +873,7 @@ mod tests {
                     Some(RecordEndLocation::new(id(0, 1), 33))
                 );
                 assert_eq!(writer.record_count(), 2);
+                assert_eq!(writer.expected_record_id(), id(0, 2));
                 if matches!(stage, Stage::LogWrite | Stage::LogFlush) {
                     assert_eq!(observed.borrow().index.len(), 8);
                     assert!(!observed.borrow().calls.contains(&Stage::IndexWrite));
@@ -787,6 +883,7 @@ mod tests {
                     writer.write_record(&records[1]),
                     Err(IndexedLogWriteError::Unusable)
                 ));
+                assert_eq!(writer.expected_record_id(), id(0, 2));
                 assert!(matches!(
                     writer.flush().await,
                     Err(IndexedLogWriteError::Unusable)
@@ -865,16 +962,22 @@ mod tests {
 
     #[tokio::test]
     async fn independent_file_handles_read_flushed_data_and_resumption_preserves_the_prefix() {
-        let directory = tempfile::tempdir().unwrap();
-        let log_path = directory.path().join("records.log");
-        let index_path = directory.path().join("records.idx");
-        let log = tokio::fs::File::create(&log_path).await.unwrap();
-        let index = tokio::fs::File::create(&index_path).await.unwrap();
+        let fixture = storage_fixture().await;
+        let provider = fixture.provider();
+        let stream = fixture.stream_id();
+        let file_id = LogFileId::first(stream);
+        let log_path = provider.log_file_path(file_id);
+        let index_path = provider.index_file_path(file_id);
+        let (log, index) = provider.create_log_and_index(file_id).await.unwrap();
         let mut log_reader = tokio::fs::File::open(&log_path).await.unwrap();
         let mut index_reader = tokio::fs::File::open(&index_path).await.unwrap();
-        let records = records(42, 100_000, &[0, 3]).await;
-        let mut writer =
-            IndexedLogWriter::new(LogFileId::from_record_id(records[0].id()), log, index);
+        let records = records(stream.get(), 0, &[0, 3]).await;
+        let mut writer = IndexedLogWriter::new(file_id, log, index);
+        assert_eq!(writer.expected_record_id(), id(stream.get(), 0));
+        assert_eq!(writer.record_count(), 0);
+        assert_eq!(writer.buffered_end(), None);
+        assert_eq!(writer.flushed_end(), None);
+        assert_eq!(writer.synced_end(), None);
         writer.write_record(&records[0]).unwrap();
         assert_eq!(log_reader.metadata().await.unwrap().len(), 0);
         assert_eq!(index_reader.metadata().await.unwrap().len(), 0);
@@ -889,27 +992,27 @@ mod tests {
         let end = writer.flushed_end();
         drop(writer);
 
-        // Simulate the validator's handover of this known-valid prefix. New
-        // append handles and independent read cursors work on Windows and Linux.
-        let log = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&log_path)
+        // No reader I/O runs during recovery. Their independent cursors stay
+        // after the first record while the initializer prepares the writer.
+        let initialized = StreamInitializer::initialize(stream, provider)
             .await
             .unwrap();
-        let index = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&index_path)
-            .await
-            .unwrap();
-        let mut writer = IndexedLogWriter::from_validated(
-            LogFileId::from_record_id(records[0].id()),
-            log,
-            index,
-            end,
-        );
+        let mut writer = IndexedLogWriter::from(initialized);
+        assert_eq!(writer.file_id(), file_id);
+        assert_eq!(writer.record_count(), 1);
+        assert_eq!(writer.expected_record_id(), records[1].id());
+        assert_eq!(writer.buffered_end(), end);
+        assert_eq!(writer.flushed_end(), end);
+        assert_eq!(writer.synced_end(), end);
         writer.write_record(&records[1]).unwrap();
+        assert_eq!(writer.flushed_end(), end);
+        assert_eq!(writer.synced_end(), end);
         assert_eq!(log_reader.metadata().await.unwrap().len(), 16);
         assert_eq!(index_reader.metadata().await.unwrap().len(), 8);
+        writer.flush().await.unwrap();
+        let appended_end = Some(RecordEndLocation::new(id(stream.get(), 1), 35));
+        assert_eq!(writer.flushed_end(), appended_end);
+        assert_eq!(writer.synced_end(), end);
         writer.sync_data().await.unwrap();
         let mut second = [0; 19];
         log_reader.read_exact(&mut second).await.unwrap();
@@ -918,15 +1021,210 @@ mod tests {
         assert_eq!(entry, [35, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(log_reader.metadata().await.unwrap().len(), 35);
         assert_eq!(index_reader.metadata().await.unwrap().len(), 16);
-        assert_eq!(
-            writer.synced_end(),
-            Some(RecordEndLocation::new(id(42, 100_001), 35))
-        );
+        assert_eq!(writer.synced_end(), appended_end);
         let bytes = tokio::fs::read(&log_path).await.unwrap();
         let expected: Vec<u8> = records
             .iter()
             .flat_map(|r| r.as_bytes().iter().copied())
             .collect();
         assert_eq!(bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn initialized_empty_pairs_start_without_progress_and_accept_sequence_zero() {
+        for corrupt in [false, true] {
+            let fixture = storage_fixture().await;
+            let provider = fixture.provider();
+            let stream = fixture.stream_id();
+            let file_id = LogFileId::first(stream);
+            if corrupt {
+                drop(provider.create_log_and_index(file_id).await.unwrap());
+                std::fs::write(provider.log_file_path(file_id), [1, 2, 3]).unwrap();
+                std::fs::write(provider.index_file_path(file_id), [9; 13]).unwrap();
+            }
+            let initialized = StreamInitializer::initialize(stream, provider)
+                .await
+                .unwrap();
+            let mut writer: IndexedLogWriter<File> = initialized.into();
+            assert_eq!(writer.file_id(), file_id);
+            assert_eq!(writer.record_count(), 0);
+            assert_eq!(writer.expected_record_id(), id(stream.get(), 0));
+            assert_eq!(writer.buffered_end(), None);
+            assert_eq!(writer.flushed_end(), None);
+            assert_eq!(writer.synced_end(), None);
+            assert!(!writer.is_full());
+            writer.flush().await.unwrap();
+            assert!(
+                std::fs::read(provider.log_file_path(file_id))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                std::fs::read(provider.index_file_path(file_id))
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let records = records(stream.get(), 0, &[3]).await;
+            let outcome = writer.write_record(&records[0]).unwrap();
+            assert_eq!(outcome.end(), RecordEndLocation::new(records[0].id(), 19));
+            assert!(!outcome.file_full());
+            assert_eq!(writer.expected_record_id(), id(stream.get(), 1));
+            writer.sync_data().await.unwrap();
+            assert_eq!(writer.record_count(), 1);
+            assert_eq!(
+                writer.synced_end(),
+                Some(RecordEndLocation::new(records[0].id(), 19))
+            );
+            assert_eq!(
+                std::fs::read(provider.log_file_path(file_id)).unwrap(),
+                records[0].as_bytes().as_ref()
+            );
+            assert_eq!(
+                std::fs::read(provider.index_file_path(file_id)).unwrap(),
+                [19, 0, 0, 0, 0, 0, 0, 0]
+            );
+            // Live checkpoint publication is separate from writer synchronization.
+            assert_eq!(provider.read_checkpoint(stream).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn repaired_prefix_handover_preserves_durability_and_file_local_count() {
+        for first_sequence in [0, 100_000] {
+            let fixture = storage_fixture().await;
+            let provider = fixture.provider();
+            let stream = fixture.stream_id();
+            let records = records(stream.get(), first_sequence, &[0, 3, 1]).await;
+            let file_id = LogFileId::from_record_id(records[0].id());
+            let (log, index) = provider.create_log_and_index(file_id).await.unwrap();
+            let mut original = IndexedLogWriter::new(file_id, log, index);
+            assert_eq!(original.expected_record_id(), records[0].id());
+            original.write_record(&records[0]).unwrap();
+            original.sync_data().await.unwrap();
+            let checkpoint = StreamCheckpoint::new(original.synced_end().unwrap());
+            provider.write_checkpoint(&checkpoint).await.unwrap();
+            original.write_record(&records[1]).unwrap();
+            original.sync_data().await.unwrap();
+            drop(original);
+
+            // Leave a valid uncheckpointed record, corrupt log tail and invalid
+            // index suffix. The checkpoint's first entry remains trustworthy.
+            let mut bytes = std::fs::read(provider.log_file_path(file_id)).unwrap();
+            bytes.extend_from_slice(&[1, 2, 3]);
+            std::fs::write(provider.log_file_path(file_id), bytes).unwrap();
+            std::fs::write(
+                provider.index_file_path(file_id),
+                [16, 0, 0, 0, 0, 0, 0, 0, 255],
+            )
+            .unwrap();
+            let initialized = StreamInitializer::initialize(stream, provider)
+                .await
+                .unwrap();
+            let end = Some(RecordEndLocation::new(records[1].id(), 35));
+            let mut writer = IndexedLogWriter::from(initialized);
+            assert_eq!(writer.file_id(), file_id);
+            assert_eq!(writer.record_count(), 2);
+            assert_eq!(writer.expected_record_id(), records[2].id());
+            assert_eq!(writer.buffered_end(), end);
+            assert_eq!(writer.flushed_end(), end);
+            assert_eq!(writer.synced_end(), end);
+            assert!(!writer.is_full());
+            // A duplicate stays rejected without disturbing recovered progress.
+            assert!(matches!(writer.write_record(&records[1]),
+                Err(IndexedLogWriteError::UnexpectedRecordId { expected, actual })
+                    if expected == records[2].id() && actual == records[1].id()));
+            assert_eq!(writer.synced_end(), end);
+            assert_eq!(writer.expected_record_id(), records[2].id());
+            let outcome = writer.write_record(&records[2]).unwrap();
+            assert_eq!(outcome.end(), RecordEndLocation::new(records[2].id(), 52));
+            assert!(!outcome.file_full());
+            assert_eq!(
+                writer.expected_record_id(),
+                id(stream.get(), first_sequence + 3)
+            );
+            writer.flush().await.unwrap();
+            let appended_end = Some(RecordEndLocation::new(records[2].id(), 52));
+            assert_eq!(writer.record_count(), 3);
+            assert_eq!(writer.buffered_end(), appended_end);
+            assert_eq!(writer.flushed_end(), appended_end);
+            assert_eq!(writer.synced_end(), end);
+            writer.sync_data().await.unwrap();
+            assert_eq!(writer.synced_end(), appended_end);
+            let (mut log, mut index) = writer.into_inner();
+            assert_eq!(log.stream_position().await.unwrap(), 52);
+            assert_eq!(index.stream_position().await.unwrap(), 24);
+            let expected: Vec<_> = records
+                .iter()
+                .flat_map(|record| record.as_bytes().iter().copied())
+                .collect();
+            assert_eq!(
+                std::fs::read(provider.log_file_path(file_id)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                std::fs::read(provider.index_file_path(file_id)).unwrap(),
+                [
+                    16, 0, 0, 0, 0, 0, 0, 0, 35, 0, 0, 0, 0, 0, 0, 0, 52, 0, 0, 0, 0, 0, 0, 0
+                ]
+            );
+            assert_eq!(
+                provider.read_checkpoint(stream).await.unwrap(),
+                end.map(StreamCheckpoint::new)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initialized_successor_keeps_the_previous_files_checkpoint_out_of_writer_progress() {
+        let fixture = storage_fixture().await;
+        let provider = fixture.provider();
+        let stream = fixture.stream_id();
+        let first = LogFileId::first(stream);
+        let (log, index) = provider.create_log_and_index(first).await.unwrap();
+        let mut original = IndexedLogWriter::new(first, log, index);
+        let records = records(stream.get(), 0, &vec![0; 100_001]).await;
+        for record in &records[..100_000] {
+            original.write_record(record).unwrap();
+        }
+        original.sync_data().await.unwrap();
+        let checkpoint = StreamCheckpoint::new(original.finalize().unwrap());
+        provider.write_checkpoint(&checkpoint).await.unwrap();
+        drop(original);
+
+        let initialized = StreamInitializer::initialize(stream, provider)
+            .await
+            .unwrap();
+        let mut writer = IndexedLogWriter::from(initialized);
+        assert_eq!(writer.file_id(), first.next());
+        assert_eq!(writer.record_count(), 0);
+        assert_eq!(writer.expected_record_id(), id(stream.get(), 100_000));
+        assert_eq!(writer.buffered_end(), None);
+        assert_eq!(writer.flushed_end(), None);
+        assert_eq!(writer.synced_end(), None);
+        assert!(!writer.is_full());
+        let record = &records[100_000];
+        let outcome = writer.write_record(record).unwrap();
+        assert_eq!(outcome.end(), RecordEndLocation::new(record.id(), 16));
+        assert!(!outcome.file_full());
+        assert_eq!(writer.expected_record_id(), id(stream.get(), 100_001));
+        writer.sync_data().await.unwrap();
+        assert_eq!(writer.record_count(), 1);
+        assert_eq!(
+            writer.synced_end(),
+            Some(RecordEndLocation::new(record.id(), 16))
+        );
+        assert_eq!(
+            std::fs::read(provider.log_file_path(first.next())).unwrap(),
+            record.as_bytes().as_ref()
+        );
+        assert_eq!(
+            std::fs::read(provider.index_file_path(first.next())).unwrap(),
+            [16, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            provider.read_checkpoint(stream).await.unwrap(),
+            Some(checkpoint)
+        );
     }
 }

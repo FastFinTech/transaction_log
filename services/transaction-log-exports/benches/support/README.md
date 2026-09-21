@@ -104,6 +104,8 @@ Every worker must succeed. Sender batch counts must match ceiling division of
 assigned records by batch size. Every receiver must reach EOF and receive the
 exact encoded byte count. In `record_io`, every record additionally passes the
 real reader's framing/stream-ID/CRC validation and the parsed count must match.
+Its byte counter sums `record.length().get()`, the validated `u64` total encoded
+length, including the header and CRC, without repeating length validation.
 The byte-drain target deliberately does not verify CRC or record contents: its
 reported record count comes from the completed producer, cross-checked against
 received bytes. Correctness tests and the combined benchmark complement it.

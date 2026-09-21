@@ -553,12 +553,12 @@ behind symlinks.
 
 ### Shared test storage
 
-The crate-private, test-only `test_support` module serves provider, initializer and
-indexed-log validator tests. `storage_fixture().await` returns an owned
+The crate-private, test-only `test_support` module serves provider, initializer,
+indexed-log writer and indexed-log validator tests. `storage_fixture().await` returns an owned
 `StorageFixture` guard with read-only `provider()` and `stream_id()` getters.
 A Tokio `OnceCell` constructs the real provider and awaits `clear_all` exactly
 once before publishing it. Construction is not bypassed. An atomic counter
-assigns distinct IDs across all three suites; claim another fixture when a case
+assigns distinct IDs across all consuming suites; claim another fixture when a case
 needs another stream. Independent parameter-loop cases claim separate guards.
 Allocation order and numeric IDs are not assumptions tests may rely on.
 

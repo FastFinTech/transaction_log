@@ -6,7 +6,7 @@ and its paired index. The pair writer composes the index writer and the exports
 crate's `RecordWriter` rather than implementing either encoding/output layer.
 `IndexedLogValidator` composes the focused log/index validators in
 `validation`, returning a synchronized endpoint and append-positioned files for a
-partial pair. Startup orchestration and writer construction remain separate work.
+partial pair. Startup orchestration remains separate work.
 `StreamCheckpoint` represents the certified local log/index boundary as a typed,
 Serde-enabled value; it does not itself load or publish checkpoint files.
 `StreamInitializer` implements startup recovery of one stream.
@@ -17,14 +17,20 @@ endpoint and partial pair, then removes the discarded range, publishes changed
 recovered progress and prepares the active pair. It creates an empty pair when
 needed without synchronizing the empty files. Final handover consumes the state
 and returns the pair. Its owned `InitializedStream` result uses read-only
-getters. Startup integration remains unimplemented; the result contains files
-rather than a writer.
+getters. The caller can consume this result through
+`IndexedLogWriter::from(initialized)`, preserving its synchronized file-local
+endpoint and append positions. Startup integration remains unimplemented.
 
 The owner supplies an empty or validated pair, buffers ordered records, commands
 flushing and synchronization, and explicitly finalizes a full file. Live
 subscriptions, historical requests, scheduling, runtime checkpoint updates,
 startup integration and live file rotation remain future work. File acquisition
 for validation uses the storage provider's named log/index opening methods.
+Each successful paired append returns `AppendOutcome`, identifying the buffered
+endpoint and whether that record filled the file. The writer caches its next
+expected ID while retaining the checked append contract. The
+[writer's optimization notes](indexed_log_writer/README.md#available-optimizations-deferred)
+describe potential work once measurements or implemented queue admission justify it.
 
 ## Where to start
 
@@ -33,7 +39,7 @@ for validation uses the storage provider's named log/index opening methods.
 | [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. |
 | [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write and initializer advancement are implemented. |
 | [Stream initializer](stream_initializer/README.md) | Checked checkpoint loading/discovery, sequential pair validation, later-file cleanup, checkpoint advancement, active-pair preparation and final handover. |
-| [Indexed log writer](indexed_log_writer/README.md) | Append ordered records to a log/index pair; control flushing, synchronization, progress and finalization. Start here for normal output. |
+| [Indexed log writer](indexed_log_writer/README.md) | Consume an initialized stream or take a fresh empty pair; append ordered records and control flushing, synchronization, progress and finalization. Start here for normal output. |
 | [Indexed log validator](validation/indexed_log_validator/README.md) | Recover and synchronize one existing pair from a supplied trusted boundary. Return its endpoint and append-positioned files when partial. Start here for recovery. |
 | [Index writer](index_writer/README.md) | Encode offsets into a reusable buffer and send, flush or synchronize an owned file. Shared by the pair writer and validator. |
 | [Validation](validation/README.md) | Focused log and index recovery, their combined validator, and shared file capabilities and test support. Startup integration remains deferred. |
@@ -51,7 +57,7 @@ The component `mod.rs` files contain declarations, README inclusion and re-expor
 This top-level `mod.rs` preserves the public imports, including
 `streams::IndexWriter`, `streams::IndexedLogWriter`,
 `streams::IndexedLogValidator` and `streams::StreamCheckpoint`.
-`IndexedLogValidationError`, `ValidatedFilePair`, `StreamInitializer` and `InitializedStream`
+`AppendOutcome`, `IndexedLogValidationError`, `ValidatedFilePair`, `StreamInitializer` and `InitializedStream`
 are also re-exported. Location types
 are available through both `streams::location` and top-level streams re-exports;
 the writer/validator component modules remain private.

@@ -60,14 +60,23 @@ The private `scan_records` owns its offset vector and returns one `LogScanResult
 - `suffix_ends`: absolute exclusive byte ends of newly accepted records only;
 - `tail_error`: the first content violation, or `None` for a clean end.
 
-Each accepted record supplies its own ID and advances the byte position, so the
-scanner tracks the endpoint directly. The caller does not reconstruct IDs from
-counts or offsets. Empty input with no checkpoint gives no endpoint; a trusted
-prefix with no accepted suffix keeps its original endpoint and an empty vector.
+The accepted endpoint supplies both the next expected ID and its byte start
+through `RecordEndLocation::next_record_start()`. With no accepted endpoint,
+the start is the file's first assigned ID at byte zero. After checking the
+incoming ID, `RecordStartLocation::to_end(record.length())` supplies the accepted
+end and its suffix-index offset. The scanner keeps no separate mutable byte
+position or expected ID. It already needs each accepted end for the index, so
+it does not also call `to_next()` to recompute that end.
+
+The caller does not reconstruct IDs from counts or offsets. Empty input with no
+checkpoint gives no endpoint; a trusted prefix with no accepted suffix keeps
+its original endpoint and an empty vector.
 
 The scanner receives the initial whole-file length, including trusted bytes. At
 100,000 accepted records it uses that length to diagnose every extra byte without
-probing EOF, including when the entire file was already trusted. `None` is a complete
+probing EOF, including when the entire file was already trusted. This comparison
+uses the accepted end in the current file, not the next record's start, which
+would reset to zero at file rotation. `None` is a complete
 clean-tail diagnosis, rather than an instruction for the caller to distinguish EOF
 from reaching the record cap. The length is not rechecked for external changes.
 

@@ -1,6 +1,7 @@
 //! Shared public types and APIs for the Transaction Log service.
 //!
 //! [`record`] defines immutable record values and the wire/file contract;
+//! [`RecordLength`] represents the validated total encoded byte length.
 //! [`RecordReader`] validates incoming bytes before exposing them. [`record_writer`]
 //! owns an output destination and buffers complete records synchronously. Its
 //! constructor selects either serialization callbacks or existing-record copies;
@@ -15,7 +16,10 @@ pub mod record;
 pub mod record_reader;
 pub mod record_writer;
 
-pub use record::{Record, RecordHeader, RecordId, SequenceNumber, StreamId, StreamIdError};
+pub use record::{
+    Record, RecordHeader, RecordId, RecordLength, RecordLengthError, SequenceNumber, StreamId,
+    StreamIdError,
+};
 pub use record_reader::{RecordReadError, RecordReader};
 pub use record_writer::{
     AsyncSyncData, ExistingRecords, RecordBuildError, RecordBuilder, RecordOutputError,

@@ -639,6 +639,9 @@ prefix preservation, reservation from insufficient capacity, stable storage,
 deferred publication, empty/maximum payloads, atomic rejection, sticky errors
 and rollback. Golden frames, independent CRC expectations, arbitrary byte
 offsets and guard bytes protect the protocol and unsafe initialization.
+The real-reader integration test compares the decoded `RecordLength` with a
+typed expected length derived from the input payload and the independently
+specified 16-byte overhead, including empty and maximum payloads.
 
 Writer tests are in `record_writer.rs`. They cover owned non-Send sinks without
 a runtime, immediate callbacks without I/O, batches exceeding one record's limit,

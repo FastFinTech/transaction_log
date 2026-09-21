@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use super::record_protocol as protocol;
-use super::{RecordHeader, RecordId, SequenceNumber, StreamId};
+use super::{RecordHeader, RecordId, RecordLength, SequenceNumber, StreamId};
 
 /// A completed, immutable record that owns a shared handle to its encoded bytes.
 ///
@@ -51,12 +51,15 @@ impl Record {
 
     /// Returns the encoded length including the header, body, and CRC trailer.
     ///
-    /// The result is in `16..=65_535`. This reads the byte handle's length; the
-    /// reader has already established equality with the encoded length field.
+    /// Returns a [`RecordLength`] in `16..=65_535`. This reads the byte handle's
+    /// length; the reader has already established equality with the encoded
+    /// length field and the supported range. No validation is repeated here.
     #[inline]
-    pub fn length(&self) -> u16 {
-        // The reader guarantees this slice's length equals the encoded u16 length.
-        self.bytes.len() as u16
+    pub fn length(&self) -> RecordLength {
+        // SAFETY: The reader validated this record's exact extent and its length
+        // in MIN_RECORD_LEN..=MAX_RECORD_LEN before publishing these immutable
+        // bytes. That bounded length fits in u64, so the cast is lossless.
+        unsafe { RecordLength::new_unchecked(self.bytes.len() as u64) }
     }
 
     /// Returns the owned stream-and-sequence pair identifying this record.
@@ -142,7 +145,7 @@ impl AsRef<[u8]> for Record {
 
 #[cfg(test)]
 mod tests {
-    use super::{Record, RecordHeader, RecordId, SequenceNumber, StreamId};
+    use super::{Record, RecordHeader, RecordId, RecordLength, SequenceNumber, StreamId};
     use crate::record::record_protocol::test_data::{FRAME, encode_frame, reference_crc};
     use bytes::Bytes;
 
@@ -151,7 +154,7 @@ mod tests {
         let record = fixture_record();
         let pointer = record.as_bytes().as_ptr();
 
-        assert_eq!(record.length(), 21);
+        assert_eq!(record.length(), RecordLength::new(21).unwrap());
         assert_eq!(record.stream_id(), StreamId::new(0x0708).unwrap());
         assert_eq!(
             record.sequence_number(),
@@ -168,7 +171,7 @@ mod tests {
         assert_eq!(bytes.as_ptr(), pointer);
         assert_eq!(bytes.as_ref(), FRAME);
         drop(bytes);
-        assert_eq!(header.length(), 21);
+        assert_eq!(header.length(), RecordLength::new(21).unwrap());
         assert_eq!(header.id().stream_id(), StreamId::new(0x0708).unwrap());
         assert_eq!(header.id().sequence_number().get(), 0x1112_1314_1516_1718);
     }
@@ -204,11 +207,14 @@ mod tests {
             // SAFETY: This exact slice is the known valid 21-byte fixture,
             // including its supported stream ID and independently verified CRC.
             let record = unsafe { Record::from_validated_bytes(bytes) };
-            assert_eq!(record.length(), 21);
+            assert_eq!(record.length(), RecordLength::new(21).unwrap());
             assert_eq!(record.stream_id(), expected_id.stream_id());
             assert_eq!(record.sequence_number(), expected_id.sequence_number());
             assert_eq!(record.id(), expected_id);
-            assert_eq!(record.get_header(), RecordHeader::new(21, expected_id));
+            assert_eq!(
+                record.get_header(),
+                RecordHeader::new(RecordLength::new(21).unwrap(), expected_id)
+            );
             assert_eq!(record.crc(), 0x8a51_c744);
             assert_eq!(record.body(), b"hello");
             assert_eq!(record.as_ref(), FRAME);
@@ -231,13 +237,16 @@ mod tests {
                 // SAFETY: The independent encoder produces an exact frame with
                 // typed IDs and a valid CRC; these inputs are at most 65,535 bytes.
                 let record = unsafe { Record::from_validated_bytes(frame) };
-                assert_eq!(record.length(), 16 + body_len as u16);
+                assert_eq!(
+                    record.length(),
+                    RecordLength::new(16 + body_len as u64).unwrap()
+                );
                 assert_eq!(record.stream_id(), id.stream_id());
                 assert_eq!(record.sequence_number(), id.sequence_number());
                 assert_eq!(record.id(), id);
                 assert_eq!(
                     record.get_header(),
-                    RecordHeader::new(16 + body_len as u16, id)
+                    RecordHeader::new(RecordLength::new(16 + body_len as u64).unwrap(), id)
                 );
                 assert_eq!(record.body(), body);
                 assert_eq!(record.crc(), crc);

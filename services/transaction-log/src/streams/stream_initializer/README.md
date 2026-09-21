@@ -17,7 +17,8 @@ later cleanup. Cleanup removes the marked range through the discovered maximum.
 Checkpoint advancement publishes the recovered endpoint when it differs from the
 original checkpoint. Preparation then retains the validated partial pair or creates
 an empty pair. Final handover consumes the state and returns that pair. All steps
-are implemented; the result uses `getset` getters without a manual impl.
+are implemented; the result uses `getset` getters, and the writer consumes it
+through named field destructuring.
 Application startup does not call the initializer yet.
 
 ## Source map
@@ -26,11 +27,13 @@ Application startup does not call the initializer yet.
   The private state stays beside its entry point so its fields and step methods
   can remain private to that implementation file.
 - `initialized_stream.rs`: the owned result and derived read-only getters.
-  Its fields are accessible only within this component.
+  Its fields are visible within `streams` for named ownership transfer; stream
+  components constructing it must establish the documented initialization guarantees.
 - `mod.rs`: declarations, re-exports and this README's Rustdoc inclusion.
 
 The following describes the implemented per-stream operation. Startup-wide
-coordination, writer construction and live rotation remain separate work.
+coordination and live rotation remain separate work. The caller can consume the
+result through `IndexedLogWriter::from(initialized)` to prepare its writer.
 
 ## Public API and result
 
@@ -72,7 +75,12 @@ Successful initialization will return files positioned for appending, with no
 invalid log bytes or index entries after their accepted ends. Recovered records
 are synchronized; freshly created empty pairs require no initial synchronization.
 The pair has room for another record: a completed final file requires preparing
-its successor. No writer is constructed here.
+its successor. The initializer returns the pair; the caller chooses when to
+consume it as an `IndexedLogWriter<File>` through the writer's `From` conversion.
+That conversion moves the existing handles without I/O and preserves the recovered
+endpoint as buffered, flushed and synchronized progress. Borrowed file getters
+must not be used to mutate contents or cursors before this handover. See the
+[writer specification](../indexed_log_writer/README.md#ownership-and-construction).
 
 The returned endpoint belongs **only to the returned file**. If file 7 is complete
 and file 8 is empty, the result identifies file 8 with `end == None`, while the
@@ -292,7 +300,7 @@ coordination or live rotation are part of this component.
 ## Validation and performance
 
 Same-file tests use [shared test storage](../../storage/README.md#shared-test-storage)
-alongside the provider and indexed-log validator tests. All three suites share
+alongside the provider, indexed-log writer and indexed-log validator tests. They share
 one initialized provider and one atomic stream-ID allocator. Each independent
 test case and parameter-loop iteration owns a fixture guard for its stream;
 additional streams need additional guards from the same allocator. Guards are

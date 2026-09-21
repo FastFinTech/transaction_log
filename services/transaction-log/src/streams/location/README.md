@@ -18,6 +18,12 @@ shorter. Successors must not wrap. Range endpoints must share a stream, have
 ordered sequences and consistent known byte boundaries. Byte offsets remain
 metadata rather than proof of an actual file's size.
 
+`RecordStartLocation::to_end(record_length)` derives the same record's exclusive
+end from a validated total encoded `RecordLength`. It preserves the record ID
+and file, adding the length to the start position without inspecting storage.
+`to_next(record_length)` instead derives the following record's start, advancing
+the ID and resetting the byte position to zero when it belongs to the next file.
+
 `RecordEndLocation::next_record_start()` derives the following record's inclusive
 start: it preserves the exclusive end position within a file, resets to zero on
 file rotation, and panics at sequence exhaustion through `RecordId::next()`. It performs no I/O and
@@ -169,6 +175,22 @@ they store the resolver's supplied values without inspecting files or adding
 partial numeric validation. A location alone does not prove that a record exists
 at that offset, is valid or is durable. Endpoint getters perform no validation.
 
+`RecordStartLocation::to_end(record_length: RecordLength)` returns a
+`RecordEndLocation` for the same record. Its exclusive position is the start plus
+the complete encoded length, including header, payload and CRC. `RecordLength`
+comes from the exports crate and already enforces the protocol bounds, so this
+method does not repeat length validation. The caller must provide the length of
+the record identified by the start; numeric validity alone does not prove that
+relationship. No bytes are read or written, and the result certifies neither
+storage validity nor durability.
+
+The helper does not advance the record ID or reset the position at file rotation:
+the last record's end stays in its own file. Byte-position addition panics on
+`u64` overflow in both debug and release, rather than wrapping malformed metadata.
+Valid resolved file positions cannot reach that overflow. The log-file validator
+and indexed log writer use this helper after checking the incoming record ID,
+sharing the resulting endpoint with their index-offset and progress handling.
+
 Both endpoint types derive Serde with named `record_id` and `position` fields.
 For example, an end location has this JSON representation:
 
@@ -204,6 +226,16 @@ the next record remains in the same file, uses zero when it belongs to a new
 file, and panics at sequence exhaustion through `RecordId::next()`. It does not validate stored
 bytes or prove that the next record exists. No reverse method is provided,
 because a file's first record start cannot reveal the preceding file's end.
+
+`RecordStartLocation::to_next(record_length: RecordLength)` composes `to_end()`
+with `RecordEndLocation::next_record_start()`. It uses the **current** record's
+encoded length to derive the following record's inclusive start. The next ID
+stays in the same stream; its position is the current end within a file, or zero
+at file rotation. Composition keeps the arithmetic and rotation rules in their
+existing helpers, including their panic contracts for byte-position overflow
+and sequence exhaustion. It performs no allocation, I/O or repeated length
+validation, and does not establish that the next record exists. Caller migration
+remains a separate step.
 
 `RecordRangeLocation` stores only `start: RecordStartLocation` and
 `end: RecordEndLocation`, exposed through read-only copy getters. Distinct types
@@ -314,6 +346,15 @@ Their JSON tests cover literal field shapes and I/O round trips, zero and maximu
 numeric metadata, invalid stream IDs and numeric types, missing/duplicate/unknown
 fields, truncation and trailing garbage. Acceptance of raw offset limits protects
 the distinction between metadata decoding and actual storage validation.
+
+`to_end()` tests cover minimum/maximum encoded lengths, nonzero offsets, positions
+above 4 GiB, both stream limits and the last/first records on either side of a file
+boundary. Literal expected ends verify exclusive-end arithmetic and preserved
+identity. Raw byte-position overflow is rejected in both debug and release.
+`to_next()` tests verify the following record ID and position with minimum/maximum
+lengths, offsets above 4 GiB and progression before, across and after a file
+boundary, preserving both stream limits. Expected endpoints use literal values
+rather than the helper composition being tested.
 
 `record_range_location.rs` tests the typed endpoint pair and `LogFileRange` enum contract:
 single records, partial single-file requests, every multi-file role, adjacent and

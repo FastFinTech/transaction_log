@@ -10,6 +10,7 @@ Public callers continue to import `transaction_log::streams::IndexedLogWriter`.
 | Source | Responsibility |
 | --- | --- |
 | `indexed_log_writer.rs` | Pair ownership, trusted handover, ordered appends, output ordering, progress, finalization and same-file tests. |
+| `append_outcome.rs` | Read-only snapshot of an accepted record's endpoint and whether that append filled the file. |
 | `indexed_log_write_error.rs` | Rejected record/finalization requests and original log/index output errors. |
 | `indexed_log_writer_state.rs` | Internal open, unusable and finalized lifecycle states. |
 | `mod.rs` | This Rustdoc specification, declarations and re-exports. |
@@ -21,7 +22,8 @@ Read the [shared stream contracts](../README.md#shared-contracts),
 [record writer specification](../../../../transaction-log-exports/src/record_writer/README.md)
 for the underlying formats and ownership contracts. The sibling
 [index writer](../index_writer/README.md) owns offset output; the
-[validator](../validation/indexed_log_validator/README.md) establishes recovery handovers.
+[stream initializer](../stream_initializer/README.md) supplies the active pair
+after recovery and checkpoint publication.
 
 ## Ownership and construction
 
@@ -32,45 +34,73 @@ writer owns record identity, sequencing, progress and lifecycle state.
 Both files stay at their permanent storage paths, with identical formats while
 active and finalized. Finalization changes permission to append, not placement.
 
-Appending derives one `RecordStartLocation` from the buffered end through
-`RecordEndLocation::next_record_start()`, or uses the file's first ID at position
-zero for an empty pair. That start supplies both the expected ID and the offset
-used to calculate the new end. The existing full-file check still prevents
-appending into the next file. Stream-wide sequence exhaustion panics through
-`RecordId::next()`, consistent with the endpoint helper. This is a readability
-change, not a measured performance improvement; it introduces no allocation.
+The writer caches `expected_record_id`, initially the file's first assigned ID
+for an empty pair or the recovered end's successor. It uses that ID for the
+existing stream/sequence comparison and advances it only after both buffers
+accept the record. Rejected appends and flush/sync/finalize operations leave it
+unchanged. After the last assigned record it points into the successor file;
+the full-file guard still rejects another append to this writer.
+
+The existing `RecordStartLocation` calculation remains for the byte offset:
+`RecordEndLocation::next_record_start()` for a buffered prefix, or the file's
+first ID at position zero for an empty pair. This retains the helper's general
+rollover calculation even though the full-file guard prevents crossing files.
+The cached ID is additional state, not evidence of a performance improvement.
+Checked ID advancement retains the existing panic policy at sequence exhaustion.
+
+After identity validation, `start.to_end(record.length())` computes one typed
+accepted endpoint. Its position supplies the index entry, and the same endpoint
+becomes buffered progress and the append outcome only after both buffers accept
+the record. The writer does not maintain a separate local offset or reconstruct
+the endpoint afterward. `to_next()` is unnecessary here: the writer needs the
+accepted end and cached successor ID, not a successor file's byte position.
 
 `new(file_id, log, index)` accepts an empty pair positioned at zero, with an owned
 `tokio::fs::File` for the index. The caller establishes emptiness and exclusive
 write ownership. Construction does no I/O. The default index type lets normal
 callers name the pair writer as `IndexedLogWriter<File>`.
-The application-internal `from_validated(file_id, log, index, end)` is the handover
-point for a recovery owner. `IndexedLogValidator` returns synchronized files and
-their endpoint; constructing a writer from that result remains separate work.
-`None` means an empty pair. A supplied endpoint
-must describe a contiguous validated prefix beginning with the file's first
-assigned record, with exactly one correct index entry for each complete record.
-Any invalid tail must already be repaired, and both handles must be positioned
-at their logical append ends. A buffered reader's physical cursor may be ahead
-of its last validated record; the handing-over layer must resolve that difference.
-Prefix writes, including rebuilt index entries, must have completed destination
-flushing before handover; no unflushed prefix bytes may remain in either output.
+`From<InitializedStream> for IndexedLogWriter<File>` consumes the initializer's
+result to resume its active pair. The result has no public unchecked constructor:
+recovery establishes a contiguous valid log prefix, exactly matching index entries,
+tail repair, synchronization of both files and their logical append positions.
+The initializer also cleans up later files and publishes recovered progress before
+returning the active pair. The owner preserves exclusive write access through
+handover; borrowed file getters are for observation, not mutation of that prefix.
 
-The writer derives the existing record count from the endpoint and file identity.
-The endpoint's log position is reused; the index append position is the record
-count times eight. The internal identity assertion detects an inconsistent
-handover, not corruption. No public partial file validator or raw metadata
-deserialization can establish a trusted pair. The validator establishes content
-readiness; its caller establishes exclusive recovery/write ownership.
+Conversion moves both handles without reopening, seeking, revalidating or I/O.
+The writer destructures `InitializedStream` by field name, so ownership transfer
+does not depend on tuple order. Its fields are visible only within `streams`;
+components constructing it must establish the documented initialization guarantees.
+The writer derives
+the file-local record count using `LogFileId::record_count_through`, and initializes
+empty output buffers. No raw endpoint constructor is needed for resumption.
 
-The handed-over prefix starts as buffered/flushed progress, with no pending
-buffers. The internal constructor starts `synced_end` absent: it does not record
-synchronization performed before construction, even when the caller obtained the
-files from `IndexedLogValidator`. The recovery owner must account for this when
-writer handover is integrated. Direct `new` construction still starts empty.
-Explicit synchronization can establish durability for that prefix without
-appending another record. The owner may independently retain a trusted recovery
-checkpoint; this writer does not overwrite or publish one.
+All three endpoints (`buffered_end`, `flushed_end`, `synced_end`) start at the
+recovered file-local end, preserving the synchronization already performed by
+recovery. All three are `None` for an empty pair, including an empty successor to
+a completed file. That earlier file's checkpoint remains stream-wide metadata;
+it is not progress within the active writer. Direct `new` construction also starts
+empty. Fresh empty files receive no initial synchronization. Subsequent appends
+advance buffered progress, flush advances readable progress, and successful
+explicit synchronization advances durable progress. This writer never publishes
+or overwrites a checkpoint.
+
+```no_run
+use tokio::fs::File;
+use transaction_log::{
+    storage::StorageProvider,
+    streams::{IndexedLogWriter, StreamInitializer},
+};
+use transaction_log_exports::StreamId;
+
+async fn resume(
+    stream: StreamId,
+    storage: &StorageProvider,
+) -> anyhow::Result<IndexedLogWriter<File>> {
+    let initialized = StreamInitializer::initialize(stream, storage).await?;
+    Ok(IndexedLogWriter::from(initialized))
+}
+```
 
 Ordinary Rust exclusive borrows serialize operations. There is no worker, timer,
 queue, mutex, `RefCell`, object pool or imposed `Send` bound. Async I/O runs wherever
@@ -79,7 +109,8 @@ an awaited operation, the mutable borrow prevents another append to this writer.
 
 ## Appending and memory use
 
-`write_record(&Record)` is synchronous. It checks that the writer remains open,
+`write_record(&Record) -> Result<AppendOutcome, IndexedLogWriteError>` is synchronous.
+It checks that the writer remains open,
 that the file has capacity, and that the ID is precisely the expected stream and
 sequence. New files start at their assigned first ID; resumed files require the
 successor of their last record. Rejections leave buffers and progress untouched.
@@ -88,9 +119,21 @@ are not checked again. Client disconnection after rejection is the caller's job.
 
 Each successful append copies the complete encoding into the record batch, adds
 its absolute exclusive log end as one little-endian `u64` index entry, and advances
-the accepted count and `buffered_end`. It does not retain a `Record` or clone its
+the accepted count, `buffered_end` and `expected_record_id`. It does not retain a `Record` or clone its
 byte handle. The first record starts at zero. There is no file header, padding,
 index header or explicit initial-zero entry.
+
+`AppendOutcome` is a small `Copy` snapshot with private fields and `getset` copy
+getters. `end()` returns the accepted record and its exclusive file-local byte
+end. `file_full()` is true exactly when that successful append filled the last
+assigned slot. The final record was accepted; it was not rejected as `Full`.
+A subsequent append is still rejected. The owner can use the result to arrange
+synchronization, finalization and rollover without fetching progress separately.
+An outcome does not certify flushing, synchronization, checkpoint publication or
+permission to read the buffered bytes through another handle. Later appends and
+output operations do not change a previously returned snapshot. Errors produce
+no outcome and do not advance the expected ID or accepted progress; a failed
+paired append still makes the writer unusable even if one buffer changed.
 
 Only the current batches remain in application memory. There is no payload
 history or retained full-file index. After validation, the pair guards both
@@ -107,11 +150,45 @@ unsafe code. The copy is intentional to end the source borrow synchronously.
 These are implementation properties, not measured disk throughput claims.
 No special terminal-sequence file lifecycle is introduced in this step.
 
+### Available optimizations (deferred)
+
+The full defensive contract is deliberately retained: stream/sequence checks,
+file-capacity and lifecycle checks, the general next-start calculation, lower
+writer usability checks and protection against a partially accepted pair.
+The expected-ID cache and append outcome do not introduce a reduced-contract
+entry point, remove those checks or establish a measured speedup.
+
+The planned live stream owner will verify stream routing and sequence order
+before enqueueing records. Validation and admission must be serialized per stream.
+A worker will own the indexed writer and process records, flush commands and
+sync commands from the MPSC queue in order, completing a command's operation
+before processing the next. This owner and worker are not implemented yet; the
+writer currently verifies ordering itself.
+
+Optimization candidates include removing duplicate admission checks once the
+implemented upper layer establishes and tests those guarantees, simplifying
+the rollover-aware offset calculation under the existing full-file guard, and
+examining repeated usability checks across the pair and lower writers. The pair's
+error, panic and cancellation guarantees must remain accounted for by whichever
+layer owns the operation. A queue's ordering guarantee alone does not establish
+file health or make partial writes safe to reuse.
+
+Pursue these changes when benchmarking justifies them, or when the implemented
+and tested upper layer permits an explicitly reduced contract. Moving an identical
+check to the caller is not itself a reduction in total work. Inspect optimized
+code and measure before claiming a performance gain: Rust expression count and
+derivable-versus-cached state alone do not establish machine cost. The existing
+record I/O benchmarks do not measure this paired append path, and no indexed-writer
+performance result is claimed here. Keep these future decisions separate from
+the current checked API.
+
 ## Output ordering and progress
 
 | API | Contract |
 | --- | --- |
 | `file_id()` / `record_count()` / `is_full()` | Read the identity and accepted record count, including buffered records. |
+| `expected_record_id()` | Read the next ID checked on append; this does not override full, finalized or unusable state. |
+| `write_record(&Record)` | Buffer one checked record and its index entry; return `AppendOutcome` with `end()` and `file_full()`. |
 | `buffered_end()` | Last accepted endpoint; `None` for an empty file. |
 | `flushed_end()` | Last endpoint whose complete log bytes and index entry have finished flushing. |
 | `synced_end()` | Last endpoint covered by successful synchronization of both outputs. |
@@ -233,13 +310,26 @@ implemented, and its latency benefit has not been measured.
 
 Pair tests live in `indexed_log_writer.rs`. They use literal expected index bytes,
 production-validated input records, observable destinations with delayed flushes,
-short writes, failures and cancellation, and actual temporary file pairs. Check
+short writes, failures and cancellation, and actual file pairs in the shared
+storage fixture. Check
 record identity and file bounds, resumption, unchanged bytes, separate progress,
 strict log-before-index ordering and explicit finalization. Buffer internals are
 tested in their owning layer, not exposed for the pair's tests.
-The temporary-file test reads through independent handles after flush and before
+They also check exact append outcomes, the last-slot/full distinction, preserved
+outcome snapshots, expected-ID initialization/advancement and no advancement on
+identity/capacity/lifecycle rejection or either lower writer refusing an append.
+The independent-reader test reads through separate handles after flush and before
 any explicit durable sync; it establishes visibility, not absence of incidental
 OS writeback. No test should rely on a disk actually remaining unsynchronized.
+
+Handover tests use the real `StreamInitializer`: empty and entirely corrupt files,
+sequence zero, repaired tails after a checkpoint, a nonzero file's local count,
+and an empty successor whose checkpoint belongs to the previous completed file.
+They append after conversion and check exact bytes, index offsets, cursors and
+distinct buffered/flushed/synchronized progress. Each claims a unique stream from
+the shared fixture and retains its cleanup guard until all files close. Generic
+fault tests construct their private test writers directly; a separate arithmetic
+test seeds large-offset progress without allocating a multi-gigabyte prefix.
 
 Follow the [module verification guidance](../README.md#verification-and-performance).
 This component has no disk-performance measurements yet. Future benchmarks should

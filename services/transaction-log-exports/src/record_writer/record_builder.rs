@@ -242,7 +242,7 @@ impl fmt::Debug for RecordBuilder<'_> {
 mod tests {
     use super::{RecordBuildError, RecordBuilder};
     use crate::record::record_protocol::test_data::{FRAME, encode_frame};
-    use crate::{RecordId, RecordReader, SequenceNumber, StreamId};
+    use crate::{RecordId, RecordLength, RecordReader, SequenceNumber, StreamId};
     use bytes::BytesMut;
     use std::io::{self, Write};
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -551,7 +551,10 @@ mod tests {
                 let (id, payload) = &records[index];
                 assert_eq!(record.id(), *id);
                 assert_eq!(record.body(), payload);
-                assert_eq!(usize::from(record.length()), payload.len() + 16);
+                assert_eq!(
+                    record.length(),
+                    RecordLength::new(payload.len() as u64 + 16).unwrap()
+                );
                 index += 1;
             }
         }

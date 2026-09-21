@@ -1,11 +1,12 @@
 use getset::CopyGetters;
 
-use super::RecordId;
+use super::{RecordId, RecordLength};
 
 /// An owned, read-only snapshot of an already-validated record's header.
 ///
 /// Obtain a snapshot through [`Record::get_header`](super::Record::get_header),
 /// then read its native-endian fields through [`Self::length`] and [`Self::id`].
+/// The length remains a [`RecordLength`], preserving its validated byte range.
 /// The snapshot can outlive the record without retaining its byte buffer.
 ///
 /// Its native memory layout is compiler-selected. Use
@@ -13,20 +14,20 @@ use super::RecordId;
 /// serialized size; native padding is never written to the wire or file.
 ///
 /// ```compile_fail,E0616
-/// use transaction_log_exports::RecordHeader;
+/// use transaction_log_exports::{RecordHeader, RecordLength};
 ///
 /// fn change_length(mut header: RecordHeader) {
-///     header.length = 17;
+///     header.length = RecordLength::MIN;
 /// }
 /// ```
 ///
 /// Construction is restricted to the record module:
 ///
 /// ```compile_fail,E0624
-/// use transaction_log_exports::{RecordHeader, RecordId, SequenceNumber, StreamId};
+/// use transaction_log_exports::{RecordHeader, RecordId, RecordLength, SequenceNumber, StreamId};
 ///
 /// let id = RecordId::new(StreamId::MIN, SequenceNumber::MIN);
-/// let header = RecordHeader::new(16, id);
+/// let header = RecordHeader::new(RecordLength::MIN, id);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CopyGetters)]
 #[getset(get_copy = "pub")]
@@ -34,7 +35,7 @@ pub struct RecordHeader {
     /// Total encoded header, body, and CRC trailer length in bytes.
     ///
     /// The value is in `16..=65_535`, as established by record validation.
-    length: u16,
+    length: RecordLength,
     /// The stream and sequence number identifying the record.
     id: RecordId,
 }
@@ -42,12 +43,13 @@ pub struct RecordHeader {
 impl RecordHeader {
     /// Copies an already-validated record's length and identity into a snapshot.
     ///
-    /// The caller must supply the validated encoded length in `16..=65_535` and
-    /// the corresponding record ID. Construction stays within the record module
+    /// The caller must supply the length and ID of the same validated record.
+    /// The length type already guarantees the protocol's numeric bounds.
+    /// Construction stays within the record module
     /// so the hot path can reuse those guarantees without allocation or repeated
     /// validation.
     #[inline]
-    pub(super) const fn new(length: u16, id: RecordId) -> Self {
+    pub(super) const fn new(length: RecordLength, id: RecordId) -> Self {
         Self { length, id }
     }
 }

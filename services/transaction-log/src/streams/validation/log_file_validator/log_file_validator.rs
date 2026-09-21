@@ -8,7 +8,8 @@ use transaction_log_exports::{
 
 use super::{LogFileValidationError as Error, ValidatedLogFile};
 use crate::streams::{
-    LogFileId, LogTailError, RECORDS_PER_FILE, RecordEndLocation, ValidationFile,
+    LogFileId, LogTailError, RECORDS_PER_FILE, RecordEndLocation, RecordStartLocation,
+    ValidationFile,
 };
 
 /// Startup validation and tail recovery for an exclusively owned log file.
@@ -114,13 +115,11 @@ async fn scan_records<R: AsyncRead + Unpin>(
     }
     let mut reader = RecordReader::new(source);
     let mut count = last_trusted.map_or(0, |end| LogFileId::record_count_through(end.record_id()));
-    let mut position = last_trusted.map_or(0, |end| end.position());
     let mut validated_end = last_trusted;
     let mut suffix_ends = Vec::new();
-    let mut expected_record_id =
-        last_trusted.map_or_else(|| file_id.first_record_id(), |end| end.record_id().next());
     let tail_error = 'scan: loop {
         if count == RECORDS_PER_FILE {
+            let position = validated_end.map_or(0, |end| end.position());
             break (position < file_length).then_some(LogTailError::ExtraData);
         }
         // Keep this exhaustive: a new reader error must get an explicit recovery
@@ -143,17 +142,20 @@ async fn scan_records<R: AsyncRead + Unpin>(
             let Some(record) = reader.try_read_next().map_err(Error::Read)? else {
                 break;
             };
-            if record.id() != expected_record_id {
+            let start = validated_end.map_or_else(
+                || RecordStartLocation::new(file_id.first_record_id(), 0),
+                RecordEndLocation::next_record_start,
+            );
+            if record.id() != start.record_id() {
                 break 'scan Some(LogTailError::UnexpectedRecordId {
-                    expected: expected_record_id,
+                    expected: start.record_id(),
                     actual: record.id(),
                 });
             }
-            position += u64::from(record.length());
-            validated_end = Some(RecordEndLocation::new(record.id(), position));
-            suffix_ends.push(position);
+            let end = start.to_end(record.length());
+            validated_end = Some(end);
+            suffix_ends.push(end.position());
             count += 1;
-            expected_record_id = expected_record_id.next();
         }
     };
     Ok(LogScanResult {

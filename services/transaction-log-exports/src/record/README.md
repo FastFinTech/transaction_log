@@ -23,8 +23,9 @@ benchmark result or a guarantee made by this crate.
 | Component | Responsibility and status |
 | --- | --- |
 | `Record` | Implemented: immutable ownership of exactly one validated encoded record and inexpensive accessors. |
-| `RecordHeader` | Implemented: an independently owned, read-only snapshot of length and identity. |
+| `RecordHeader` | Implemented: an independently owned, read-only snapshot of a `RecordLength` and record identity. |
 | `RecordId` | Implemented: a read-only `StreamId` and `SequenceNumber` pair with a checked successor operation. |
+| `RecordLength` / `RecordLengthError` | Implemented in `record_length.rs` / `record_length_error.rs`: validated total encoded byte length, protocol-derived bounds, checked raw construction and a restricted unchecked constructor for `Record::length()`. |
 | `StreamId` / `StreamIdError` | Implemented: a validated logical stream identifier, enumeration of its supported domain, and its construction error. |
 | `SequenceNumber` | Implemented: a typed integer with no raw-value validation. |
 | `record_protocol` | Implemented: encoded sizes, offsets, raw header/CRC initialization, field decoding, and CRC calculation shared by consumers. |
@@ -97,6 +98,43 @@ raw pointer whose header and payload are already initialized. Both calculations
 use the same `crc32c` implementation. Writers must not create a full frame slice
 while the trailer is uninitialized. Separate content-only calculation, CRC-offset,
 and trailer-borrow helpers are unnecessary.
+
+## Encoded record length type
+
+`RecordLength` wraps a private `u64` containing the complete encoded length,
+including header, payload and CRC. It is distinct from a payload size, stream/file
+offset or batch length. `RecordLength::MIN` and `MAX` are typed constants derived
+from `record_protocol::MIN_RECORD_LEN` and `MAX_RECORD_LEN`; the protocol remains
+the source of truth for the bounds. The current range is `16..=65_535`.
+
+The native `u64` matches file-position arithmetic, including the positions in
+`RecordEndLocation`. The wire length remains `u16`; the native representation does
+not change the encoded format or increase the maximum record size. Buffer APIs
+use `usize`, so conversion is still explicit even on targets where both integers
+are 64 bits wide. `Record` computes this value rather than storing another field.
+
+`new(u64)` and `TryFrom<u64>` validate both bounds, returning `RecordLengthError`
+with the full rejected input through its read-only `value()` getter. Validation
+does not narrow or truncate oversized inputs before checking them.
+`get()` returns the underlying `u64` without validation. Checked construction
+establishes a numeric bound, not framing, byte availability, identity or checksum
+validity. Both types are exported from `record` and the crate root.
+
+The unsafe `new_unchecked(u64)` constructor is restricted to the record module
+and may be called only by `Record::length()`. That getter reads the immutable byte
+handle's already-validated length, converts it losslessly to `u64` and wraps it without
+repeating the range check. Reader validation established exact extent, supported
+length and equality with the encoded field before exposing the record. Tests of
+invalid raw values use the checked constructor, never the unchecked constructor.
+The raw protocol decoder and reader continue using raw lengths while inspecting
+unvalidated bytes.
+
+`Record::length()` and `RecordHeader::length()` return `RecordLength`. Header
+construction, record tests and builder tests use the typed length; benchmark byte
+counters use its `get()` accessor. The application's log-file validator and
+indexed log writer use `RecordStartLocation::to_end(RecordLength)` to derive each
+accepted record's exclusive end. Numeric extraction remains explicit; the wrapper
+does not implicitly convert to integers.
 
 ## Identity and domain rules
 
@@ -180,9 +218,10 @@ without a clone. These operations serve different ownership needs.
 
 `get_header()` returns an owned, native-endian `RecordHeader`. Callers can retain
 it independently and reuse it for repeated field access. Its private fields are
-exposed by `length()` and `id()`, both returning copies. Its `length()` and
-`Record::length()` return `u16`. Individual record getters let callers read only
-the fields they need. Callers obtain snapshots through `Record::get_header()`.
+exposed by `length()` and `id()`, returning `RecordLength` and `RecordId` copies.
+Both the header and `Record::length()` preserve the typed length. Individual
+record getters let callers read only the fields they need. Callers obtain
+snapshots through `Record::get_header()`.
 The `RecordHeader::new(length, id)` constructor is restricted to the record
 module with `pub(super)`. Its inputs must come from an already-validated record,
 allowing it to copy the fields without allocation or repeated length validation.
@@ -204,7 +243,7 @@ and byte-view accessors; generated getters do not replace protocol logic.
 
 `RecordHeader` and `RecordId` use Rust's default representation. Their native
 field order, offsets, and padding are compiler-selected and are not part of the
-public contract. `StreamId` and `SequenceNumber` use `repr(transparent)` to retain
+public contract. `StreamId`, `SequenceNumber` and `RecordLength` use `repr(transparent)` to retain
 the layout of their underlying integers. Native layout does not define
 serialization: never derive encoded sizes from `size_of`, serialize raw struct
 memory, or cast a byte pointer to a native header reference. The protocol's
@@ -326,7 +365,7 @@ async fn read_first<R: AsyncRead + Unpin>(source: R) -> Result<Option<Record>, R
 | Validate at the reader boundary | Repeated field access does not repeat length, stream ID, or CRC validation. |
 | Keep completed storage immutable | Once established, those invariants remain true for every retained handle. |
 | Decode only requested fields | Getters do not eagerly construct or cache a complete header inside every record. |
-| Use `Bytes::len()` for `length()` | The validated equality permits a metadata load and a safe-by-invariant narrowing cast, avoiding a buffer dereference. |
+| Use `Bytes::len()` for `length()` | The validated equality permits a metadata load and lossless conversion to the length wrapper's `u64`, avoiding a buffer dereference. |
 | Use fixed-size little-endian loads | They support arbitrary alignment; on the inspected little-endian target they compile to ordinary loads without byte swapping. |
 | Wrap validated IDs without checking again | The typed API retains the domain invariant without adding a range branch to `stream_id()`. |
 | Expose native value fields through `getset::CopyGetters` | Private fields preserve read-only APIs; inline field copies avoid allocation, reference counting, and repeated validation. |
@@ -364,15 +403,26 @@ probe functions. The existing record getter load counts above were unchanged.
 These probes measure optimized scalar access, not the cost of copying or
 retaining a whole header or ID, and do not establish throughput.
 
-To inspect current code generation, save a small probe under `target/record_getters.rs`:
+These historical measurements predate the `RecordLength` return type on `Record`
+and `RecordHeader`.
+
+On 2026-09-21, the typed header length was checked with Rust 1.98.1, LLVM 22.1.8,
+targeting `x86_64-pc-windows-msvc` with `-C opt-level=3` and a release-built exports
+library. Wrappers returning `RecordLength` from `header.length()` and
+`record.get_header().length()` each compiled to one 64-bit load followed by a
+return, without validation branches or helper calls. This checks those access
+paths only; it is not a throughput measurement or a portable layout guarantee.
+
+Save a probe under `target/record_getters.rs` to inspect
+current code generation:
 
 ```rust
 use transaction_log_exports::{
-    Record, RecordHeader, RecordId, SequenceNumber, StreamId, StreamIdError,
+    Record, RecordHeader, RecordId, RecordLength, SequenceNumber, StreamId, StreamIdError,
 };
 
 #[unsafe(no_mangle)]
-pub fn probe_length(record: &Record) -> u16 { record.length() }
+pub fn probe_length(record: &Record) -> RecordLength { record.length() }
 #[unsafe(no_mangle)]
 pub fn probe_stream_id(record: &Record) -> StreamId { record.stream_id() }
 #[unsafe(no_mangle)]
@@ -384,7 +434,9 @@ pub fn probe_id_stream_id(id: &RecordId) -> StreamId { id.stream_id() }
 #[unsafe(no_mangle)]
 pub fn probe_id_sequence_number(id: &RecordId) -> SequenceNumber { id.sequence_number() }
 #[unsafe(no_mangle)]
-pub fn probe_header_length(header: &RecordHeader) -> u16 { header.length() }
+pub fn probe_header_length(header: &RecordHeader) -> RecordLength { header.length() }
+#[unsafe(no_mangle)]
+pub fn probe_record_header_length(record: &Record) -> RecordLength { record.get_header().length() }
 #[unsafe(no_mangle)]
 pub fn probe_header_stream_id(header: &RecordHeader) -> StreamId { header.id().stream_id() }
 #[unsafe(no_mangle)]
@@ -520,6 +572,8 @@ Review changes against the relevant coverage:
 | Accessors, exact payload slices, empty/maximum payloads, typed boundaries, all eight address residues, shared ownership and header lifetime | `record.rs` |
 | Encoded sizes, offsets, uninitialized header/CRC writes at byte alignments with guard bytes, endianness, raw numeric limits, known CRC vectors, every covered bit, excluded trailer, oversized test encoding | `record_protocol.rs` |
 | Entire raw `u16` range, conversions, representation, limits, rejected value accessor, formatting and validated JSON loading | `stream_id.rs` |
+| Every wire-representable length, oversized `u64` inputs through `u64::MAX`, checked construction, protocol-derived limits, const use and preserved invalid inputs | `record_length.rs` |
+| Length error wording, rejected input and concrete error contract | `record_length_error.rs` |
 | Raw sequence boundaries, conversions, representation, formatting and exact full-range JSON integers | `sequence_number.rs` |
 | Successor arithmetic across numeric boundaries, preserved stream ID, panic on exhaustion in debug and release builds, named-field JSON shape and invalid metadata | `record_id.rs` |
 | Public API rejects field mutation and direct header construction; generated accessors remain callable | Rustdoc examples in `record_id.rs`, `record_header.rs`, and `stream_id_error.rs`; existing record and stream tests |

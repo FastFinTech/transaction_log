@@ -242,7 +242,8 @@ failure handling, comparison rules and integration commands.
 - [ ] Client ingestion rejection/disconnection.
 - [ ] Multi-file lifecycle coordination and stream-specific index queries.
 - [x] Per-stream recovery: checkpoint loading, discovery, sequential pair validation, later-file cleanup, checkpoint advancement, active-pair preparation and final handover.
-- [ ] Active-writer preparation, durable flush scheduling and startup-wide recovery orchestration.
+- [x] Consume an initialized stream as an indexed log writer, preserving recovered progress and durability.
+- [ ] Durable flush scheduling and startup-wide recovery orchestration.
 - [ ] Replication and cluster coordination.
 - [x] Raw and validated single/cluster configuration with fixed node slots and derived DNS hostnames; storage supports configuration read/write, while startup integration remains deferred.
 - [ ] Storage, indexing, replication, recovery and latency benchmarks.
@@ -255,7 +256,8 @@ Pair recovery and storage-level checkpoint publication are implemented. The
 stream initializer loads checkpoint metadata, checks discovery bounds and validates
 successive pairs through the first partial file or gap, then removes the discarded
 range, publishes the recovered checkpoint and prepares the active pair. This
-per-stream operation is complete; application startup does not call it yet.
+per-stream operation is complete, and its result can be consumed as an indexed log
+writer. Application startup does not call it yet.
 
 ## Workspace and development
 
