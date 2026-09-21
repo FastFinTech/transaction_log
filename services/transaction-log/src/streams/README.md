@@ -1,195 +1,154 @@
 # Stream operations
 
-This application module implements `IndexWriter`, buffered dense-index file
-output, and `IndexedLogWriter`, the append lifecycle of one stream's log file
-and its paired index. The pair writer composes the index writer and the exports
-crate's `RecordWriter` rather than implementing either encoding/output layer.
-`IndexedLogValidator` composes the focused log/index validators in
-`validation`, returning a synchronized endpoint and append-positioned files for a
-partial pair. Startup orchestration remains separate work.
-`StreamCheckpoint` represents the certified local log/index boundary as a typed,
-Serde-enabled value; it does not itself load or publish checkpoint files.
-`StreamInitializer` implements startup recovery of one stream.
-Its stateless entry point creates private state, loads the optional checkpoint,
-checks its stream ID and discovers the maximum log covering its file number. It
-validates successive pairs until a partial file or gap, retaining the recovered
-endpoint and partial pair, then removes the discarded range, publishes changed
-recovered progress and prepares the active pair. It creates an empty pair when
-needed without synchronizing the empty files. Final handover consumes the state
-and returns the pair. Its owned `InitializedStream` result uses read-only
-getters. The caller can consume this result through
-`IndexedLogWriter::from(initialized)`, preserving its synchronized file-local
-endpoint and append positions. Startup integration remains unimplemented.
+Recover a stream's persisted log/index files, publish its recovery checkpoint and
+continue ordered appends through an owned active pair. The module also supplies
+the typed locations and progress boundaries shared by writing, recovery and future
+reads. Per-stream recovery and paired writing are implemented; application startup
+integration, live rotation and query serving remain planned.
 
-The owner supplies an empty or validated pair, buffers ordered records, commands
-flushing and synchronization, and explicitly finalizes a full file. Live
-subscriptions, historical requests, scheduling, runtime checkpoint updates,
-startup integration and live file rotation remain future work. File acquisition
-for validation uses the storage provider's named log/index opening methods.
-Each successful paired append returns `AppendOutcome`, identifying the buffered
-endpoint and whether that record filled the file. The writer caches its next
-expected ID while retaining the checked append contract. The
-[writer's optimization notes](indexed_log_writer/README.md#available-optimizations-deferred)
-describe potential work once measurements or implemented queue admission justify it.
+## Types and modules
 
-## Where to start
-
-| Component | Responsibility |
+| Type or module | Responsibility |
 | --- | --- |
-| [Stream locations](location/README.md) | Logical file IDs, sequence-to-file grouping, record endpoints and lazy range enumeration. Endpoints and file ranges use `LogFilePosition`, preserved through writing, recovery and checkpoint metadata. |
-| [Stream checkpoint](#stream-checkpoint-model) | Typed checkpoint boundary, Serde representation and certification/publication requirements. Storage read/write and initializer advancement are implemented. |
-| [Stream initializer](stream_initializer/README.md) | Checked checkpoint loading/discovery, sequential pair validation, later-file cleanup, checkpoint advancement, active-pair preparation and final handover. |
-| [Indexed log writer](indexed_log_writer/README.md) | Consume an initialized stream or take a fresh empty pair; append ordered records and control flushing, synchronization, progress and finalization. Start here for normal output. |
-| [Indexed log validator](validation/indexed_log_validator/README.md) | Recover and synchronize one existing pair from a supplied trusted boundary. Return its endpoint and append-positioned files when partial. Start here for recovery. |
-| [Index writer](index_writer/README.md) | Encode offsets into a reusable buffer and send, flush or synchronize an owned file. Shared by the pair writer and validator. |
-| [Validation](validation/README.md) | Focused log and index recovery, their combined validator, and shared file capabilities and test support. Startup integration remains deferred. |
+| [`location`] | File identities, sequence-to-file grouping, typed record endpoints and lazy read ranges. |
+| [`StreamCheckpoint`] | A stored recovery boundary; the [checkpoint contract](#stream-checkpoint-model) below owns its certification and metadata semantics. |
+| [`StreamInitializer`] / [`InitializedStream`] | Recover one stream, clean discarded files, publish progress and hand over its active pair. Start here for stream recovery. |
+| [`IndexedLogWriter`] / [`AppendOutcome`] | Append ordered records and control buffered, flushed and synchronized progress for one pair. Start here for normal output. |
+| [`IndexedLogValidator`] / [`ValidatedFilePair`] | Recover one existing pair and return its endpoint, plus append-positioned handles when partial. |
+| [`IndexWriter`] | Buffer and output dense index offsets, shared by normal appends and index repair. |
+| [`validation`] / [`ValidationFile`] | Focused log/index recovery and shared file capabilities for inspection, repair and synchronization. |
 
-Log and index validation accept Tokio files and explicit file wrappers through
-`ValidationFile`, re-exported from both `streams` and `streams::validation`.
-The [validation specification](validation/README.md#shared-file-capabilities) owns
-the common capability and completion contracts. Index validation additionally
-requires `AsyncWrite`; the log result retains its file in `ValidatedLogFile<F>`.
+The component specifications explain [paired writing](self::indexed_log_writer),
+[initialization](self::stream_initializer), [pair recovery](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/streams/validation/indexed_log_validator/README.md)
+and [index output](self::index_writer). Their public types and errors are
+re-exported from `streams`; location and validation types are also available
+through their public modules.
 
-`stream_checkpoint.rs` directly owns the checkpoint model and its same-file tests.
-The writer and validator folders keep their components, supporting types and detailed specifications
-together; tests remain in the source file of the behavior they exercise.
-The component `mod.rs` files contain declarations, README inclusion and re-exports.
-This top-level `mod.rs` preserves the public imports, including
-`streams::IndexWriter`, `streams::IndexedLogWriter`,
-`streams::IndexedLogValidator` and `streams::StreamCheckpoint`.
-`AppendOutcome`, `IndexedLogValidationError`, `ValidatedFilePair`, `StreamInitializer` and `InitializedStream`
-are also re-exported. Location types
-are available through both `streams::location` and top-level streams re-exports;
-the writer/validator component modules remain private.
+## Usage
 
-The index writer is a sibling because both normal appending and index repair use
-it. Recovery-only findings, errors and completion metadata live with the
-validation module. The validator returns owned files after establishing and
-synchronizing the append boundary; constructing the pair writer belongs to its caller.
+Recover one stream and consume its active pair as a writer:
 
-## Shared contracts
+```no_run
+use tokio::fs::File;
+use transaction_log::{
+    storage::StorageProvider,
+    streams::{IndexedLogWriter, StreamInitializer},
+};
+use transaction_log_exports::StreamId;
 
-The [location specification](location/README.md) owns logical file identities,
-the 100,000-record grouping, endpoints and ranges. The
-[storage specification](../storage/README.md) owns permanent paths; the
-[index writer specification](index_writer/README.md#dense-index-layout) owns the
-shared dense index encoding.
-The [record specification](../../../transaction-log-exports/src/record/README.md)
-owns record framing and CRC validity. The
-[record writer specification](../../../transaction-log-exports/src/record_writer/README.md)
-owns reusable record buffering and destination output semantics. Reuse those
-contracts and constants; this module introduces no alternative record encoding.
+async fn recover_writer(
+    stream_id: StreamId,
+    storage: &StorageProvider,
+) -> anyhow::Result<IndexedLogWriter<File>> {
+    let initialized = StreamInitializer::initialize(stream_id, storage).await?;
+    Ok(IndexedLogWriter::from(initialized))
+}
+```
 
-Log files contain consecutive unchanged record encodings. Index files contain
-one little-endian `u64` exclusive log end per record, with no header or initial
-zero entry. A full pair holds 100,000 records and 100,000 index entries (800,000
-index bytes). Active and finalized pairs use the same format and permanent paths.
-No component here supplies file rotation, alternate encodings or path policy.
+The caller supplies exclusive recovery access and an established storage hierarchy.
+Initialization positions the active files for appending; conversion moves them
+into the writer without I/O and preserves recovered progress. The caller then
+chooses when to append, flush, synchronize and finalize a full file.
 
-Complete log output and the log destination's flush before exposing corresponding
-index bytes. Buffering, flushing and durable synchronization are distinct progress
-boundaries; synchronizing the pair is not an atomic transaction across two files.
-The pair writer coordinates normal output, and the validator applies the same
-ordering during repair and handover.
+## Behavior and guarantees
 
-An owner excludes concurrent writes and supplies trusted prefixes explicitly.
-Checkpoints certify both records and their exact index entries; the owner must
-establish both, synchronize log then index, and only then persist the checkpoint.
-Recovery checks the supplied boundary and trusts the earlier certified contents.
-Failure, panic or cancellation during I/O cannot authorize reuse or publication
-of a partly processed pair. Component READMEs describe the exact failure states,
-recovery preconditions and handover guarantees. Scheduling, checkpoint publication
-and directory-entry durability remain owner responsibilities.
+### Shared contracts
 
-## Historical reads and live delivery
+A log holds consecutive unchanged record encodings. Its dense index stores one
+little-endian `u64` exclusive log end per record, with no header or initial zero
+entry. An ordinary full pair contains 100,000 records and 800,000 index bytes.
+Active and finalized pairs use the same format and permanent paths.
 
-Live subscriptions receive records independently of these stream components.
-Historical queries open separate read-only handles to the same log and index,
-with independent cursors and compatible sharing. Bytes remaining in application
-buffers are not available through those handles. With normal cached local-file I/O, completed
-writes can be read through the OS cache before durable synchronization.
+| Contract | Authoritative specification |
+| --- | --- |
+| File grouping, identities, endpoints and ranges | [Stream locations](self::location) |
+| Record framing, encoded limits and CRC validity | [Record format](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log-exports/src/record/README.md#wire-and-file-contract) |
+| Record buffering and output completion | [Record writer](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log-exports/src/record_writer/README.md) |
+| Dense index encoding | [Index layout](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/streams/index_writer/README.md#dense-index-layout) |
+| Paths, acquisition and metadata publication | [Storage](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/storage/README.md) |
+| Shared recovery file operations | [Validation capabilities](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/streams/validation/README.md#shared-file-capabilities) |
 
-The request owner chooses whether historical availability requires the flushed or
-durable boundary. The pair writer reports both and imposes neither serving policy.
-The stream-wide published prefix must also account for preceding files and startup
-readiness. A request fixes its end before copying; it must not chase a growing EOF.
-Concurrent index readers must handle a partially written final eight-byte entry
-and must not treat raw index length as an independently verified publication marker.
-No payload cache or data-serving method belongs on these components.
+Log output and destination flushing precede the corresponding index output.
+Buffered, flushed and synchronized progress are distinct: only synchronization
+establishes file-data durability. Pair synchronization is not an atomic transaction
+across two files. Checkpoint publication follows validation of the covered records
+and exact index entries, then synchronization of the log and index in that order.
 
-## Verification and performance
+Owners exclude conflicting access and supply trusted prefixes explicitly.
+Recovery checks its boundary and trusts the earlier certified contents. Failure,
+panic or cancellation during I/O cannot authorize publication of an incomplete
+pair; component contracts determine the required recovery and reuse restrictions.
 
-Component READMEs describe their same-file tests and edge cases. Preserve those
-contracts when reorganizing code, and retain independent expected encodings,
-failure/cancellation coverage and the compile-fail constructor example.
-Each component README is included in its module's Rustdoc so its examples remain
-documentation tests.
+<details>
+<summary>Design and maintenance notes</summary>
 
-Run `cargo test -p transaction-log --locked`, the release tests,
-workspace Clippy, formatting and Rustdoc checks. Owned
-[test-storage guards](../storage/README.md#shared-test-storage) clean each test's
-files when its scope ends, keeping the empty stream directories for reuse.
-The application is currently a binary crate:
-ordinary Cargo tests do not run its documentation examples. Check those with
-`rustdoc --test` against a temporary library build of `src/main.rs`, including
-the application's dependency artifacts, until a library target is introduced.
-Keep temporary outputs under the ignored `target/` directory.
+**Ownership follows the lifecycle.** `IndexedLogWriter` composes `RecordWriter`
+and `IndexWriter`, sharing their encodings and output contracts. The index writer
+is a sibling of paired writing and validation because both append and repair need
+it. Recovery findings and errors stay with the validation components.
 
-Long throughput benchmarks remain opt-in. These components have no disk or
-recovery performance measurements yet. Future benchmarks should distinguish
-buffered appends, cached file output, durable synchronization and recovery.
+Focused validators preserve the supplied concrete file type through `ValidationFile`;
+index repair adds `AsyncWrite`, while log recovery only reads, truncates and
+synchronizes. The combined validator acquires files through storage and establishes
+append positions. The initializer selects the contiguous stream prefix, performs
+cleanup and checkpoint publication, and prepares an active pair. Its caller
+constructs the writer, preserving the separation between recovery and live policy.
 
-## Stream checkpoint model
+The writer returns an `AppendOutcome` after each paired buffered append, including
+whether that record filled the file. It tracks file-local buffered, flushed and
+durable endpoints while the initializer also needs stream-wide recovered progress.
+An empty active successor can therefore have no local endpoint even when a
+checkpoint covers preceding complete files.
 
-`StreamCheckpoint` stores one read-only `end: RecordEndLocation`, exposed through
-a `getset` copy getter. The endpoint keeps the last included record and its byte
-position together:
+Scheduling, runtime checkpoint updates and live rotation remain future work.
+No alternate record format or storage-path policy is introduced by these stream
+operations. Directory-entry durability follows the storage provider's platform
+contract and the recovery owner's established hierarchy.
 
-- `checkpoint.end().record_id()` identifies the last complete record included in
-  the checkpoint. Its identity already includes the stream ID.
-- `checkpoint.end().position()` returns a `LogFilePosition` from the beginning of that
-  record's log file to immediately after the complete encoded record, including its CRC.
-  The boundary is exclusive: following bytes have not been checkpointed by this
-  snapshot. It is not the position of the last byte, an index-file position, or
-  a cumulative byte count across multiple files. Use `.get()` to extract the raw
-  `u64` when passing the offset to an I/O or encoding API.
+</details>
 
-`checkpoint.end().log_file_id()` derives the file identity through the endpoint,
-so the model does not store redundant stream/file identifiers that could disagree.
-Endpoint access and file lookup belong to `RecordEndLocation`; the checkpoint
-does not duplicate those methods. The separate checkpoint type expresses the
-recovery boundary's meaning, which a general record end location does not carry.
-At sequence 99,999 the endpoint still belongs to file zero; sequence 100,000
-belongs to file one and has a position within that new file. The helper never
-increments the sequence and remains usable at `u64::MAX`. An endpoint may precede
-the physical end of a file containing newer, uncheckpointed records.
+### Stream checkpoint model
 
-Use `Option<StreamCheckpoint>` for an absent checkpoint, including an empty stream;
-do not reserve sequence zero as a sentinel. `LogFilePosition` preserves the full
-`u64` width because log files can exceed 4 GiB. The model is a small owned `Copy`
-value without allocation, mutable accessors or filesystem access. Its native layout does not define its
-serialized representation.
+`StreamCheckpoint` stores a read-only `end: RecordEndLocation`. Its `end()` getter
+identifies the last included record and the exclusive byte position immediately
+after that record's CRC in its own log file. The position can precede physical EOF
+when newer uncheckpointed records follow it.
 
-`StreamCheckpoint::new(end)` is an infallible data constructor. It does not
-claim to validate the relationship between the record and its supplied position,
-and it does not add a partial numeric check in place of inspecting actual storage.
-The checkpoint/recovery owner must establish the complete contract when producing
-or loading a trusted recovery checkpoint.
+`StreamCheckpoint::new(end)` stores supplied metadata without I/O or validation.
+A checkpoint published for recovery certifies a contiguous local prefix of valid
+records **and correct index entries**. It may lag the synchronized pair but must
+never lead either file. Constructing or decoding the value does not establish
+that certification.
 
-A checkpoint published for recovery certifies a contiguous prefix of valid records
-AND correct index entries on the local replica. It cannot advance until framing,
-CRC, stream identity, sequence continuity and the corresponding exact record end
-offsets are established. Synchronize the covered log data, then the index data,
-before durably publishing the checkpoint. It may lag this durable pair, but must
-never lead either file. Constructing the model establishes none of those facts.
-Storage implements checkpoint reading and publication. The initializer loads the
-checkpoint, checks its stream identity and advances it after validation and cleanup;
-startup integration remains future work. `IndexedLogValidator` accepts the explicitly supplied trusted endpoint; it
-does not load or choose the checkpoint itself. It checks prefix presence and the
-final certified index entry's agreement with that endpoint, without revalidating
-earlier records or index entries. It validates and repairs the suffix. A missing
-trusted index prefix or mismatching endpoint requires the caller to supply an
-earlier trustworthy boundary for a separate attempt.
+Use `Option<StreamCheckpoint>` for absence, including an empty stream; sequence
+zero is a valid first record. Storage reads and publishes checkpoints, and the
+initializer checks stream identity and advances progress after recovery and cleanup.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**One endpoint owns identity and position.** The checkpoint exposes its record ID,
+position and derived file identity through `RecordEndLocation`, avoiding duplicate
+stream/file fields and duplicate accessors. The position is a `LogFilePosition`,
+not an index address, last-byte position or cumulative byte count across files.
+It retains the full `u64` width because log files can exceed 4 GiB; `.get()` extracts
+the raw offset for I/O or encoding.
+
+Sequence 99,999 belongs to file zero; sequence 100,000 belongs to file one with a
+position in that new file. Deriving the file identity never increments the sequence.
+The checkpoint is a small owned `Copy` value with no allocation, mutable accessors
+or filesystem access, and its native layout does not define its serialization.
+
+The distinct checkpoint type gives a general record end its recovery meaning.
+An infallible constructor deliberately avoids a partial numeric check that could
+appear to certify real records. The producing recovery owner establishes framing,
+CRC, stream identity, sequence continuity, exact index ends and synchronization
+before publication. On reuse, pair recovery checks prefix presence and the final
+certified index entry without rescanning earlier contents. A missing or mismatched
+trusted index requires a separately supplied earlier trustworthy boundary for a
+new attempt; there is no implicit fallback.
+
+This example constructs and round-trips metadata only:
 
 ```rust
 use transaction_log::streams::{LogFilePosition, RecordEndLocation, StreamCheckpoint};
@@ -207,51 +166,10 @@ assert_eq!(serde_json::from_slice::<StreamCheckpoint>(&bytes)?, checkpoint);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`StorageProvider::checkpoint_file_path(stream_id)` names this stream's checkpoint
-at `{root}/streams/{stream_id:04}/checkpoint.json`. The path depends only on the
-stream, so advancing across log-file ranges does not change the checkpoint's
-location. Asynchronous storage-provider construction creates its parent directory
-but no checkpoint file.
-The initializer checks that the decoded checkpoint's stream ID matches the
-requested stream; agreement with the actual pair requires separate validation.
-
-### Planned historical-read availability
-
-Historical requests require a published contiguous prefix of validated, fully
-indexed records. A ready recovery checkpoint can establish a durable serving
-boundary. For the active file, `IndexedLogWriter` also reports a flushed boundary:
-independent read-only handles can read completed writes through the OS cache
-before durable synchronization. Whether to expose that newer prefix or require
-durability remains the serving owner's policy; the writer reports both boundaries.
-On startup, loading checkpoint metadata alone does not make a stream ready;
-required indexes must also be available and consistent, with rebuilding where
-necessary. Raw index length is not a substitute for this readiness contract.
-
-Provide a per-stream endpoint reporting the **last queryable sequence number**
-so historical clients can discover this limit before requesting data. Its value
-comes from the serving owner's ready, published endpoint. It may lag the last
-received or appended record; those newer records are not the advertised historical
-limit. Represent absence explicitly when no queryable prefix exists, rather
-than using sequence zero as a sentinel. A stream still recovering must not advertise
-an unready checkpoint as available history.
-
-The reported limit is a snapshot of the serving replica's availability. Each
-historical request still checks its range against that replica's ready prefix;
-an earlier status response does not establish readiness on another replica or
-guarantee that older files remain retained. Requests beyond the limit must not
-be reported as successful shortened ranges. Whether they return unavailable or
-explicitly wait, along with the endpoint's name and wire response format, remains
-future protocol design. These are development notes; no endpoint or historical
-request handling is implemented yet.
-
-### JSON representation
-
-Checkpoint metadata uses human-readable JSON. It is small and updated outside
-the per-record hot path, so a compact binary encoding is not necessary. Serde
-derives describe the fields, and `serde_json` provides the JSON codec.
-
-`LogFilePosition` is transparent to Serde, so the position remains a numeric field
-inside the endpoint. No additional wrapper object is stored:
+**Metadata representation.** Checkpoints use readable JSON because they are small
+and updated outside the per-record hot path. Serde derives reuse the endpoint and
+identifier checks without format-specific deserializers or separate JSON objects.
+`LogFilePosition` is transparent to Serde, retaining a numeric position field:
 
 ```json
 {
@@ -265,41 +183,134 @@ inside the endpoint. No additional wrapper object is stored:
 }
 ```
 
-Use `serde_json::to_vec_pretty(&checkpoint)` to prepare bytes for asynchronous
-file output, and `serde_json::from_slice::<StreamCheckpoint>(&bytes)` to decode
-them. The same traits also support `to_writer_pretty` and `from_reader` for
-synchronous `std::io` destinations/sources. These codecs do not flush, sync or
-atomically publish a checkpoint file. The storage provider implements
-publication; the initializer's recovery steps certify and synchronize the covered log/index
-prefix first. See the initializer and storage specifications for failure and
-platform-specific directory-durability contracts.
+All fields are required. Missing, duplicate or unknown fields fail at the checkpoint,
+endpoint and record-ID levels, with no default-zero substitutions. Stream IDs use
+the checked `0..=4095` domain. Sequences and positions decode as `u64`, rejecting
+negative, fractional and overflowing numbers. `serde_json` preserves the full
+integer range; tooling that rewrites this metadata must not round through floating
+point. These checks establish typed metadata, not the existence or durability of
+the represented records.
 
-Fields are required; missing, duplicate or unknown object fields are errors,
-including inside the endpoint and its nested record ID. There are no default-zero
-substitutions.
-`StreamId` deserialization uses its existing checked conversion, so JSON cannot
-introduce an ID outside `0..=4095`. Sequence numbers and positions decode as `u64`:
-negative, fractional and overflowing values are rejected. JSON integer text
-preserves the full `u64` range through `serde_json`; tooling that rewrites these
-files must preserve integers rather than round them through floating point.
+`to_vec_pretty` and `from_slice` work with asynchronously acquired bytes; the same
+traits support synchronous `to_writer_pretty` and `from_reader`. The codecs perform
+no flushing, synchronization or atomic publication. No binary checkpoint codec or
+persisted envelope is implemented, and metadata serialization does not change the
+binary record protocol or hot-path validation.
 
-These checks establish typed metadata only. A syntactically valid checkpoint
-can still point to missing, mismatched or non-durable records; file-level recovery
-must establish those facts before trusting it. Deserialization does not add
-filesystem I/O or partial record/offset validation to this model.
+**Persistence belongs to storage.** `checkpoint_file_path(stream_id)` names
+`{root}/streams/{stream_id:04}/checkpoint.json`. Advancing across log files does not
+change that location. Provider construction creates the stream directory but no
+checkpoint file. The initializer verifies the decoded stream ID against the
+requested stream, then coordinates recovery and publication under the
+[storage checkpoint contract](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/storage/README.md#stream-checkpoints).
+Loading metadata alone does not make the stream ready.
 
-The serialization traits are format-independent and reuse the identifier types'
-validation. There are no per-format custom deserializers or separate JSON DTOs.
-JSON is the selected metadata encoding; no binary checkpoint codec or persisted
-file envelope has been introduced. Metadata serialization does not change the
-binary record protocol, identifier layouts, getters or hot-path validation.
+</details>
+
+### Historical reads and live delivery
+
+Historical queries, live subscriptions and queryable-progress reporting are
+planned. The writer already exposes flushed and durable progress; choosing which
+boundary is available to readers belongs to the serving owner.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**A published prefix defines availability.** Historical requests need a contiguous
+prefix of validated, fully indexed records. Recovery can establish a durable
+boundary, while a writer's flushed boundary may permit newer data through normal
+cached local-file I/O before durable synchronization. Application-buffered bytes
+are not visible through separate read handles. The serving policy chooses between
+these boundaries; the writer imposes neither.
+
+Historical queries use independent read-only log/index handles with their own
+cursors and compatible sharing. Live delivery is independent of these file
+components. The published prefix accounts for preceding files and startup readiness;
+a loaded checkpoint alone is insufficient when required indexes are unavailable
+or inconsistent. Raw index length is not a publication marker: a concurrent reader
+can encounter a partially written final eight-byte entry.
+
+Each request fixes its end before copying instead of chasing a growing EOF. The
+planned per-stream status endpoint reports the **last queryable sequence number**,
+which may lag received or appended data. Absence is explicit when no queryable
+prefix exists; a recovering stream cannot advertise an unready checkpoint.
+
+That status is a snapshot of one replica. Every request still checks its range
+against that replica's ready prefix; an earlier status response proves neither
+another replica's readiness nor continued retention of old files. Requests beyond
+the limit cannot be reported as successful shortened ranges. Whether they fail as
+unavailable or explicitly wait, and the endpoint name and wire response, remain
+future protocol decisions. No payload cache or serving API is implemented on the
+stream components.
+
+</details>
+
+## Performance
+
+Paired writing uses reusable record/index buffers and cached expected-record state;
+recovery processes one file pair at a time. The
+[writer's deferred optimization notes](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/streams/indexed_log_writer/README.md#available-optimizations-deferred)
+separate possible changes from the implemented append contract.
+
+There are no disk-output or recovery throughput measurements for these components.
+The record-layer loopback benchmarks do not establish durable stream performance.
+Buffered appends, cached file output, synchronization and recovery need distinct
+measurements. Long throughput benchmarks remain opt-in.
+
+<a id="verification-and-performance"></a>
+
+## Validation
+
+From the workspace root:
+
+```powershell
+cargo test -p transaction-log --locked streams::
+cargo test -p transaction-log --release --locked streams::
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo rustdoc -p transaction-log --bin transaction-log --locked -- -D warnings
+```
+
+Component specifications describe the tests for writing, recovery and locations.
+Owned [storage fixtures](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/storage/README.md#shared-test-storage)
+clean each test's files on scope exit while retaining empty stream directories.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Documentation checks in a binary crate.** These READMEs are included in Rustdoc,
+but ordinary Cargo tests skip documentation examples for the service binary.
+Their executable and compile-fail examples are checked with `rustdoc --test` against
+a temporary library build of `src/main.rs`, supplying the application's current
+dependency artifacts. The build needs `CARGO_PKG_VERSION` for the entry point's
+version string and the edition selected by the workspace. Temporary library and
+documentation-test outputs stay under ignored `target/`. This checks the same
+module code until a library target is introduced.
+
+Independent expected encodings expose mistakes that a matching encoder/decoder
+could share. Focused suites cover partial progress, errors, cancellation and
+synchronization; composition tests observe actual files, checkpoints and returned
+cursors. Compile-fail examples cover type and constructor restrictions. These
+checks establish contracts, not power-loss behavior or performance results.
+
+</details>
 
 ### Checkpoint validation
 
-`stream_checkpoint.rs` tests preservation of the supplied typed endpoint at sequence
-zero, file rotation, a position above 4 GiB and sequence exhaustion. These tests
-exercise the metadata model, not validation or durability of real stored records.
-JSON fixtures check pretty output and I/O round trips, exact maximum sequence
-values, large offsets, missing/duplicate/unknown fields at all three object levels,
-invalid numeric values, truncation and trailing garbage. Expected JSON is literal, so serialization and
-deserialization cannot silently agree on an unintended field shape.
+Checkpoint tests distinguish metadata correctness from validation of real storage.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+The model preserves the supplied typed endpoint at sequence zero, file rotation,
+positions above 4 GiB and the full sequence range. Literal JSON fixtures verify the
+readable field shape, pretty output, I/O round trips and exact large integer values;
+serialization and deserialization cannot silently agree on a different format.
+
+Malformed cases cover missing, duplicate and unknown fields at all three object
+levels, invalid numeric types and values, truncated input and trailing garbage.
+These tests establish the model and codec contracts. Provider and initializer
+suites separately exercise persistence, trusted-boundary checks and publication
+ordering against files.
+
+</details>

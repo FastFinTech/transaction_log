@@ -1,103 +1,187 @@
 # Stream validation
 
-This module collects focused components that validate and repair persisted stream
-files. `IndexFileValidator::validate` owns an index file, checks the checkpoint's
-trusted entry, unconditionally replaces its following suffix and returns the file
-after synchronization. It has no constructor or persistent state.
+Recover persisted log/index pairs from an explicitly trusted checkpoint boundary.
+The focused validators own inspection and repair of each file; the combined
+validator returns a synchronized pair ready for handover. Stream-wide recovery
+and checkpoint publication belong to the stream initializer.
 
-[`LogFileValidator`](log_file_validator/README.md) scans and removes corrupt log
-tails through an associated async function that owns its input file and returns
-the synchronized file and accepted record ends. Its scanner produces the complete
-content findings, including any extra bytes beyond the record limit. Both
-validators receive the same trusted endpoint from the stream checkpoint, which
-certifies prior validation and synchronization of the covered log and index.
-[`IndexedLogValidator`](indexed_log_validator/README.md) passes the
-accepted suffix offsets to `IndexFileValidator::validate`, returning a synchronized
-pair's endpoint and, for partial files, handles positioned for appending. It opens
-one existing log/index pair through a borrowed `StorageProvider`. The
-[stream initializer](../stream_initializer/README.md) orchestrates sequential pair
-validation, later-file cleanup, checkpoint advancement and active-pair preparation.
-Startup integration remains separate work.
+## Types and modules
 
-The log validator returns typed suffix offsets as `&[LogFilePosition]`, directly
-accepted by the index validator, and uses a typed log EOF position internally.
-The index validator also decodes stored log offsets into that type; its own
-index-file byte addresses remain raw `u64` values. The combined validator borrows
-the typed suffix directly and unwraps the accepted log end only when seeking.
-The stream initializer preserves these typed endpoints through checkpoint
-publication and active-pair handover.
+| Type or module | Responsibility |
+| --- | --- |
+| [`ValidationFile`] | Shared reading, seeking, length, truncation and synchronization capabilities for focused recovery. |
+| [`LogFileValidator`] / [`ValidatedLogFile`] | Scan a log, remove a corrupt tail and return the synchronized file with accepted record ends. |
+| [`IndexFileValidator`] | Check the trusted index entry and replace its following suffix from accepted log ends. |
+| [`IndexedLogValidator`] / [`ValidatedFilePair`] | Open and recover one stored pair; return append-positioned handles when partial. |
+| [`LogTailError`] | Describe content corruption that was removed successfully. |
+| [`LogFileValidationError`], [`IndexFileValidationError`], [`IndexedLogValidationError`] | Preserve invalid-boundary and operational failures at the appropriate recovery layer. |
 
-The focused log/index validators receive already-open files and domain values;
-the combined validator acquires those files through `StorageProvider`. Storage path
-selection and opening semantics remain in the provider; log-record decoding remains
-with the record reader. Components here must preserve exclusive ownership across
-inspection and repair, fail closed after incomplete
-I/O, and distinguish content mismatch from operational failure.
+The [log](self::log_file_validator), [index](self::index_file_validator) and
+[pair](self::indexed_log_validator) specifications own their detailed algorithms
+and completion guarantees. [`StreamInitializer`](crate::streams::StreamInitializer)
+coordinates successive pairs, cleanup, checkpoint advancement and active-pair
+preparation. Application startup integration remains unimplemented.
 
-See the
-[index-file validator specification](index_file_validator/README.md) for its API,
-dense-index format, ownership, suffix replacement and tests.
+## Usage
 
-## Shared file capabilities
+The shared file trait lets a focused validator recover a Tokio file or a concrete
+wrapper while preserving its type:
 
-`validation_file.rs` owns `ValidationFile` and its Tokio file implementation. The
-trait is re-exported through `streams::validation` and `streams`. The log and index
-validators are generic over the supplied file and return ownership of the same concrete type;
-Tokio files and explicitly supplied controlled test files run through the same
-implementation. Type inference keeps ordinary calls unchanged.
+```no_run
+use transaction_log::streams::{
+    LogFileId, LogFileValidationError, LogFileValidator, RecordEndLocation,
+    ValidatedLogFile, ValidationFile,
+};
 
-`ValidationFile` combines Tokio's `AsyncRead` and `AsyncSeek`, the exports crate's
-existing `AsyncSyncData`, and `Unpin`. It adds only `length()` and `set_len(length)`.
-Length inspection must preserve contents and cursor. Resizing truncates or extends
-with zero bytes without repositioning the cursor; success means the length change
-has completed, not merely been scheduled. It does not establish durability. All
-operations must address the same underlying file and cursor, preserve concrete
-I/O errors and defer I/O until polled. Cancellation may leave outstanding work.
+async fn recover_log<F: ValidationFile>(
+    file: F,
+    file_id: LogFileId,
+    last_trusted: Option<RecordEndLocation>,
+) -> Result<ValidatedLogFile<F>, LogFileValidationError> {
+    LogFileValidator::validate(file, file_id, last_trusted).await
+}
+```
 
+Index recovery additionally requires `AsyncWrite`. For a pair acquired through
+[`StorageProvider`](crate::storage::StorageProvider), use `IndexedLogValidator` to
+coordinate both operations and establish append positions.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Capabilities follow the work.** The focused operations receive already-open
+files; the combined operation acquires those files through storage. This keeps
+path selection and opening semantics with the provider while letting file wrappers
+exercise the same validation code as ordinary Tokio handles.
+
+Log recovery needs truncation but writes no record bytes. Index recovery writes
+replacement entries, so only that operation adds `AsyncWrite`. A shared file trait
+avoids separate validator-specific abstractions for the same length and completion
+contracts. Generic calls use static dispatch and concrete futures without boxing
+or mandatory `Send`/`Sync` bounds.
+
+</details>
+
+## Behavior and guarantees
+
+### Shared file capabilities
+
+`ValidationFile` combines Tokio `AsyncRead`, `AsyncSeek`, the exports crate's
+`AsyncSyncData`, and `Unpin`. It adds two operations:
+
+| Operation | Contract |
+| --- | --- |
+| `length()` | Return the byte length without changing contents or cursor. |
+| `set_len(length)` | Set the exact byte length without repositioning the cursor. Shrinking removes the tail; extending adds zero bytes. Success means the change has completed. |
+
+All operations address the same underlying file and cursor, defer I/O until polled
+and preserve original I/O errors. Resizing does not establish durability; each
+validator synchronizes separately before success. Cancellation need not stop
+underlying OS work.
+
+The caller supplies exclusive access, finishes flushing earlier writes and
+establishes checkpoint certification. The trait itself guarantees none of those
+conditions. The focused validators return ownership of the same concrete type
+only on success; recovery failure can leave partial file changes.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Completion belongs in the capability contract.** A validator can rely on a
+successful resize before its next seek or synchronization only if the length
+change has actually completed. Merely scheduling a resize would break that order.
 The Tokio implementation delegates to metadata and the inherent `set_len` method,
-and uses the existing `AsyncSyncData` implementation. Index validation additionally
-requires `AsyncWrite` to output its suffix. Log validation only reads, seeks,
-truncates and synchronizes. This separates required capabilities without separate
-validator-specific file traits.
+and uses the existing `AsyncSyncData` implementation for data synchronization.
+No alternate file semantics are introduced by the wrapper boundary.
 
-Generic calls use static dispatch and concrete futures without boxing or mandatory
-`Send`/`Sync` bounds. The traits supply I/O capabilities; trusted records, valid
-offsets, exclusive access and checkpoint certification remain caller responsibilities.
-Recovery throughput has not been measured.
+</details>
 
-## Shared test file
+### Trust and recovery order
 
-`test_file.rs` is compiled only for unit tests. It contains `TestFile`, `FileProbe`,
-`FileOperation` and `wait_for_pause`, shared by both validators' same-file tests.
-Each test explicitly constructs a file with its own `Rc<FileProbe>` and passes it
-to the generic validator. There is no global or thread-local registration and no
-test-specific branch in either validator.
+A checkpoint certifies prior validation and synchronization of the covered log
+and index. Both focused validators receive that same original endpoint; earlier
+certified contents are trusted. Log validation supplies only the newly accepted
+suffix ends to index recovery. Operational read failures remain errors and never
+authorize deletion of unread content.
 
-The wrapper delegates successful operations to a real Tokio file. It can pause or
-fail length lookup, truncation, writes, flushing and synchronization at API entry
-boundaries, and cap accepted write sizes. Reads and seeks pass through directly.
-It records starts and successful completions; write completion means acceptance,
-not flushing or durability. Repeated write/flush polls can appear more than once
-in the start observations. Each file gets a separate probe.
+The combined operation synchronizes the recovered log before replacing, flushing
+and synchronizing the index. Its partial result additionally positions both
+handles for appending. Synchronizing files does not make recovery atomic across
+the pair or publish a checkpoint; the stream initializer owns the later publication.
 
-Tests drive these futures locally and explicitly resume/poll them after a pause.
-`wait_for_pause` drives either validator until its configured gate, failing if the
-operation returns first. A dropped wrapper retains its handle in the probe so tests
-can quiesce pending writes before inspecting bytes. This cleanup is test-only and
-does not promise atomic repair or cancellation of OS work. The wrapper implements
-file controls, never recovery decisions. Component tests cover short writes,
-errors, cancellation, exact retained bytes and synchronization before success;
-they do not simulate power loss or cancellation inside a kernel operation.
+<details>
+<summary>Design and maintenance notes</summary>
 
-The combined validator's tests use real storage paths and files to exercise the
-handoff, complete/partial results, cursor positions and error propagation. It does
-not introduce a storage abstraction or test-specific execution path.
+**Typed handoff.** Log recovery retains its accepted endpoint and a vector of
+`LogFilePosition` values. Index recovery borrows that vector as a slice without
+conversion or copying. The original trusted boundary selects the index prefix;
+substituting the log's newly discovered final endpoint would demand trust in
+entries that still need to be written.
 
-Run all validation suites with ordinary Cargo commands. Owned storage fixtures
-clean each case's files when its scope ends, retaining the empty stream directories:
+Log EOF, accepted ends and decoded index values all describe positions in a log.
+Index-file addresses and lengths remain raw `u64` byte counts in the index.
+Preserving those domains through recovery prevents an index cursor from being
+mistaken for a log position. The combined validator extracts raw log offsets only
+when seeking, while the initializer passes typed endpoints through publication
+and handover.
+
+</details>
+
+## Performance
+
+Recovery reuses the production record reader and index writer. It scans one pair
+at a time, borrows accepted offsets for index output and retains no whole log image
+or stream-wide file list. Index suffix replacement is unconditional, including
+already-correct entries. Recovery throughput has not been measured; the focused
+specifications describe their buffering and synchronization costs.
+
+## Validation
+
+From the workspace root:
 
 ```powershell
-cargo test -p transaction-log streams::validation --locked
+cargo test -p transaction-log --locked streams::validation
 cargo clippy -p transaction-log --all-targets --locked -- -D warnings
-cargo doc -p transaction-log --no-deps --locked
+cargo fmt --all --check
+cargo rustdoc -p transaction-log --bin transaction-log --locked -- -D warnings
 ```
+
+The [stream validation guidance](https://github.com/FastFinTech/transaction_log/blob/main/services/transaction-log/src/streams/README.md#verification-and-performance)
+also covers release checks and documentation examples in this binary crate.
+
+### Shared test file
+
+The focused suites use explicit file probes to observe partial progress and
+synchronization. The combined suite uses real provider paths to check file
+acquisition, repaired bytes and append positions together.
+
+<details>
+<summary>Design and maintenance notes</summary>
+
+**Controlled operations over real files.** The test-only `TestFile` implements
+`ValidationFile` around a Tokio file. Each case supplies its own `Rc<FileProbe>`;
+there is no global or thread-local registration and no test-specific branch in
+either validator. `FileOperation` identifies length lookup, truncation, writing,
+flushing and synchronization gates. Reads and seeks pass through directly.
+
+The wrapper can pause or fail operations at API entry boundaries and limit
+accepted write sizes. It records operation starts and successful completions;
+write completion means acceptance, not flushing or durability. Repeated write or
+flush polls can produce repeated start observations. Each file has its own probe.
+
+`wait_for_pause` drives a validator until the configured gate, failing if it
+completes first. Tests explicitly resume and poll the operation, making completion
+order observable. A dropped wrapper retains its handle in the probe so pending
+writes can be quiesced before retained bytes are inspected. This cleanup is a test
+mechanism, not a guarantee that cancellation stops OS work or makes repair atomic.
+The wrapper controls I/O; recovery decisions stay in the validators.
+
+The suites check short writes, concrete errors, cancellation, exact surviving
+bytes and synchronization before success. Ordinary filesystem cases pass Tokio
+files directly. Combined recovery uses owned storage fixtures for isolation and
+cleanup while checking complete/partial results, cursor positions and error
+propagation. These tests do not simulate power loss or cancellation inside kernel
+operations. The component specifications explain which observable contracts each
+suite establishes.
+
+</details>
